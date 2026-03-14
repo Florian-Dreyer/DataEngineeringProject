@@ -43,18 +43,28 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-cov>=5.0",
-    "ruff>=0.4",                # Linting & formatting
-    "ipykernel>=6.0",           # Jupyter support for EDA
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "pre-commit",
+    "jupyter",
+    "ipykernel>=6.0",
 ]
 
 [tool.ruff]
-line-length = 100
-target-version = "py310"
-
+line-length = 88
+required-version = "0.4.4"
 [tool.ruff.lint]
-select = ["E", "F", "I"]       # pycodestyle, pyflakes, isort
+select = ["E", "F", "W", "I", "UP", "PL", "PT"]
+ignore = ["PLR2004", "PT011"]
+[tool.ruff.format]
+quote-style = "single"
+[tool.mypy]
+python_version = "3.10"
+exclude = ["^build/"]
+warn_return_any = false  # We use Any for indexing operations
+warn_unused_configs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
