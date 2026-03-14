@@ -109,18 +109,23 @@ streamlit run src/dashboard/app.py
 ```
 ├── dags/                        # Airflow DAG definitions
 ├── src/
-│   ├── batch/                   # Batch layer (runs via Airflow)
-│   │   ├── extract.py           # Load CSVs into DataFrames
-│   │   ├── transform.py         # Cleaning & feature engineering
-│   │   ├── sentiment.py         # DistilBERT scoring
-│   │   ├── clustering.py        # K-Means user segmentation
-│   │   ├── model.py             # XGBoost rating prediction
-│   │   └── load.py              # PostgreSQL star schema loaders
-│   ├── stream/                  # Stream layer (speed layer)
-│   │   ├── producer.py          # Kafka producer (simulation replay)
-│   │   └── consumer.py          # Kafka consumer, VADER, hot table write
-│   └── dashboard/               # Streamlit app
-│       └── app.py
+│   └── foodcom_pipeline/        # Main package
+│       ├── __init__.py
+│       ├── batch/                   # Batch layer (runs via Airflow)
+│       │   ├── __init__.py
+│       │   ├── extract.py           # Load CSVs into DataFrames
+│       │   ├── transform.py         # Cleaning & feature engineering
+│       │   ├── sentiment.py         # DistilBERT scoring
+│       │   ├── clustering.py        # K-Means user segmentation
+│       │   ├── model.py             # XGBoost rating prediction
+│       │   └── load.py              # PostgreSQL star schema loaders
+│       ├── stream/                  # Stream layer (speed layer)
+│       │   ├── __init__.py
+│       │   ├── producer.py          # Kafka producer (simulation replay)
+│       │   └── consumer.py          # Kafka consumer, VADER, hot table write
+│       └── dashboard/               # Streamlit app
+│           ├── __init__.py
+│           └── app.py
 ├── data/
 │   └── raw/                     # Place Kaggle CSVs here (gitignored)
 ├── docker-compose.yml
