@@ -123,7 +123,7 @@ def _ensure_schema(engine) -> None:
     );
 
     CREATE TABLE IF NOT EXISTS dim_recipe (
-        recipe_id        INTEGER PRIMARY KEY,
+        recipe_id        BIGINT PRIMARY KEY,
         name             TEXT,
         avg_rating       FLOAT,
         review_count     INTEGER,
@@ -153,7 +153,7 @@ def _ensure_schema(engine) -> None:
     CREATE TABLE IF NOT EXISTS fact_interactions (
         interaction_id        BIGINT PRIMARY KEY,
         user_id               BIGINT   REFERENCES dim_user(user_id),
-        recipe_id             INTEGER  REFERENCES dim_recipe(recipe_id),
+        recipe_id             BIGINT   REFERENCES dim_recipe(recipe_id),
         date_id               INTEGER  REFERENCES dim_date(date_id),
         rating                SMALLINT,
         sentiment_score       FLOAT,
@@ -165,7 +165,7 @@ def _ensure_schema(engine) -> None:
     CREATE TABLE IF NOT EXISTS recent_interactions (
         interaction_id        BIGINT PRIMARY KEY,
         user_id               BIGINT,
-        recipe_id             INTEGER,
+        recipe_id             BIGINT,
         date_id               INTEGER,
         rating                SMALLINT,
         sentiment_score       FLOAT,
@@ -184,6 +184,25 @@ def _ensure_schema(engine) -> None:
 
     with engine.begin() as conn:
         conn.execute(text(ddl))
+
+        # If tables pre-existed with narrower integer types, widen them safely.
+        # This is idempotent: Postgres will keep BIGINT if already widened.
+        try:
+            conn.execute(text('ALTER TABLE dim_recipe ALTER COLUMN recipe_id TYPE BIGINT'))
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                text('ALTER TABLE fact_interactions ALTER COLUMN recipe_id TYPE BIGINT')
+            )
+        except Exception:
+            pass
+        try:
+            conn.execute(
+                text('ALTER TABLE recent_interactions ALTER COLUMN recipe_id TYPE BIGINT')
+            )
+        except Exception:
+            pass
 
     logger.info('Schema ensured (tables and serving view created if not existing).')
 
@@ -269,9 +288,11 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
     else:
         recipe_sent = pd.DataFrame(columns=['recipe_id', 'sentiment_rating'])
 
-    # Join with recipe metadata
-    dim = recipes.merge(recipe_agg, left_on='id', right_on='recipe_id', how='left')
-    dim = dim.merge(recipe_sent, on='recipe_id', how='left')
+    # Join with recipe metadata without creating duplicate recipe_id columns.
+    recipe_agg = recipe_agg.rename(columns={'recipe_id': 'id'})
+    dim = recipes.merge(recipe_agg, on='id', how='left')
+    dim = dim.merge(recipe_sent, left_on='id', right_on='recipe_id', how='left')
+    dim = dim.drop(columns=['recipe_id'], errors='ignore')
 
     # avg_cook_minutes from the recipes table
     dim = dim.rename(
@@ -281,13 +302,27 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
         }
     )
 
+    # Defensive type coercion for DB compatibility
+    # (avoid floats like 137739.0 being bound into integer columns)
+    dim['recipe_id'] = pd.to_numeric(dim['recipe_id'], errors='coerce').astype('Int64')
+    dim['review_count'] = pd.to_numeric(dim['review_count'], errors='coerce').astype(
+        'Int64'
+    )
+    dim['ingredient_count'] = pd.to_numeric(
+        dim['ingredient_count'], errors='coerce'
+    ).astype('Int64')
+
     # Top ingredients: first 10 from the normalized pipe-separated string
     dim['top_ingredients'] = dim['ingredients_normalized'].apply(
         lambda x: '|'.join(x.split('|')[:10]) if isinstance(x, str) else None
     )
 
-    # Tags: keep as-is (already a string in the dataset)
-    dim['tags'] = dim['tags'].astype(str)
+    # Ensure column names are unique before row mapping/upsert.
+    dim = dim.loc[:, ~dim.columns.duplicated()]
+
+    # Keep null tags as NULL (not literal "nan"), stringify real values.
+    dim['tags'] = dim['tags'].where(pd.notnull(dim['tags']), None)
+    dim['tags'] = dim['tags'].apply(lambda v: str(v) if v is not None else None)
 
     # Select and rename to match schema
     dim = dim[
