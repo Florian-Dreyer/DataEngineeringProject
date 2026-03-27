@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-foodcom}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  airflow:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    image: foodcom-airflow:2.9.3-local
+    depends_on:
+      - postgres
+    environment:
+      # Airflow metadata DB (kept in Postgres for simplicity)
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-foodcom}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+      # Batch pipeline config (used by src/foodcom_pipeline/batch/*.py)
+      FOODCOM_POSTGRES_CONN: postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-foodcom}
+      FOODCOM_DATA_DIR: /opt/airflow/data
+      FOODCOM_STAGING_DIR: /opt/airflow/staging
+      FOODCOM_ENABLE_KAGGLE_DOWNLOAD: ${FOODCOM_ENABLE_KAGGLE_DOWNLOAD:-true}
+      FOODCOM_KAGGLE_DATASET: ${FOODCOM_KAGGLE_DATASET:-shuyangli94/food-com-recipes-and-user-interactions}
+      KAGGLE_CONFIG_DIR: /home/airflow/.kaggle
+
+      # Make package importable from the mounted repo
+      PYTHONPATH: /opt/airflow/app/src
+    # Use the image's airflow user so the `airflow` CLI is available on PATH.
+    user: "50000:0"
+    volumes:
+      # Mount repo root so pyproject.toml exists in-container
+      - ./:/opt/airflow/app
+      # Keep DAGs on Airflow's default DAG path
+      - ./src/foodcom_pipeline/batch/dags:/opt/airflow/dags
+      - ./data:/opt/airflow/data
+      - ./staging:/opt/airflow/staging
+      - ${HOME}/.kaggle:/home/airflow/.kaggle:ro
+    ports:
+      - "8080:8080"
+    command: >
+      bash -lc "set -euo pipefail;
+      pip install -e /opt/airflow/app --no-deps;
+      airflow db migrate;
+      airflow users create --username \"${AIRFLOW_USERNAME:-airflow}\" --password \"${AIRFLOW_PASSWORD:-airflow}\" --firstname \"${AIRFLOW_FIRSTNAME:-Air}\" --lastname \"${AIRFLOW_LASTNAME:-Flow}\" --role Admin --email \"${AIRFLOW_EMAIL:-airflow@example.com}\" || true;
+      airflow scheduler & exec airflow webserver"
+
+volumes:
+  postgres_data:
+

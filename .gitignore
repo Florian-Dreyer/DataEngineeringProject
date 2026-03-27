@@ -172,3 +172,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+#raw csv files downloaded from kaggle using kaggle api during extract task in airflow dag
+data/
+
+#staging files for parquet files created during extract task in airflow dag
+staging/

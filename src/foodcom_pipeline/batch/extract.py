@@ -10,6 +10,8 @@ can be too large for Airflow's XCom storage (backed by the metadata DB).
 
 import logging
 import os
+import subprocess
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +36,14 @@ INTERACTIONS_CSV = DATA_DIR / 'RAW_interactions.csv'
 RECIPES_STAGING = STAGING_DIR / 'recipes_extracted.parquet'
 INTERACTIONS_STAGING = STAGING_DIR / 'interactions_extracted.parquet'
 
+KAGGLE_DATASET = os.getenv(
+    'FOODCOM_KAGGLE_DATASET',
+    'shuyangli94/food-com-recipes-and-user-interactions',
+)
+ENABLE_KAGGLE_DOWNLOAD = (
+    os.getenv('FOODCOM_ENABLE_KAGGLE_DOWNLOAD', 'true').lower() == 'true'
+)
+
 
 # ---------------------------------------------------------------------------
 # Watermark helper
@@ -45,13 +55,26 @@ def get_last_processed_date(engine) -> datetime | None:
     Returns the latest interaction date already loaded into fact_interactions,
     or None if the table is empty (first run).
     """
-    with engine.connect() as conn:
-        result = conn.execute(
-            text("""
-            SELECT MAX(date) FROM fact_interactions
-        """)
+    # Star schema stores dates in dim_date and references them via date_id.
+    # On first run, tables may not exist yet; treat that as "no watermark".
+    try:
+        with engine.connect() as conn:
+            value = conn.execute(
+                text(
+                    """
+                    SELECT MAX(d.full_date) AS last_processed_date
+                    FROM fact_interactions f
+                    JOIN dim_date d
+                      ON d.date_id = f.date_id
+                    """
+                )
+            ).scalar()
+    except Exception as e:
+        logger.info(
+            'Could not read watermark from warehouse (first run or schema missing). '
+            f'Proceeding with full extract. Error: {e}'
         )
-        value = result.scalar()
+        return None
 
     if value is None:
         logger.info('fact_interactions is empty — this is a full initial load.')
@@ -59,6 +82,169 @@ def get_last_processed_date(engine) -> datetime | None:
         logger.info(f'Watermark: last processed date = {value}')
 
     return value
+
+
+# ---------------------------------------------------------------------------
+# Source data bootstrap (Kaggle API)
+# ---------------------------------------------------------------------------
+
+
+def ensure_source_data(**context) -> None:
+    """
+    Ensures RAW_recipes.csv and RAW_interactions.csv exist in DATA_DIR.
+
+    If either file is missing and FOODCOM_ENABLE_KAGGLE_DOWNLOAD=true, downloads
+    both files from the Kaggle dataset using the Kaggle CLI.
+    """
+    logger.info(
+        f'Checking source files in {DATA_DIR}: '
+        f'recipes_csv_exists={RECIPES_CSV.exists()}, '
+        f'interactions_csv_exists={INTERACTIONS_CSV.exists()}'
+    )
+
+    # If CSVs are missing but ZIPs exist from a previous Kaggle run, extract first.
+    logger.info('Attempting pre-download ZIP extraction (if needed).')
+    _extract_csv_from_zip_if_needed(RECIPES_CSV)
+    _extract_csv_from_zip_if_needed(INTERACTIONS_CSV)
+
+    recipes_exists = RECIPES_CSV.exists()
+    interactions_exists = INTERACTIONS_CSV.exists()
+    logger.info(
+        'Post pre-download extraction check: '
+        f'recipes_csv_exists={recipes_exists}, '
+        f'interactions_csv_exists={interactions_exists}'
+    )
+
+    if recipes_exists and interactions_exists:
+        logger.info('Raw CSV files already present. Skipping Kaggle download.')
+        return
+
+    if not ENABLE_KAGGLE_DOWNLOAD:
+        raise FileNotFoundError(
+            'Raw CSV files are missing and Kaggle auto-download is disabled. '
+            'Set FOODCOM_ENABLE_KAGGLE_DOWNLOAD=true or place files at '
+            f'{RECIPES_CSV} and {INTERACTIONS_CSV}.'
+        )
+
+    logger.info(
+        f'Raw CSV missing. Downloading from Kaggle dataset "{KAGGLE_DATASET}" '
+        f'to {DATA_DIR}...'
+    )
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    _download_file_from_kaggle('RAW_recipes.csv')
+    _download_file_from_kaggle('RAW_interactions.csv')
+
+    # Kaggle may leave .zip files even with --unzip in some environments.
+    logger.info('Attempting post-download ZIP extraction (if needed).')
+    _extract_csv_from_zip_if_needed(RECIPES_CSV)
+    _extract_csv_from_zip_if_needed(INTERACTIONS_CSV)
+
+    logger.info(
+        'Final source file check: '
+        f'recipes_csv_exists={RECIPES_CSV.exists()}, '
+        f'interactions_csv_exists={INTERACTIONS_CSV.exists()}'
+    )
+
+    if not RECIPES_CSV.exists() or not INTERACTIONS_CSV.exists():
+        raise FileNotFoundError(
+            'Kaggle download completed but expected files were not found: '
+            f'{RECIPES_CSV}, {INTERACTIONS_CSV}'
+        )
+
+    logger.info('Kaggle source data download complete.')
+    context['ti'].xcom_push(key='source_dataset', value=KAGGLE_DATASET)
+
+
+def _download_file_from_kaggle(filename: str) -> None:
+    cmd = [
+        'kaggle',
+        'datasets',
+        'download',
+        '-d',
+        KAGGLE_DATASET,
+        '-f',
+        filename,
+        '-p',
+        str(DATA_DIR),
+        '--unzip',
+    ]
+
+    logger.info(f'Downloading {filename} from Kaggle...')
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f'Kaggle download failed for {filename}.\n'
+            f'STDOUT: {result.stdout}\nSTDERR: {result.stderr}\n'
+            'Ensure Kaggle CLI is installed and credentials are available '
+            '(~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY).'
+        )
+
+
+def _extract_csv_from_zip_if_needed(csv_path: Path) -> None:
+    """
+    If csv_path is missing, try to materialize it from ZIP archives in DATA_DIR.
+    """
+    if csv_path.exists():
+        logger.info(f'{csv_path.name} already exists. Skipping ZIP extraction.')
+        return
+
+    # Prefer the conventional "<name>.csv.zip", then fall back to any ZIP
+    # containing the target CSV.
+    candidate_zips = [csv_path.with_suffix(csv_path.suffix + '.zip')]
+    candidate_zips.extend(sorted(DATA_DIR.glob('*.zip')))
+
+    # Deduplicate while preserving order
+    seen = set()
+    ordered_zips = []
+    for zp in candidate_zips:
+        if zp in seen:
+            continue
+        seen.add(zp)
+        ordered_zips.append(zp)
+
+    zip_paths = [zp for zp in ordered_zips if zp.exists()]
+    if not zip_paths:
+        logger.info(f'No ZIP archives found for {csv_path.name} in {DATA_DIR}.')
+        return
+
+    logger.info(
+        f'ZIP candidates for {csv_path.name}: {[str(p.name) for p in zip_paths]}'
+    )
+    for zip_path in zip_paths:
+        logger.info(f'Attempting extraction for {csv_path.name} from {zip_path}.')
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            members = zf.namelist()
+            logger.info(f'ZIP member count for {zip_path.name}: {len(members)}')
+
+            # Case 1: exact filename present in archive
+            if csv_path.name in members:
+                zf.extract(csv_path.name, path=DATA_DIR)
+                logger.info(f'Extracted {csv_path.name} from {zip_path}.')
+                return
+
+            # Case 2: archive has nested paths; match by basename
+            basename_matches = [
+                m for m in members if Path(m).name.lower() == csv_path.name.lower()
+            ]
+            if basename_matches:
+                member = basename_matches[0]
+                logger.info(
+                    f'Found basename match for {csv_path.name} in {zip_path.name}: {member}'
+                )
+                zf.extract(member, path=DATA_DIR)
+                extracted_path = DATA_DIR / member
+                extracted_path.parent.mkdir(parents=True, exist_ok=True)
+                extracted_path.replace(csv_path)
+                logger.info(
+                    f'Extracted {member} from {zip_path} and renamed to {csv_path.name}.'
+                )
+                return
+
+    raise FileNotFoundError(
+        f'Could not find {csv_path.name} inside ZIP archives in {DATA_DIR}.'
+    )
 
 
 # ---------------------------------------------------------------------------
