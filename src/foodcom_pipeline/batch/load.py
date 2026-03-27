@@ -53,6 +53,10 @@ POSTGRES_CONN = os.getenv(
 # Batch size for bulk upserts — avoids building a single enormous SQL statement
 UPSERT_BATCH_SIZE = 5_000
 
+# Bayesian shrinkage strength for recipe-level sentiment_rating.
+# Higher m => more shrinkage toward global mean for low-sample recipes.
+SENTIMENT_SHRINKAGE_M = float(os.getenv('FOODCOM_SENTIMENT_SHRINKAGE_M', '100'))
+
 
 # ---------------------------------------------------------------------------
 # Entry point called by Airflow
@@ -123,6 +127,7 @@ def _ensure_schema(engine) -> None:
         name             TEXT,
         avg_rating       FLOAT,
         review_count     INTEGER,
+        sentiment_rating FLOAT,
         avg_cook_minutes FLOAT,
         top_ingredients  TEXT,    -- pipe-separated top 10 ingredients
         tags             TEXT,
@@ -239,8 +244,35 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
         .round({'avg_rating': 4})
     )
 
+    # Compute sentiment_rating per recipe using inverse-frequency weighting + Bayesian shrinkage:
+    # sentiment_rating = (Σ(w_i * r_i) + m*C) / (Σw_i + m)
+    # where w_i = 1 / global_count[rating_i], r_i = sentiment_score, C = global mean sentiment_score.
+    sentiment_df = interactions[['recipe_id', 'rating', 'sentiment_score']].copy()
+    sentiment_df = sentiment_df.dropna(subset=['sentiment_score', 'rating'])
+    if not sentiment_df.empty:
+        rating_counts = sentiment_df['rating'].value_counts().to_dict()
+        sentiment_df['w'] = sentiment_df['rating'].map(
+            lambda r: 1.0 / float(rating_counts.get(r, 1))
+        )
+        C = float(sentiment_df['sentiment_score'].mean())
+        m = SENTIMENT_SHRINKAGE_M
+
+        recipe_sent = (
+            sentiment_df.assign(wr=sentiment_df['w'] * sentiment_df['sentiment_score'])
+            .groupby('recipe_id')
+            .agg(weighted_sum=('wr', 'sum'), weight_sum=('w', 'sum'))
+            .reset_index()
+        )
+        recipe_sent['sentiment_rating'] = (
+            (recipe_sent['weighted_sum'] + m * C) / (recipe_sent['weight_sum'] + m)
+        ).round(4)
+        recipe_sent = recipe_sent[['recipe_id', 'sentiment_rating']]
+    else:
+        recipe_sent = pd.DataFrame(columns=['recipe_id', 'sentiment_rating'])
+
     # Join with recipe metadata
     dim = recipes.merge(recipe_agg, left_on='id', right_on='recipe_id', how='left')
+    dim = dim.merge(recipe_sent, on='recipe_id', how='left')
 
     # avg_cook_minutes from the recipes table
     dim = dim.rename(
@@ -265,6 +297,7 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
             'name',
             'avg_rating',
             'review_count',
+            'sentiment_rating',
             'avg_cook_minutes',
             'top_ingredients',
             'tags',
@@ -274,16 +307,17 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
 
     upsert_sql = """
         INSERT INTO dim_recipe (
-            recipe_id, name, avg_rating, review_count,
+            recipe_id, name, avg_rating, review_count, sentiment_rating,
             avg_cook_minutes, top_ingredients, tags, ingredient_count
         )
         VALUES (
-            :recipe_id, :name, :avg_rating, :review_count,
+            :recipe_id, :name, :avg_rating, :review_count, :sentiment_rating,
             :avg_cook_minutes, :top_ingredients, :tags, :ingredient_count
         )
         ON CONFLICT (recipe_id) DO UPDATE SET
             avg_rating       = EXCLUDED.avg_rating,
             review_count     = EXCLUDED.review_count,
+            sentiment_rating = EXCLUDED.sentiment_rating,
             avg_cook_minutes = EXCLUDED.avg_cook_minutes,
             top_ingredients  = EXCLUDED.top_ingredients,
             tags             = EXCLUDED.tags,
