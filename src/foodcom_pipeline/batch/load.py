@@ -182,9 +182,8 @@ def _ensure_schema(engine) -> None:
         WHERE interaction_id NOT IN (SELECT interaction_id FROM fact_interactions);
     """
 
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(text(ddl))
-        conn.commit()
 
     logger.info('Schema ensured (tables and serving view created if not existing).')
 
@@ -478,15 +477,16 @@ def _bulk_upsert(engine, df: pd.DataFrame, sql: str) -> None:
     records = df.where(pd.notnull(df), None).to_dict(orient='records')
     total = len(records)
 
-    with engine.connect() as conn:
-        for i in range(0, total, UPSERT_BATCH_SIZE):
-            batch = records[i : i + UPSERT_BATCH_SIZE]
-            conn.execute(text(sql), batch)
-            conn.commit()
+    for i in range(0, total, UPSERT_BATCH_SIZE):
+        batch = records[i : i + UPSERT_BATCH_SIZE]
 
-            end = min(i + UPSERT_BATCH_SIZE, total)
-            if i % (UPSERT_BATCH_SIZE * 5) == 0 or end == total:
-                logger.info(f'  Upserted {end:,} / {total:,} rows...')
+        # Execute each batch in its own transaction so partial progress is preserved.
+        with engine.begin() as conn:
+            conn.execute(text(sql), batch)
+
+        end = min(i + UPSERT_BATCH_SIZE, total)
+        if i % (UPSERT_BATCH_SIZE * 5) == 0 or end == total:
+            logger.info(f'  Upserted {end:,} / {total:,} rows...')
 
 
 def _log_row_counts(engine) -> None:
