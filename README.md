@@ -65,37 +65,126 @@ The **speed layer** processes incoming reviews immediately using VADER for low-l
 - Docker & Docker Compose
 - Python 3.10+
 
-### Setup
+### 1) Prepare Local Files
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/<your-org>/foodcom-pipeline.git
-cd foodcom-pipeline
-
-# 2. Copy and fill in environment variables
+# From the repo root (same folder as docker-compose.yml)
 cp .env.example .env
+mkdir -p data staging
 
-# 3. Download the dataset from Kaggle and place in data/raw/
-#    RAW_recipes.csv and RAW_interactions.csv
+# Kaggle credentials are required for auto-download:
+#   ~/.kaggle/kaggle.json
+# You can generate it from Kaggle Account -> API -> Create New Token.
+# The docker compose file mounts this into the Airflow container.
+mkdir -p ~/.kaggle
+# Copy your downloaded Kaggle token file to:
+#   ~/.kaggle/kaggle.json
+chmod 600 ~/.kaggle/kaggle.json
+```
 
-# 4. Start all services
+### 2) Start Services
+
+#### 🆕 First-time setup (build required)
+> ⚠️ Only run this once, or when dependencies change (e.g. Dockerfile or requirements.txt)
+
+```bash
+# Build and start all services (may take a few minutes)
+docker compose up -d --build
+
+# Subsequent runs (fast) - start services without rebuilding
 docker compose up -d
 
-# 5. Access Airflow UI at http://localhost:8080
-#    Default credentials: airflow / airflow
+# Restart services
+docker compose restart
+
+# Stop services
+docker compose down
+
+
 ```
 
-### Run the pipeline
+Expected:
+- `postgres` and `airflow` are both `Up` in `docker compose ps`
+- Airflow log shows webserver boot (e.g. `Listening at: http://0.0.0.0:8080`)
+- First build can take several minutes (it builds a custom Airflow image with DAG dependencies preinstalled).
+
+Health check:
 
 ```bash
-# Trigger the batch DAG manually from the Airflow UI,
-# or wait for the scheduled run.
-
-# Start the Kafka stream simulation (in a separate terminal)
-python src/stream/producer.py --rate 1  # 1 review/second
+curl -I http://localhost:8080/health
 ```
 
-### Launch the dashboard
+You should get `HTTP/1.1 200 OK`.
+
+If you see `Empty reply from server` or connection reset, wait ~20-40 seconds and retry:
+
+```bash
+curl -v http://localhost:8080/health
+```
+
+### 3) Open Airflow UI
+
+- URL: `http://localhost:8080`
+- Default credentials (from `.env`): `airflow` / `airflow`
+
+### 4) Trigger the DAG
+
+In Airflow UI:
+1. Open DAG `foodcom_batch_pipeline`
+2. Click **Trigger DAG**
+3. Watch tasks in this order:
+   - `ensure_source_data` (downloads RAW CSVs from Kaggle if missing)
+   - `extract_recipes` + `extract_interactions` (parallel)
+   - `clean`
+   - `run_distilbert_sentiment` (slowest step on CPU)
+   - `aggregate_user_stats`
+   - `run_kmeans_clustering`
+   - `load_to_star_schema`
+
+
+### 5) Verify Warehouse Load
+
+Run from your Postgres client:
+
+```sql
+SELECT COUNT(*) FROM fact_interactions;
+SELECT COUNT(*) FROM dim_user;
+SELECT COUNT(*) FROM dim_recipe;
+SELECT COUNT(*) FROM dim_date;
+```
+
+---
+
+## Troubleshooting
+
+- **`docker compose up` says `no configuration file provided`**
+  - Run from the repo root (where `docker-compose.yml` is located).
+- **`localhost:8080` not opening**
+  - Check `docker compose ps` (airflow must be `Up`).
+  - Check `curl -I http://localhost:8080/health` (should be 200).
+  - Check `docker compose logs --tail=200 airflow`.
+- **Browser says connection reset but health is 200**
+  - Try `http://127.0.0.1:8080` and hard refresh / incognito.
+- **`/bin/bash: --username: command not found` in airflow logs**
+  - Your compose command block is malformed; use the one in this repo (single-line `airflow users create ...`).
+- **`/bin/bash: airflow: command not found` in airflow logs**
+  - Ensure airflow container runs with `user: "50000:0"` (as in this repo).
+- **Large warning spam from `azure/... SyntaxWarning: invalid escape sequence`**
+  - This is noisy but non-fatal; ignore unless there is a traceback/error after it.
+- **`zsh: command not found: rg`**
+  - `rg` (ripgrep) is optional locally; use:
+    `docker compose logs airflow | grep -E "ERROR|Traceback|Exception|Listening at|Booting worker"`.
+- **DAG fails at extract due to missing CSV**
+  - Confirm exact paths: `data/RAW_recipes.csv`, `data/RAW_interactions.csv`.
+- **Kaggle download fails**
+  - Confirm `~/.kaggle/kaggle.json` exists on your host.
+  - Ensure file permissions are strict: `chmod 600 ~/.kaggle/kaggle.json`.
+  - Confirm `.env` has `FOODCOM_ENABLE_KAGGLE_DOWNLOAD=true`.
+- **Where data is mounted in container**
+  - Input CSVs: `/opt/airflow/data`
+  - Staging parquet files: `/opt/airflow/staging`
+
+### (Optional) Launch the dashboard
 
 ```bash
 streamlit run src/dashboard/app.py
@@ -107,17 +196,21 @@ streamlit run src/dashboard/app.py
 ## Project Structure
 
 ```
-├── dags/                        # Airflow DAG definitions
+├── docker-compose.yml
+├── docker/
+│   └── airflow/
+│       └── Dockerfile          # Custom Airflow image (pre-installs runtime deps)
+├── .env.example
 ├── src/
 │   └── foodcom_pipeline/        # Main package
 │       ├── __init__.py
 │       ├── batch/                   # Batch layer (runs via Airflow)
 │       │   ├── __init__.py
 │       │   ├── extract.py           # Load CSVs into DataFrames
-│       │   ├── transform.py         # Cleaning & feature engineering
+│       │   ├── clean.py             # Cleaning & normalization
 │       │   ├── sentiment.py         # DistilBERT scoring
-│       │   ├── clustering.py        # K-Means user segmentation
-│       │   ├── model.py             # XGBoost rating prediction
+│       │   ├── aggregate_user_stats.py  # User-level feature engineering
+│       │   ├── cluster.py           # K-Means user segmentation
 │       │   └── load.py              # PostgreSQL star schema loaders
 │       ├── stream/                  # Stream layer (speed layer)
 │       │   ├── __init__.py
@@ -127,8 +220,8 @@ streamlit run src/dashboard/app.py
 │           ├── __init__.py
 │           └── app.py
 ├── data/
-│   └── raw/                     # Place Kaggle CSVs here (gitignored)
-├── docker-compose.yml
-├── .env.example
+│   ├── RAW_recipes.csv           # Kaggle CSV (you add this)
+│   └── RAW_interactions.csv      # Kaggle CSV (you add this)
+├── staging/                      # Parquet staging outputs (created at runtime)
 └── pyproject.toml
 ```
