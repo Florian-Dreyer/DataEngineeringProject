@@ -30,7 +30,11 @@ from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
-from foodcom_pipeline.batch.extract import extract_interactions, extract_recipes
+from foodcom_pipeline.batch.extract import (
+    ensure_source_data,
+    extract_interactions,
+    extract_recipes,
+)
 
 # ---------------------------------------------------------------------------
 # Default arguments
@@ -117,6 +121,15 @@ with DAG(
     max_active_runs=1,
     tags=['foodcom', 'batch', 'lambda'],
 ) as dag:
+    task_ensure_source_data = PythonOperator(
+        task_id='ensure_source_data',
+        python_callable=ensure_source_data,
+        doc_md=(
+            'Ensures RAW_recipes.csv and RAW_interactions.csv exist. '
+            'If missing, downloads them from Kaggle.'
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Stage 1: Extract — PARALLEL
     # ------------------------------------------------------------------
@@ -132,7 +145,7 @@ with DAG(
         python_callable=extract_interactions,
         doc_md=(
             'Incremental extract of RAW_interactions.csv. '
-            'Filters to rows newer than MAX(date) in fact_interactions. '
+            'Filters to rows newer than MAX(full_date) via dim_date join. '
             'Pushes `has_new_data` flag to XCom.'
         ),
     )
@@ -223,6 +236,7 @@ with DAG(
     # Dependency graph
     # ------------------------------------------------------------------
 
+    task_ensure_source_data >> [task_extract_recipes, task_extract_interactions]
     [task_extract_recipes, task_extract_interactions] >> task_check_new_data
     (
         task_check_new_data
