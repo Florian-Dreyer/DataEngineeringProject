@@ -28,9 +28,8 @@ dependencies = [
     "kafka-python>=2.0",
 
     # ── NLP & Sentiment ─────────────────────────────────────────────
-    "transformers>=4.40",       # DistilBERT (batch layer)
-    "torch>=2.2",               # DistilBERT backend
-    "nltk>=3.8",                # VADER (stream layer)
+    "nltk>=3.8",                # VADER lexicon utils (stream layer)
+    "vaderSentiment>=3.3.2",    # VADER sentiment (batch + stream)
 
     # ── Machine Learning ────────────────────────────────────────────
     "xgboost>=2.0",
