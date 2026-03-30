@@ -34,6 +34,7 @@ from foodcom_pipeline.batch.extract import (
     ensure_source_data,
     extract_interactions,
     extract_recipes,
+    extract_usda_nutrients,
 )
 
 # ---------------------------------------------------------------------------
@@ -150,6 +151,15 @@ with DAG(
         ),
     )
 
+    task_extract_usda_nutrients = PythonOperator(
+        task_id='extract_usda_nutrients',
+        python_callable=extract_usda_nutrients,
+        doc_md=(
+            'Extracts USDA nutrient ground truth for canonical ingredients from '
+            '`ingr_map.pkl`, writes `usda_nutrients.parquet` to staging.'
+        ),
+    )
+
     # ------------------------------------------------------------------
     # Guard
     # ------------------------------------------------------------------
@@ -236,8 +246,15 @@ with DAG(
     # Dependency graph
     # ------------------------------------------------------------------
 
-    task_ensure_source_data >> [task_extract_recipes, task_extract_interactions]
+    task_ensure_source_data >> [
+        task_extract_recipes,
+        task_extract_interactions,
+        task_extract_usda_nutrients,
+    ]
     [task_extract_recipes, task_extract_interactions] >> task_check_new_data
+
+    # Clean step uses USDA-enriched nutrient features (when available).
+    task_extract_usda_nutrients >> task_clean
     (
         task_check_new_data
         >> task_clean

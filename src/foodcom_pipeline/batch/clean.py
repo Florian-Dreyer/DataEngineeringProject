@@ -18,12 +18,18 @@ Cleaning steps are divided into two categories:
 import ast
 import logging
 import re
+import pickle
+import sys
+import types
+from typing import Any
 
 import pandas as pd
 from foodcom_pipeline.batch.extract import (
+    INGR_MAP_PKL,
     INTERACTIONS_STAGING,
     RECIPES_STAGING,
     STAGING_DIR,
+    USDA_NUTRIENTS_STAGING,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,7 +43,7 @@ INTERACTIONS_CLEAN = STAGING_DIR / 'interactions_clean.parquet'
 
 # Nutrition fields as defined in the dataset documentation
 NUTRITION_COLS = [
-    'calories',
+    'calories_pdv',
     'total_fat_pdv',
     'sugar_pdv',
     'sodium_pdv',
@@ -69,7 +75,26 @@ def run_clean(**context) -> None:
     recipes_df = pd.read_parquet(RECIPES_STAGING)
     interactions_df = pd.read_parquet(INTERACTIONS_STAGING)
 
-    recipes_clean = clean_recipes(recipes_df)
+    ingr_map: dict[str, str] | None = None
+    if INGR_MAP_PKL.exists():
+        try:
+            ingr_map = _load_ingr_map(INGR_MAP_PKL)
+            logger.info(f'Loaded ingr_map.pkl ({len(ingr_map):,} mappings).')
+        except Exception as e:
+            logger.warning(f'Could not load ingr_map.pkl: {e}')
+
+    usda_nutrients = None
+    if USDA_NUTRIENTS_STAGING.exists():
+        try:
+            usda_nutrients = pd.read_parquet(USDA_NUTRIENTS_STAGING)
+            logger.info(
+                f'Loaded USDA nutrients ({len(usda_nutrients):,} rows) from '
+                f'{USDA_NUTRIENTS_STAGING}'
+            )
+        except Exception as e:
+            logger.warning(f'Could not load {USDA_NUTRIENTS_STAGING}: {e}')
+
+    recipes_clean = clean_recipes(recipes_df, ingr_map=ingr_map, usda_nutrients=usda_nutrients)
     interactions_clean = clean_interactions(interactions_df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
@@ -348,20 +373,30 @@ def _drop_bot_interactions(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def clean_recipes(df: pd.DataFrame) -> pd.DataFrame:
+def clean_recipes(
+    df: pd.DataFrame,
+    *,
+    ingr_map: dict[str, str] | None,
+    usda_nutrients: pd.DataFrame | None,
+) -> pd.DataFrame:
     logger.info(f'Cleaning recipes: starting with {len(df):,} rows')
 
     # --- [DATASET] ---
     df = _drop_null_recipe_ids(df)
     df = _parse_nutrition(df)
-    df = _normalize_ingredients(df)
+    df = _normalize_ingredients(df, ingr_map=ingr_map)
     df = _clean_minutes(df)
+
+    # [USDA] Enrich canonical ingredients -> absolute per-100g nutrients
+    df = _enrich_recipes_with_usda(df, usda_nutrients=usda_nutrients)
 
     # --- [DEFENSIVE] ---
     df = _drop_duplicate_recipe_ids(df)
     df = _clean_recipe_names(df)
     df = _cap_nutrition_values(df)
     df = _drop_negative_nutrition(df)
+
+    df = _compute_balance_score(df)
 
     logger.info(f'Recipes cleaning complete: {len(df):,} rows retained')
     return df.reset_index(drop=True)
@@ -410,7 +445,44 @@ def _parse_nutrition(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _normalize_ingredients(df: pd.DataFrame) -> pd.DataFrame:
+def _load_ingr_map(path) -> dict[str, str]:
+    def _pickle_load_with_pandas_shim(fh):
+        try:
+            return pickle.load(fh)
+        except ModuleNotFoundError as e:
+            if "pandas.core.indexes.numeric" not in str(e):
+                raise
+            import pandas as _pd
+
+            shim = types.ModuleType("pandas.core.indexes.numeric")
+            for cls_name in [
+                "Int64Index",
+                "UInt64Index",
+                "Float64Index",
+                "NumericIndex",
+            ]:
+                setattr(shim, cls_name, _pd.Index)
+            sys.modules["pandas.core.indexes.numeric"] = shim
+            fh.seek(0)
+            return pickle.load(fh)
+
+    with path.open('rb') as f:
+        obj: Any = _pickle_load_with_pandas_shim(f)
+
+    if isinstance(obj, dict):
+        out: dict[str, str] = {}
+        for k, v in obj.items():
+            if v is None:
+                continue
+            out[str(k).strip().lower()] = str(v).strip().lower()
+        return out
+
+    raise TypeError(f'Unsupported ingr_map.pkl structure: {type(obj)!r}')
+
+
+def _normalize_ingredients(
+    df: pd.DataFrame, *, ingr_map: dict[str, str] | None
+) -> pd.DataFrame:
     """
     [DATASET] Parse and normalize ingredient strings.
     Lowercases, strips whitespace, stores as pipe-separated string.
@@ -429,6 +501,17 @@ def _normalize_ingredients(df: pd.DataFrame) -> pd.DataFrame:
     df['ingredients_normalized'] = df['ingredients_parsed'].apply('|'.join)
     df['ingredient_count'] = df['ingredients_parsed'].apply(len)
 
+    if ingr_map:
+        # Map normalized ingredient strings onto canonical forms required
+        # for consistent USDA lookup.
+        df['ingredients_canonical_list'] = df['ingredients_parsed'].apply(
+            lambda lst: [ingr_map.get(ing, ing) for ing in lst] if isinstance(lst, list) else []
+        )
+    else:
+        df['ingredients_canonical_list'] = df['ingredients_parsed']
+
+    df['ingredients_canonical_normalized'] = df['ingredients_canonical_list'].apply('|'.join)
+
     empty = (df['ingredient_count'] == 0).sum()
     if empty > 0:
         logger.warning(f'[DATASET] {empty} recipes have no parseable ingredients.')
@@ -439,6 +522,118 @@ def _normalize_ingredients(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
+
+def _enrich_recipes_with_usda(
+    df: pd.DataFrame, *, usda_nutrients: pd.DataFrame | None
+) -> pd.DataFrame:
+    """
+    Joins each recipe's canonical ingredient list with USDA nutrient values.
+
+    Because recipes don't include ingredient quantities, we treat each ingredient
+    as a 100g-equivalent proxy and use the *mean* nutrient value across the
+    canonical ingredients as a pragmatic estimate for recipe-level nutrition.
+    """
+    # If USDA data isn't available yet, compute balance_score from PDV later.
+    if usda_nutrients is None or df.empty:
+        for col in [
+            'calories',
+            'protein',
+            'fat',
+            'saturated_fat',
+            'sugar',
+            'sodium',
+            'carbs',
+        ]:
+            if col not in df.columns:
+                df[col] = None
+        return df
+
+    required_usda_cols = {
+        'canonical_ingredient',
+        'calories_per_100g',
+        'protein_g_per_100g',
+        'fat_g_per_100g',
+        'saturated_fat_g_per_100g',
+        'sugar_g_per_100g',
+        'sodium_g_per_100g',
+        'carbs_g_per_100g',
+    }
+    missing_cols = required_usda_cols - set(usda_nutrients.columns)
+    if missing_cols:
+        raise ValueError(f'USDA nutrients missing expected columns: {missing_cols}')
+
+    exploded = df[['id', 'ingredients_canonical_list']].explode(
+        'ingredients_canonical_list'
+    )
+    exploded = exploded.rename(
+        columns={'ingredients_canonical_list': 'canonical_ingredient'}
+    )
+    exploded = exploded.dropna(subset=['canonical_ingredient'])
+
+    merged = exploded.merge(
+        usda_nutrients,
+        on='canonical_ingredient',
+        how='left',
+    )
+
+    agg = (
+        merged.groupby('id')
+        .agg(
+            calories=('calories_per_100g', 'mean'),
+            protein=('protein_g_per_100g', 'mean'),
+            fat=('fat_g_per_100g', 'mean'),
+            saturated_fat=('saturated_fat_g_per_100g', 'mean'),
+            sugar=('sugar_g_per_100g', 'mean'),
+            sodium=('sodium_g_per_100g', 'mean'),
+            carbs=('carbs_g_per_100g', 'mean'),
+            usda_matched_ingredients=('calories_per_100g', lambda s: s.notna().sum()),
+        )
+        .reset_index()
+    )
+
+    df = df.merge(agg, on='id', how='left')
+
+    # Recipe-level USDA ingredient coverage proxy.
+    df['usda_coverage_rate'] = (
+        df['usda_matched_ingredients'] / df['ingredient_count']
+    ).fillna(0.0)
+
+    return df
+
+
+def _compute_balance_score(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes a bounded recipe balance_score using nutrient risk weighting:
+      balance_score = 0.4*protein_norm
+                       -0.25*saturated_fat_norm
+                       -0.2*sugar_norm
+                       -0.15*sodium_norm
+    clipped to [-1, 1].
+    """
+    # Prefer USDA-derived absolute nutrients when present; otherwise fall back
+    # to Food.com PDV-derived percentages.
+    def _norm_from_usda(col_abs: str, col_pdv: str) -> pd.Series:
+        if col_abs in df.columns and df[col_abs].notna().any():
+            denom = float(df[col_abs].quantile(0.95))
+            if denom and denom > 0:
+                return (df[col_abs] / denom).clip(0, 1)
+        if col_pdv in df.columns and df[col_pdv].notna().any():
+            return (df[col_pdv] / 100.0).clip(0, 1)
+        return pd.Series([0.0] * len(df), index=df.index)
+
+    protein_norm = _norm_from_usda('protein', 'protein_pdv')
+    sat_fat_norm = _norm_from_usda('saturated_fat', 'saturated_fat_pdv')
+    sugar_norm = _norm_from_usda('sugar', 'sugar_pdv')
+    sodium_norm = _norm_from_usda('sodium', 'sodium_pdv')
+
+    df['balance_score'] = (
+        protein_norm * 0.4
+        - sat_fat_norm * 0.25
+        - sugar_norm * 0.2
+        - sodium_norm * 0.15
+    ).clip(-1, 1)
+
+    return df
 
 def _clean_minutes(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -536,15 +731,15 @@ def _cap_nutrition_values(df: pd.DataFrame) -> pd.DataFrame:
     users enter nutrition manually could have data entry errors
     (e.g. calories=999999). Cap rather than drop to preserve the recipe.
     """
-    if 'calories' not in df.columns:
+    if 'calories_pdv' not in df.columns:
         return df
 
-    extreme = (df['calories'] > MAX_CALORIES).sum()
+    extreme = (df['calories_pdv'] > MAX_CALORIES).sum()
     if extreme > 0:
         logger.warning(
-            f'[DEFENSIVE] Capping {extreme} recipes with calories > {MAX_CALORIES}.'
+            f'[DEFENSIVE] Capping {extreme} recipes with calories_pdv > {MAX_CALORIES}.'
         )
-        df['calories'] = df['calories'].clip(upper=MAX_CALORIES)
+        df['calories_pdv'] = df['calories_pdv'].clip(upper=MAX_CALORIES)
 
     return df
 

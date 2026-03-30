@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir \
     numpy \
     scipy \
     scikit-learn \
+    requests \
     sqlalchemy \
     psycopg2-binary \
     transformers \

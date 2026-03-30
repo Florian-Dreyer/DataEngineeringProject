@@ -12,10 +12,20 @@ import logging
 import os
 import subprocess
 import zipfile
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
+import pickle
+import sys
+import threading
+import types
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from time import monotonic, sleep
+from typing import Any
 
 import pandas as pd
+import requests
 from sqlalchemy import create_engine, text
 
 logger = logging.getLogger(__name__)
@@ -32,9 +42,11 @@ POSTGRES_CONN = os.getenv(
 
 RECIPES_CSV = DATA_DIR / 'RAW_recipes.csv'
 INTERACTIONS_CSV = DATA_DIR / 'RAW_interactions.csv'
+INGR_MAP_PKL = DATA_DIR / 'ingr_map.pkl'
 
 RECIPES_STAGING = STAGING_DIR / 'recipes_extracted.parquet'
 INTERACTIONS_STAGING = STAGING_DIR / 'interactions_extracted.parquet'
+USDA_NUTRIENTS_STAGING = STAGING_DIR / 'usda_nutrients.parquet'
 
 KAGGLE_DATASET = os.getenv(
     'FOODCOM_KAGGLE_DATASET',
@@ -43,6 +55,63 @@ KAGGLE_DATASET = os.getenv(
 ENABLE_KAGGLE_DOWNLOAD = (
     os.getenv('FOODCOM_ENABLE_KAGGLE_DOWNLOAD', 'true').lower() == 'true'
 )
+
+
+@dataclass
+class _GlobalRateLimiter:
+    """
+    Thread-safe global rate limiter.
+
+    Supports both:
+      - optional max_rps smoothing
+      - optional strict rolling-hour request cap
+    """
+
+    max_rps: float
+    max_requests_per_hour: int = 0
+
+    def __post_init__(self):
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+        self._window_s = 3600.0
+        self._request_times: deque[float] = deque()
+
+    def acquire(self) -> None:
+        while True:
+            wait_s = 0.0
+            with self._lock:
+                now = monotonic()
+
+                # Enforce strict rolling 1-hour cap if configured.
+                if self.max_requests_per_hour > 0:
+                    cutoff = now - self._window_s
+                    while self._request_times and self._request_times[0] <= cutoff:
+                        self._request_times.popleft()
+
+                    if len(self._request_times) >= self.max_requests_per_hour:
+                        wait_s = max(0.0, self._request_times[0] + self._window_s - now)
+                    else:
+                        # Optional smoothing on top of hourly cap.
+                        if self.max_rps > 0:
+                            min_interval = 1.0 / self.max_rps
+                            wait_s = max(0.0, self._next_allowed - now)
+                            if wait_s == 0.0:
+                                self._next_allowed = now + min_interval
+                        if wait_s == 0.0:
+                            self._request_times.append(now)
+                            return
+                else:
+                    # Legacy behavior when no hourly cap is configured.
+                    if self.max_rps <= 0:
+                        return
+                    min_interval = 1.0 / self.max_rps
+                    wait_s = max(0.0, self._next_allowed - now)
+                    if wait_s == 0.0:
+                        self._next_allowed = now + min_interval
+                        return
+
+            if wait_s > 0.0:
+                sleep(wait_s)
 
 
 # ---------------------------------------------------------------------------
@@ -91,15 +160,16 @@ def get_last_processed_date(engine) -> datetime | None:
 
 def ensure_source_data(**context) -> None:
     """
-    Ensures RAW_recipes.csv and RAW_interactions.csv exist in DATA_DIR.
+    Ensures RAW_recipes.csv, RAW_interactions.csv, and ingr_map.pkl exist in DATA_DIR.
 
-    If either file is missing and FOODCOM_ENABLE_KAGGLE_DOWNLOAD=true, downloads
-    both files from the Kaggle dataset using the Kaggle CLI.
+    If any file is missing and FOODCOM_ENABLE_KAGGLE_DOWNLOAD=true, downloads
+    missing files from the Kaggle dataset using the Kaggle CLI.
     """
     logger.info(
         f'Checking source files in {DATA_DIR}: '
         f'recipes_csv_exists={RECIPES_CSV.exists()}, '
-        f'interactions_csv_exists={INTERACTIONS_CSV.exists()}'
+        f'interactions_csv_exists={INTERACTIONS_CSV.exists()}, '
+        f'ingr_map_exists={INGR_MAP_PKL.exists()}'
     )
 
     # If CSVs are missing but ZIPs exist from a previous Kaggle run, extract first.
@@ -109,31 +179,40 @@ def ensure_source_data(**context) -> None:
 
     recipes_exists = RECIPES_CSV.exists()
     interactions_exists = INTERACTIONS_CSV.exists()
+    ingr_map_exists = INGR_MAP_PKL.exists()
     logger.info(
         'Post pre-download extraction check: '
         f'recipes_csv_exists={recipes_exists}, '
-        f'interactions_csv_exists={interactions_exists}'
+        f'interactions_csv_exists={interactions_exists}, '
+        f'ingr_map_exists={ingr_map_exists}'
     )
 
-    if recipes_exists and interactions_exists:
-        logger.info('Raw CSV files already present. Skipping Kaggle download.')
+    if recipes_exists and interactions_exists and ingr_map_exists:
+        logger.info('All required source files present. Skipping Kaggle download.')
         return
 
     if not ENABLE_KAGGLE_DOWNLOAD:
+        missing = []
+        if not recipes_exists:
+            missing.append(str(RECIPES_CSV))
+        if not interactions_exists:
+            missing.append(str(INTERACTIONS_CSV))
+        if not ingr_map_exists:
+            missing.append(str(INGR_MAP_PKL))
         raise FileNotFoundError(
-            'Raw CSV files are missing and Kaggle auto-download is disabled. '
-            'Set FOODCOM_ENABLE_KAGGLE_DOWNLOAD=true or place files at '
-            f'{RECIPES_CSV} and {INTERACTIONS_CSV}.'
+            f'Missing required source files ({missing}) and Kaggle auto-download is disabled. '
+            'Set FOODCOM_ENABLE_KAGGLE_DOWNLOAD=true or place files in DATA_DIR.'
         )
 
-    logger.info(
-        f'Raw CSV missing. Downloading from Kaggle dataset "{KAGGLE_DATASET}" '
-        f'to {DATA_DIR}...'
-    )
+    logger.info(f'Source files missing. Downloading from Kaggle "{KAGGLE_DATASET}"...')
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    _download_file_from_kaggle('RAW_recipes.csv')
-    _download_file_from_kaggle('RAW_interactions.csv')
+    if not recipes_exists:
+        _download_file_from_kaggle('RAW_recipes.csv')
+    if not interactions_exists:
+        _download_file_from_kaggle('RAW_interactions.csv')
+    if not ingr_map_exists:
+        _download_file_from_kaggle('ingr_map.pkl')
 
     # Kaggle may leave .zip files even with --unzip in some environments.
     logger.info('Attempting post-download ZIP extraction (if needed).')
@@ -143,13 +222,14 @@ def ensure_source_data(**context) -> None:
     logger.info(
         'Final source file check: '
         f'recipes_csv_exists={RECIPES_CSV.exists()}, '
-        f'interactions_csv_exists={INTERACTIONS_CSV.exists()}'
+        f'interactions_csv_exists={INTERACTIONS_CSV.exists()}, '
+        f'ingr_map_exists={INGR_MAP_PKL.exists()}'
     )
 
-    if not RECIPES_CSV.exists() or not INTERACTIONS_CSV.exists():
+    if not RECIPES_CSV.exists() or not INTERACTIONS_CSV.exists() or not INGR_MAP_PKL.exists():
         raise FileNotFoundError(
             'Kaggle download completed but expected files were not found: '
-            f'{RECIPES_CSV}, {INTERACTIONS_CSV}'
+            f'{RECIPES_CSV}, {INTERACTIONS_CSV}, {INGR_MAP_PKL}'
         )
 
     logger.info('Kaggle source data download complete.')
@@ -375,6 +455,343 @@ def _validate_interactions(df: pd.DataFrame) -> None:
         raise ValueError(f'Found {null_keys} interactions with null key fields.')
 
     logger.info('Interactions validation passed.')
+
+
+# ---------------------------------------------------------------------------
+# USDA extraction (canonical ingredient nutrient enrichment)
+# ---------------------------------------------------------------------------
+
+
+def _load_ingr_map(path: Path) -> dict[str, str]:
+    """
+    Loads ingr_map.pkl and normalizes it to {raw_string: canonical_string}.
+
+    The exact pickle structure can vary across preprocessing versions; we handle
+    the common cases (dict-like or DataFrame-like) and fall back with clear errors.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f'ingr_map.pkl not found at {path}')
+
+    def _pickle_load_with_pandas_shim(fh):
+        """
+        `ingr_map.pkl` in the Kaggle dataset was created with older pandas.
+        Pandas 2.x removed some internal module paths (e.g. pandas.core.indexes.numeric),
+        causing ModuleNotFoundError during unpickling.
+
+        We shim the missing module path and alias legacy Index classes to `pandas.Index`
+        so we can load the pickle and then extract the raw→canonical mapping.
+        """
+        try:
+            return pickle.load(fh)
+        except ModuleNotFoundError as e:
+            if "pandas.core.indexes.numeric" not in str(e):
+                raise
+
+            import pandas as _pd
+
+            shim = types.ModuleType("pandas.core.indexes.numeric")
+            # Legacy index class names that appear in older pickles.
+            for cls_name in [
+                "Int64Index",
+                "UInt64Index",
+                "Float64Index",
+                "NumericIndex",
+            ]:
+                setattr(shim, cls_name, _pd.Index)
+
+            sys.modules["pandas.core.indexes.numeric"] = shim
+            fh.seek(0)
+            return pickle.load(fh)
+
+    with path.open('rb') as f:
+        obj: Any = _pickle_load_with_pandas_shim(f)
+
+    if isinstance(obj, dict):
+        out: dict[str, str] = {}
+        for k, v in obj.items():
+            out[str(k).strip().lower()] = str(v).strip().lower()
+        return out
+
+    # Some variants store two columns in a DataFrame-like object.
+    if isinstance(obj, pd.DataFrame):
+        cols = {c.lower(): c for c in obj.columns}
+        raw_col = cols.get('raw_ingr') or cols.get('raw_ingredient') or cols.get('raw')
+        canon_col = cols.get('canonical') or cols.get('canonical_form') or cols.get(
+            'replaced'
+        )
+        if raw_col and canon_col:
+            out = {}
+            for _, row in obj.iterrows():
+                raw = row.get(raw_col)
+                canon = row.get(canon_col)
+                if pd.notnull(raw) and pd.notnull(canon):
+                    out[str(raw).strip().lower()] = str(canon).strip().lower()
+            if out:
+                return out
+
+    raise TypeError(
+        f'Unsupported ingr_map.pkl structure in {path} (type={type(obj)!r}).'
+    )
+
+
+def _find_nutrient_amount(
+    food_nutrients: list[dict[str, Any]],
+    *,
+    name_keywords: list[str],
+    unit_keywords: list[str] | None = None,
+) -> float | None:
+    """
+    Best-effort extraction from USDA `foodNutrients`.
+
+    - Matches nutrientName with any `name_keywords` (case-insensitive substring)
+    - Optionally filters by unitName containing any `unit_keywords`
+    - Returns the first matching `amount` (or `value`) as float
+    """
+    for n in food_nutrients:
+        nutrient_name = str(n.get('nutrientName') or n.get('name') or '').lower()
+        if not nutrient_name:
+            continue
+
+        if not any(kw.lower() in nutrient_name for kw in name_keywords):
+            continue
+
+        if unit_keywords is not None:
+            unit_name = str(n.get('unitName') or '').lower()
+            if not unit_name:
+                continue
+            if not any(uk.lower() in unit_name for uk in unit_keywords):
+                continue
+
+        amount = n.get('amount')
+        if amount is None:
+            amount = n.get('value')
+
+        try:
+            return float(amount)
+        except (TypeError, ValueError):
+            return None
+
+    return None
+
+
+def _empty_usda_nutrient_row() -> dict[str, float | None]:
+    return {
+        'calories_per_100g': None,
+        'protein_g_per_100g': None,
+        'fat_g_per_100g': None,
+        'saturated_fat_g_per_100g': None,
+        'sugar_g_per_100g': None,
+        'sodium_g_per_100g': None,
+        'carbs_g_per_100g': None,
+    }
+
+
+def _query_usda_nutrients_for_ingredient(
+    ingredient: str,
+    *,
+    api_key: str,
+    session: requests.Session,
+    timeout_s: float,
+    max_retries: int,
+    rate_limiter: _GlobalRateLimiter,
+) -> dict[str, float | None]:
+    """
+    Queries USDA FoodData Central (POST /foods/search) for one ingredient.
+
+    Returns a dict of per-100g nutrient values. Missing values are None.
+    """
+    base_url = os.getenv(
+        'FOODCOM_USDA_FDC_SEARCH_URL',
+        'https://api.nal.usda.gov/fdc/v1/foods/search',
+    )
+    data_types = os.getenv(
+        'FOODCOM_USDA_DATA_TYPES',
+        'Survey (FNDDS),SR Legacy,Foundation',
+    )
+
+    params = {'api_key': api_key}
+    payload = {
+        'query': ingredient,
+        'dataType': data_types,
+        'pageSize': 1,
+    }
+
+    response = None
+    for attempt in range(max_retries + 1):
+        rate_limiter.acquire()
+        response = session.post(
+            base_url,
+            params=params,
+            json=payload,
+            timeout=timeout_s,
+        )
+
+        # Retry on USDA rate-limit and transient service failures.
+        if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries:
+            backoff = min(8.0, 0.5 * (2**attempt))
+            sleep(backoff)
+            continue
+        break
+
+    assert response is not None
+    response.raise_for_status()
+    payload = response.json()
+
+    foods = payload.get('foods') or []
+    if not foods:
+        return _empty_usda_nutrient_row()
+
+    food0 = foods[0]
+    nutrients = food0.get('foodNutrients') or []
+    if not isinstance(nutrients, list):
+        nutrients = []
+
+    # Calories / Energy
+    calories = _find_nutrient_amount(
+        nutrients,
+        name_keywords=['energy'],
+        unit_keywords=['kcal'],
+    )
+
+    protein = _find_nutrient_amount(
+        nutrients,
+        name_keywords=['protein'],
+    )
+
+    fat = _find_nutrient_amount(
+        nutrients,
+        name_keywords=['total lipid', 'fat'],
+    )
+
+    saturated_fat = _find_nutrient_amount(
+        nutrients,
+        name_keywords=['total saturated'],
+    )
+
+    sugar = _find_nutrient_amount(
+        nutrients,
+        name_keywords=['sugars', 'total sugars'],
+    )
+
+    sodium_mg = _find_nutrient_amount(
+        nutrients,
+        name_keywords=['sodium'],
+        unit_keywords=['mg'],
+    )
+    sodium_g = sodium_mg / 1000.0 if sodium_mg is not None else None
+
+    carbs = _find_nutrient_amount(
+        nutrients,
+        name_keywords=['carbohydrate', 'carbohydrates'],
+    )
+
+    return {
+        'calories_per_100g': calories,
+        'protein_g_per_100g': protein,
+        'fat_g_per_100g': fat,
+        'saturated_fat_g_per_100g': saturated_fat,
+        'sugar_g_per_100g': sugar,
+        'sodium_g_per_100g': sodium_g,
+        'carbs_g_per_100g': carbs,
+    }
+
+
+def extract_usda_nutrients(**context) -> None:
+    """
+    Extracts USDA FoodData Central nutrient data for canonical ingredients from ingr_map.pkl.
+
+    Writes `usda_nutrients.parquet` into the Airflow staging directory so downstream
+    transforms can join recipe ingredients against USDA nutrient ground truth.
+    """
+    api_key = os.getenv('USDA_API_KEY') or os.getenv('FOODCOM_USDA_API_KEY') or ''
+    if not api_key:
+        raise EnvironmentError(
+            'USDA API key not found. Set `USDA_API_KEY` (or FOODCOM_USDA_API_KEY).'
+        )
+
+    # Tunables for safe parallelism:
+    # - workers: concurrency (5-10 recommended)
+    # - global max_rps: aggregate request throughput cap across all workers
+    # - retries/timeout: resilience on transient USDA/API failures
+    workers = int(os.getenv('FOODCOM_USDA_WORKERS', '6'))
+    timeout_s = float(os.getenv('FOODCOM_USDA_TIMEOUT_SECONDS', '30'))
+    max_retries = int(os.getenv('FOODCOM_USDA_MAX_RETRIES', '3'))
+    global_max_rps = float(os.getenv('FOODCOM_USDA_MAX_RPS', '4'))
+    max_requests_per_hour = int(
+        os.getenv('FOODCOM_USDA_MAX_REQUESTS_PER_HOUR', '999')
+    )
+    max_ing = os.getenv('FOODCOM_USDA_MAX_INGREDIENTS')
+    max_ing_int: int | None = int(max_ing) if max_ing else None
+
+    ingr_map = _load_ingr_map(INGR_MAP_PKL)
+    canonical_ingredients = sorted(set(ingr_map.values()))
+    if max_ing_int is not None:
+        canonical_ingredients = canonical_ingredients[:max_ing_int]
+
+    if not canonical_ingredients:
+        raise ValueError('No canonical ingredients found in ingr_map.pkl')
+
+    logger.info(
+        f'Querying USDA for {len(canonical_ingredients):,} canonical ingredients '
+        f'using workers={workers}, max_rps={global_max_rps}, '
+        f'max_requests_per_hour={max_requests_per_hour}, timeout={timeout_s}s.'
+    )
+
+    rows: list[dict[str, Any]] = []
+    computed_date = date.today()
+    rate_limiter = _GlobalRateLimiter(
+        max_rps=global_max_rps,
+        max_requests_per_hour=max_requests_per_hour,
+    )
+    thread_local = threading.local()
+
+    def _get_session() -> requests.Session:
+        sess = getattr(thread_local, 'session', None)
+        if sess is None:
+            sess = requests.Session()
+            sess.headers.update({'User-Agent': 'foodcom-pipeline/1.0'})
+            thread_local.session = sess
+        return sess
+
+    def _fetch_one(ingredient: str) -> dict[str, Any]:
+        try:
+            nutrient_row = _query_usda_nutrients_for_ingredient(
+                ingredient,
+                api_key=api_key,
+                session=_get_session(),
+                timeout_s=timeout_s,
+                max_retries=max_retries,
+                rate_limiter=rate_limiter,
+            )
+        except Exception as e:
+            logger.warning(f'USDA query failed for ingredient="{ingredient}": {e}')
+            nutrient_row = _empty_usda_nutrient_row()
+
+        nutrient_row['canonical_ingredient'] = ingredient
+        nutrient_row['computed_date'] = computed_date
+        return nutrient_row
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {
+            pool.submit(_fetch_one, ingredient): ingredient
+            for ingredient in canonical_ingredients
+        }
+        for i, fut in enumerate(as_completed(futures), start=1):
+            rows.append(fut.result())
+            if i % 50 == 0 or i == len(canonical_ingredients):
+                logger.info(f'USDA progress: {i}/{len(canonical_ingredients)}')
+
+    usda_df = pd.DataFrame(rows)
+    usda_df.to_parquet(USDA_NUTRIENTS_STAGING, index=False)
+
+    coverage = int(usda_df['calories_per_100g'].notna().sum())
+    coverage_rate = coverage / max(1, len(usda_df))
+    logger.info(
+        f'USDA extraction complete. Coverage(calories)={coverage:,}/{len(usda_df):,} '
+        f'({coverage_rate:.1%}). Staged to {USDA_NUTRIENTS_STAGING}'
+    )
+    context['ti'].xcom_push(key='usda_coverage_rate', value=float(coverage_rate))
+    context['ti'].xcom_push(key='usda_rows', value=int(len(usda_df)))
 
 
 # ---------------------------------------------------------------------------

@@ -131,7 +131,15 @@ def _ensure_schema(engine) -> None:
         avg_cook_minutes FLOAT,
         top_ingredients  TEXT,    -- pipe-separated top 10 ingredients
         tags             TEXT,
-        ingredient_count INTEGER
+        ingredient_count INTEGER,
+        calories         FLOAT,
+        protein          FLOAT,
+        fat              FLOAT,
+        sugar            FLOAT,
+        sodium           FLOAT,
+        carbs            FLOAT,
+        saturated_fat    FLOAT,
+        balance_score    FLOAT
     );
 
     CREATE TABLE IF NOT EXISTS dim_user (
@@ -203,6 +211,26 @@ def _ensure_schema(engine) -> None:
             )
         except Exception:
             pass
+
+        # Add new recipe enrichment columns if the table pre-existed.
+        recipe_cols = [
+            'calories',
+            'protein',
+            'fat',
+            'sugar',
+            'sodium',
+            'carbs',
+            'saturated_fat',
+            'balance_score',
+        ]
+        for col in recipe_cols:
+            try:
+                conn.execute(
+                    text(f'ALTER TABLE dim_recipe ADD COLUMN IF NOT EXISTS {col} FLOAT')
+                )
+            except Exception:
+                # If the environment is too old for IF NOT EXISTS, ignore.
+                pass
 
     logger.info('Schema ensured (tables and serving view created if not existing).')
 
@@ -312,8 +340,27 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
         dim['ingredient_count'], errors='coerce'
     ).astype('Int64')
 
-    # Top ingredients: first 10 from the normalized pipe-separated string
-    dim['top_ingredients'] = dim['ingredients_normalized'].apply(
+    # Defensive coercion for USDA-derived float columns.
+    for col in [
+        'calories',
+        'protein',
+        'fat',
+        'sugar',
+        'sodium',
+        'carbs',
+        'saturated_fat',
+        'balance_score',
+    ]:
+        if col in dim.columns:
+            dim[col] = pd.to_numeric(dim[col], errors='coerce')
+
+    # Top ingredients: first 10 from canonical pipe-separated string when available.
+    top_src = (
+        'ingredients_canonical_normalized'
+        if 'ingredients_canonical_normalized' in dim.columns
+        else 'ingredients_normalized'
+    )
+    dim['top_ingredients'] = dim[top_src].apply(
         lambda x: '|'.join(x.split('|')[:10]) if isinstance(x, str) else None
     )
 
@@ -325,6 +372,20 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
     dim['tags'] = dim['tags'].apply(lambda v: str(v) if v is not None else None)
 
     # Select and rename to match schema
+    # Ensure nutrient columns exist even if USDA enrichment was skipped.
+    for col in [
+        'calories',
+        'protein',
+        'fat',
+        'sugar',
+        'sodium',
+        'carbs',
+        'saturated_fat',
+        'balance_score',
+    ]:
+        if col not in dim.columns:
+            dim[col] = None
+
     dim = dim[
         [
             'recipe_id',
@@ -336,17 +397,27 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
             'top_ingredients',
             'tags',
             'ingredient_count',
+            'calories',
+            'protein',
+            'fat',
+            'sugar',
+            'sodium',
+            'carbs',
+            'saturated_fat',
+            'balance_score',
         ]
     ].drop_duplicates('recipe_id')
 
     upsert_sql = """
         INSERT INTO dim_recipe (
             recipe_id, name, avg_rating, review_count, sentiment_rating,
-            avg_cook_minutes, top_ingredients, tags, ingredient_count
+            avg_cook_minutes, top_ingredients, tags, ingredient_count,
+            calories, protein, fat, sugar, sodium, carbs, saturated_fat, balance_score
         )
         VALUES (
             :recipe_id, :name, :avg_rating, :review_count, :sentiment_rating,
-            :avg_cook_minutes, :top_ingredients, :tags, :ingredient_count
+            :avg_cook_minutes, :top_ingredients, :tags, :ingredient_count,
+            :calories, :protein, :fat, :sugar, :sodium, :carbs, :saturated_fat, :balance_score
         )
         ON CONFLICT (recipe_id) DO UPDATE SET
             avg_rating       = EXCLUDED.avg_rating,
@@ -355,7 +426,15 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
             avg_cook_minutes = EXCLUDED.avg_cook_minutes,
             top_ingredients  = EXCLUDED.top_ingredients,
             tags             = EXCLUDED.tags,
-            ingredient_count = EXCLUDED.ingredient_count
+            ingredient_count = EXCLUDED.ingredient_count,
+            calories         = EXCLUDED.calories,
+            protein          = EXCLUDED.protein,
+            fat              = EXCLUDED.fat,
+            sugar            = EXCLUDED.sugar,
+            sodium           = EXCLUDED.sodium,
+            carbs            = EXCLUDED.carbs,
+            saturated_fat    = EXCLUDED.saturated_fat,
+            balance_score    = EXCLUDED.balance_score
     """
 
     _bulk_upsert(engine, dim, upsert_sql)
