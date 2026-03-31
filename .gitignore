@@ -179,3 +179,11 @@ data/
 
 #staging files for parquet files created during extract task in airflow dag
 staging/
+
+
+#usda data json files 
+usda_data/
+
+
+
+.DS_Store

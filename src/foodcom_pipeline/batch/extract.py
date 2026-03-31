@@ -8,24 +8,20 @@ Data is staged as parquet files rather than passed via XCom, since DataFrames
 can be too large for Airflow's XCom storage (backed by the metadata DB).
 """
 
+import json
 import logging
 import os
+import re
 import subprocess
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
 import pickle
 import sys
-import threading
 import types
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from time import monotonic, sleep
 from typing import Any
 
 import pandas as pd
-import requests
 from sqlalchemy import create_engine, text
 
 logger = logging.getLogger(__name__)
@@ -48,6 +44,23 @@ RECIPES_STAGING = STAGING_DIR / 'recipes_extracted.parquet'
 INTERACTIONS_STAGING = STAGING_DIR / 'interactions_extracted.parquet'
 USDA_NUTRIENTS_STAGING = STAGING_DIR / 'usda_nutrients.parquet'
 
+# USDA FoodData Central bulk JSON (Foundation, SR Legacy, FNDDS survey)
+_USDA_JSON_SPECS: tuple[tuple[str, str], ...] = (
+    ('FoodData_Central_foundation_food_json_2025-12-18.json', 'FoundationFoods'),
+    ('FoodData_Central_sr_legacy_food_json_2018-04.json', 'SRLegacyFoods'),
+    ('surveyDownload.json', 'SurveyFoods'),
+)
+_USDA_DATATYPE_RANK: dict[str, int] = {
+    'Foundation': 3,
+    'SR Legacy': 2,
+    'Survey (FNDDS)': 1,
+}
+
+
+def _default_usda_json_dir() -> Path:
+    return Path(__file__).resolve().parents[3] / 'usda_data'
+
+
 KAGGLE_DATASET = os.getenv(
     'FOODCOM_KAGGLE_DATASET',
     'shuyangli94/food-com-recipes-and-user-interactions',
@@ -55,63 +68,6 @@ KAGGLE_DATASET = os.getenv(
 ENABLE_KAGGLE_DOWNLOAD = (
     os.getenv('FOODCOM_ENABLE_KAGGLE_DOWNLOAD', 'true').lower() == 'true'
 )
-
-
-@dataclass
-class _GlobalRateLimiter:
-    """
-    Thread-safe global rate limiter.
-
-    Supports both:
-      - optional max_rps smoothing
-      - optional strict rolling-hour request cap
-    """
-
-    max_rps: float
-    max_requests_per_hour: int = 0
-
-    def __post_init__(self):
-        self._lock = threading.Lock()
-        self._next_allowed = 0.0
-        self._window_s = 3600.0
-        self._request_times: deque[float] = deque()
-
-    def acquire(self) -> None:
-        while True:
-            wait_s = 0.0
-            with self._lock:
-                now = monotonic()
-
-                # Enforce strict rolling 1-hour cap if configured.
-                if self.max_requests_per_hour > 0:
-                    cutoff = now - self._window_s
-                    while self._request_times and self._request_times[0] <= cutoff:
-                        self._request_times.popleft()
-
-                    if len(self._request_times) >= self.max_requests_per_hour:
-                        wait_s = max(0.0, self._request_times[0] + self._window_s - now)
-                    else:
-                        # Optional smoothing on top of hourly cap.
-                        if self.max_rps > 0:
-                            min_interval = 1.0 / self.max_rps
-                            wait_s = max(0.0, self._next_allowed - now)
-                            if wait_s == 0.0:
-                                self._next_allowed = now + min_interval
-                        if wait_s == 0.0:
-                            self._request_times.append(now)
-                            return
-                else:
-                    # Legacy behavior when no hourly cap is configured.
-                    if self.max_rps <= 0:
-                        return
-                    min_interval = 1.0 / self.max_rps
-                    wait_s = max(0.0, self._next_allowed - now)
-                    if wait_s == 0.0:
-                        self._next_allowed = now + min_interval
-                        return
-
-            if wait_s > 0.0:
-                sleep(wait_s)
 
 
 # ---------------------------------------------------------------------------
@@ -543,12 +499,25 @@ def _find_nutrient_amount(
     """
     Best-effort extraction from USDA `foodNutrients`.
 
-    - Matches nutrientName with any `name_keywords` (case-insensitive substring)
-    - Optionally filters by unitName containing any `unit_keywords`
+    Supports:
+    - API/search flat items (`nutrientName`, `unitName`)
+    - FDC bulk download items with nested `nutrient.name` / `nutrient.unitName`
+
+    - Matches nutrient name with any `name_keywords` (case-insensitive substring)
+    - Optionally filters by unit containing any `unit_keywords`
     - Returns the first matching `amount` (or `value`) as float
     """
     for n in food_nutrients:
-        nutrient_name = str(n.get('nutrientName') or n.get('name') or '').lower()
+        nested = n.get('nutrient')
+        if isinstance(nested, dict):
+            nutrient_name = str(nested.get('name') or '').lower()
+            unit_name = str(nested.get('unitName') or '').lower()
+        else:
+            nutrient_name = str(
+                n.get('nutrientName') or n.get('name') or ''
+            ).lower()
+            unit_name = str(n.get('unitName') or '').lower()
+
         if not nutrient_name:
             continue
 
@@ -556,7 +525,6 @@ def _find_nutrient_amount(
             continue
 
         if unit_keywords is not None:
-            unit_name = str(n.get('unitName') or '').lower()
             if not unit_name:
                 continue
             if not any(uk.lower() in unit_name for uk in unit_keywords):
@@ -586,67 +554,79 @@ def _empty_usda_nutrient_row() -> dict[str, float | None]:
     }
 
 
-def _query_usda_nutrients_for_ingredient(
-    ingredient: str,
-    *,
-    api_key: str,
-    session: requests.Session,
-    timeout_s: float,
-    max_retries: int,
-    rate_limiter: _GlobalRateLimiter,
-) -> dict[str, float | None]:
-    """
-    Queries USDA FoodData Central (POST /foods/search) for one ingredient.
-
-    Returns a dict of per-100g nutrient values. Missing values are None.
-    """
-    base_url = os.getenv(
-        'FOODCOM_USDA_FDC_SEARCH_URL',
-        'https://api.nal.usda.gov/fdc/v1/foods/search',
-    )
-    data_types = os.getenv(
-        'FOODCOM_USDA_DATA_TYPES',
-        'Survey (FNDDS),SR Legacy,Foundation',
-    )
-
-    params = {'api_key': api_key}
-    payload = {
-        'query': ingredient,
-        'dataType': data_types,
-        'pageSize': 1,
-    }
-
-    response = None
-    for attempt in range(max_retries + 1):
-        rate_limiter.acquire()
-        response = session.post(
-            base_url,
-            params=params,
-            json=payload,
-            timeout=timeout_s,
-        )
-
-        # Retry on USDA rate-limit and transient service failures.
-        if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries:
-            backoff = min(8.0, 0.5 * (2**attempt))
-            sleep(backoff)
+def _load_local_usda_foods(usda_dir: Path) -> list[dict[str, Any]]:
+    """Loads Foundation, SR Legacy, and Survey (FNDDS) foods from bulk JSON downloads."""
+    foods: list[dict[str, Any]] = []
+    for filename, top_key in _USDA_JSON_SPECS:
+        path = usda_dir / filename
+        if not path.is_file():
+            logger.warning('USDA JSON file not found, skipping: %s', path)
             continue
-        break
+        with path.open(encoding='utf-8') as f:
+            payload = json.load(f)
+        batch = payload.get(top_key) or []
+        if not isinstance(batch, list):
+            logger.warning(
+                'USDA JSON key %r in %s is not a list; skipping.', top_key, path
+            )
+            continue
+        foods.extend(batch)
+    return foods
 
-    assert response is not None
-    response.raise_for_status()
-    payload = response.json()
 
-    foods = payload.get('foods') or []
-    if not foods:
-        return _empty_usda_nutrient_row()
+def _usda_match_sort_key(
+    food: dict[str, Any],
+    desc_lower: str,
+    q: str,
+    tokens: list[str],
+) -> tuple[int, float, int, int, int]:
+    """
+    Higher tuple sorts greater. Picks the best matching USDA food row for an ingredient.
 
-    food0 = foods[0]
-    nutrients = food0.get('foodNutrients') or []
+    Preference order: full phrase in description, token hit rate, data type,
+    nutrient row count (richer), then shorter descriptions (generic items).
+    """
+    hits = sum(1 for t in tokens if t in desc_lower)
+    rate = hits / max(1, len(tokens))
+    phrase = 1 if q in desc_lower else 0
+    dt = str(food.get('dataType') or '')
+    rank = _USDA_DATATYPE_RANK.get(dt, 0)
+    n_nut = len(food.get('foodNutrients') or [])
+    return (phrase, rate, rank, n_nut, -len(desc_lower))
+
+
+def _select_best_usda_food(
+    ingredient: str,
+    foods: list[dict[str, Any]],
+    desc_lowers: list[str],
+) -> dict[str, Any] | None:
+    q = ingredient.strip().lower()
+    tokens = [t for t in re.split(r'[^a-z0-9]+', q) if len(t) >= 2]
+    if not q or not tokens:
+        return None
+
+    best_food: dict[str, Any] | None = None
+    best_key: tuple[int, float, int, int, int] | None = None
+    for food, desc_lower in zip(foods, desc_lowers, strict=True):
+        key = _usda_match_sort_key(food, desc_lower, q, tokens)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_food = food
+
+    if best_food is None or best_key is None:
+        return None
+    phrase, rate, *_rest = best_key
+    if phrase == 0 and rate == 0:
+        return None
+    return best_food
+
+
+def _nutrient_row_from_usda_food(food: dict[str, Any]) -> dict[str, float | None]:
+    """Per-100g nutrient dict from one USDA food record (API or bulk JSON shape)."""
+    nutrients = food.get('foodNutrients') or []
     if not isinstance(nutrients, list):
         nutrients = []
 
-    # Calories / Energy
     calories = _find_nutrient_amount(
         nutrients,
         name_keywords=['energy'],
@@ -700,25 +680,12 @@ def extract_usda_nutrients(**context) -> None:
     """
     Extracts USDA FoodData Central nutrient data for canonical ingredients from ingr_map.pkl.
 
-    Writes `usda_nutrients.parquet` into the Airflow staging directory so downstream
-    transforms can join recipe ingredients against USDA nutrient ground truth.
+    Uses local bulk JSON under ``FOODCOM_USDA_JSON_DIR`` (Foundation, SR Legacy, FNDDS survey),
+    not the public API. Writes `usda_nutrients.parquet` into the Airflow staging directory so
+    downstream transforms can join recipe ingredients against USDA nutrient ground truth.
     """
-    api_key = os.getenv('USDA_API_KEY') or os.getenv('FOODCOM_USDA_API_KEY') or ''
-    if not api_key:
-        raise EnvironmentError(
-            'USDA API key not found. Set `USDA_API_KEY` (or FOODCOM_USDA_API_KEY).'
-        )
-
-    # Tunables for safe parallelism:
-    # - workers: concurrency (5-10 recommended)
-    # - global max_rps: aggregate request throughput cap across all workers
-    # - retries/timeout: resilience on transient USDA/API failures
-    workers = int(os.getenv('FOODCOM_USDA_WORKERS', '6'))
-    timeout_s = float(os.getenv('FOODCOM_USDA_TIMEOUT_SECONDS', '30'))
-    max_retries = int(os.getenv('FOODCOM_USDA_MAX_RETRIES', '3'))
-    global_max_rps = float(os.getenv('FOODCOM_USDA_MAX_RPS', '4'))
-    max_requests_per_hour = int(
-        os.getenv('FOODCOM_USDA_MAX_REQUESTS_PER_HOUR', '999')
+    usda_dir = Path(
+        os.getenv('FOODCOM_USDA_JSON_DIR', str(_default_usda_json_dir()))
     )
     max_ing = os.getenv('FOODCOM_USDA_MAX_INGREDIENTS')
     max_ing_int: int | None = int(max_ing) if max_ing else None
@@ -731,55 +698,35 @@ def extract_usda_nutrients(**context) -> None:
     if not canonical_ingredients:
         raise ValueError('No canonical ingredients found in ingr_map.pkl')
 
+    logger.info('Loading USDA bulk JSON from %s', usda_dir)
+    foods = _load_local_usda_foods(usda_dir)
+    if not foods:
+        raise FileNotFoundError(
+            f'No USDA foods loaded from {usda_dir}. Expected FDC bulk JSON files: '
+            + ', '.join(n for n, _ in _USDA_JSON_SPECS)
+        )
+
+    desc_lowers = [str(f.get('description') or '').lower() for f in foods]
     logger.info(
-        f'Querying USDA for {len(canonical_ingredients):,} canonical ingredients '
-        f'using workers={workers}, max_rps={global_max_rps}, '
-        f'max_requests_per_hour={max_requests_per_hour}, timeout={timeout_s}s.'
+        f'Looking up {len(canonical_ingredients):,} canonical ingredients against '
+        f'{len(foods):,} local USDA foods.'
     )
 
     rows: list[dict[str, Any]] = []
     computed_date = date.today()
-    rate_limiter = _GlobalRateLimiter(
-        max_rps=global_max_rps,
-        max_requests_per_hour=max_requests_per_hour,
-    )
-    thread_local = threading.local()
 
-    def _get_session() -> requests.Session:
-        sess = getattr(thread_local, 'session', None)
-        if sess is None:
-            sess = requests.Session()
-            sess.headers.update({'User-Agent': 'foodcom-pipeline/1.0'})
-            thread_local.session = sess
-        return sess
-
-    def _fetch_one(ingredient: str) -> dict[str, Any]:
-        try:
-            nutrient_row = _query_usda_nutrients_for_ingredient(
-                ingredient,
-                api_key=api_key,
-                session=_get_session(),
-                timeout_s=timeout_s,
-                max_retries=max_retries,
-                rate_limiter=rate_limiter,
-            )
-        except Exception as e:
-            logger.warning(f'USDA query failed for ingredient="{ingredient}": {e}')
-            nutrient_row = _empty_usda_nutrient_row()
-
+    for i, ingredient in enumerate(canonical_ingredients, start=1):
+        food_match = _select_best_usda_food(ingredient, foods, desc_lowers)
+        nutrient_row = (
+            _nutrient_row_from_usda_food(food_match)
+            if food_match is not None
+            else _empty_usda_nutrient_row()
+        )
         nutrient_row['canonical_ingredient'] = ingredient
         nutrient_row['computed_date'] = computed_date
-        return nutrient_row
-
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {
-            pool.submit(_fetch_one, ingredient): ingredient
-            for ingredient in canonical_ingredients
-        }
-        for i, fut in enumerate(as_completed(futures), start=1):
-            rows.append(fut.result())
-            if i % 50 == 0 or i == len(canonical_ingredients):
-                logger.info(f'USDA progress: {i}/{len(canonical_ingredients)}')
+        rows.append(nutrient_row)
+        if i % 50 == 0 or i == len(canonical_ingredients):
+            logger.info(f'USDA local lookup progress: {i}/{len(canonical_ingredients)}')
 
     usda_df = pd.DataFrame(rows)
     usda_df.to_parquet(USDA_NUTRIENTS_STAGING, index=False)

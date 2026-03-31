@@ -45,6 +45,7 @@ services:
       - ./data:/opt/airflow/data
       - ./staging:/opt/airflow/staging
       - ${HOME}/.kaggle:/home/airflow/.kaggle:ro
+      - ./usda_data:/opt/airflow/usda_data
     ports:
       - "8080:8080"
     command: >
