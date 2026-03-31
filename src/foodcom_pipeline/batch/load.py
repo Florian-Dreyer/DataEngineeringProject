@@ -261,25 +261,11 @@ def _ensure_schema(engine) -> None:
     with engine.begin() as conn:
         conn.execute(text(ddl))
 
-        # If tables pre-existed with narrower integer types, widen them safely.
-        # This is idempotent: Postgres will keep BIGINT if already widened.
-        try:
-            conn.execute(text('ALTER TABLE dim_recipe ALTER COLUMN recipe_id TYPE BIGINT'))
-        except Exception:
-            pass
-        try:
-            conn.execute(
-                text('ALTER TABLE fact_interactions ALTER COLUMN recipe_id TYPE BIGINT')
-            )
-        except Exception:
-            pass
-        try:
-            conn.execute(
-                text('ALTER TABLE recent_interactions ALTER COLUMN recipe_id TYPE BIGINT')
-            )
-        except Exception:
-            pass
+    # one transaction each so a failure does not poison
+    # _ensure_dim_recipe_columns / _ensure_dim_canonical_ingredient_nutrients_columns.
 
+
+    with engine.begin() as conn:
         _ensure_dim_recipe_columns(conn)
         _ensure_dim_canonical_ingredient_nutrients_columns(conn)
 
