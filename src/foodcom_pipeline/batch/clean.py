@@ -477,6 +477,30 @@ def _load_ingr_map(path) -> dict[str, str]:
             out[str(k).strip().lower()] = str(v).strip().lower()
         return out
 
+    # Kaggle's ingr_map.pkl is often a DataFrame with raw ingredient variants
+    # mapped to a canonical replacement string (usually in "replaced").
+    if isinstance(obj, pd.DataFrame):
+        cols = {c.lower(): c for c in obj.columns}
+        raw_col = cols.get('raw_ingr') or cols.get('raw_ingredient') or cols.get('raw')
+        canon_col = (
+            cols.get('replaced') or cols.get('canonical') or cols.get('canonical_form')
+        )
+
+        if raw_col and canon_col:
+            out: dict[str, str] = {}
+            for _, row in obj.iterrows():
+                raw = row.get(raw_col)
+                canon = row.get(canon_col)
+                if pd.notnull(raw) and pd.notnull(canon):
+                    out[str(raw).strip().lower()] = str(canon).strip().lower()
+            if out:
+                return out
+
+        raise TypeError(
+            'Unsupported ingr_map.pkl DataFrame shape. '
+            f'Columns found: {list(obj.columns)}'
+        )
+
     raise TypeError(f'Unsupported ingr_map.pkl structure: {type(obj)!r}')
 
 
@@ -503,10 +527,47 @@ def _normalize_ingredients(
 
     if ingr_map:
         # Map normalized ingredient strings onto canonical forms required
-        # for consistent USDA lookup.
+        # for consistent USDA lookup, and log fallback behavior.
+        mapped_count = 0
+        fallback_count = 0
+        fallback_samples: list[str] = []
+
+        def _map_ingredient_list(lst):
+            nonlocal mapped_count, fallback_count, fallback_samples
+            if not isinstance(lst, list):
+                return []
+
+            out = []
+            for ing in lst:
+                canon = ingr_map.get(ing)
+                if canon is None:
+                    fallback_count += 1
+                    if len(fallback_samples) < 20:
+                        fallback_samples.append(ing)
+                    out.append(ing)
+                else:
+                    mapped_count += 1
+                    out.append(canon)
+            return out
+
         df['ingredients_canonical_list'] = df['ingredients_parsed'].apply(
-            lambda lst: [ingr_map.get(ing, ing) for ing in lst] if isinstance(lst, list) else []
+            _map_ingredient_list
         )
+
+        total = mapped_count + fallback_count
+        if total > 0:
+            logger.info(
+                'Ingredient canonical mapping: mapped=%s fallback=%s fallback_rate=%.1f%%',
+                f'{mapped_count:,}',
+                f'{fallback_count:,}',
+                100.0 * fallback_count / total,
+            )
+        if fallback_count > 0:
+            logger.info("some ingredients not found in ingr_map")
+            logger.info(
+                'Fallback ingredients not found in ingr_map (sample): %s',
+                sorted(set(fallback_samples)),
+            )
     else:
         df['ingredients_canonical_list'] = df['ingredients_parsed']
 
