@@ -9,10 +9,11 @@ the step is fully idempotent — rerunning the same DAG twice produces the
 same result.
 
 Load order matters due to foreign key constraints:
-  1. dim_date          (no FK dependencies)
-  2. dim_recipe        (no FK dependencies)
-  3. dim_user          (no FK dependencies)
-  4. fact_interactions (FKs → dim_date, dim_recipe, dim_user)
+  1. dim_date                              (no FK dependencies)
+  2. dim_recipe                            (no FK dependencies)
+  3. dim_canonical_ingredient_nutrients   (no FK dependencies; from staging parquet)
+  4. dim_user                              (no FK dependencies)
+  5. fact_interactions                     (FKs → dim_date, dim_recipe, dim_user)
 
 Star schema (from project plan):
   fact_interactions : interaction_id, user_id, recipe_id, date_id, rating,
@@ -37,6 +38,7 @@ from foodcom_pipeline.batch.clean import (
     load_cleaned_recipes,
 )
 from foodcom_pipeline.batch.cluster import load_user_clusters
+from foodcom_pipeline.batch.extract import USDA_NUTRIENTS_STAGING
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 from sqlalchemy import create_engine, text
 
@@ -56,6 +58,59 @@ UPSERT_BATCH_SIZE = 5_000
 # Bayesian shrinkage strength for recipe-level sentiment_rating.
 # Higher m => more shrinkage toward global mean for low-sample recipes.
 SENTIMENT_SHRINKAGE_M = float(os.getenv('FOODCOM_SENTIMENT_SHRINKAGE_M', '100'))
+
+# Non-PK columns on dim_recipe that loaders expect (legacy DBs may lack some).
+_DIM_RECIPE_NON_PK_COLUMNS: tuple[tuple[str, str], ...] = (
+    ('name', 'TEXT'),
+    ('avg_rating', 'DOUBLE PRECISION'),
+    ('review_count', 'INTEGER'),
+    ('sentiment_rating', 'DOUBLE PRECISION'),
+    ('avg_cook_minutes', 'DOUBLE PRECISION'),
+    ('top_ingredients', 'TEXT'),
+    ('tags', 'TEXT'),
+    ('ingredient_count', 'INTEGER'),
+    ('calories', 'DOUBLE PRECISION'),
+    ('protein', 'DOUBLE PRECISION'),
+    ('fat', 'DOUBLE PRECISION'),
+    ('sugar', 'DOUBLE PRECISION'),
+    ('sodium', 'DOUBLE PRECISION'),
+    ('carbs', 'DOUBLE PRECISION'),
+    ('saturated_fat', 'DOUBLE PRECISION'),
+    ('balance_score', 'DOUBLE PRECISION'),
+)
+
+
+def _ensure_dim_recipe_columns(conn) -> None:
+    """Adds any missing dim_recipe columns so upserts match the current code."""
+    for col, pg_type in _DIM_RECIPE_NON_PK_COLUMNS:
+        conn.execute(
+            text(
+                f'ALTER TABLE public.dim_recipe ADD COLUMN IF NOT EXISTS {col} {pg_type}'
+            )
+        )
+
+
+_DIM_CANONICAL_INGREDIENT_NON_PK_COLUMNS: tuple[tuple[str, str], ...] = (
+    ('computed_date', 'DATE'),
+    ('calories_per_100g', 'DOUBLE PRECISION'),
+    ('protein_g_per_100g', 'DOUBLE PRECISION'),
+    ('fat_g_per_100g', 'DOUBLE PRECISION'),
+    ('saturated_fat_g_per_100g', 'DOUBLE PRECISION'),
+    ('sugar_g_per_100g', 'DOUBLE PRECISION'),
+    ('sodium_g_per_100g', 'DOUBLE PRECISION'),
+    ('carbs_g_per_100g', 'DOUBLE PRECISION'),
+)
+
+
+def _ensure_dim_canonical_ingredient_nutrients_columns(conn) -> None:
+    """Adds any missing columns on dim_canonical_ingredient_nutrients."""
+    for col, pg_type in _DIM_CANONICAL_INGREDIENT_NON_PK_COLUMNS:
+        conn.execute(
+            text(
+                f'ALTER TABLE public.dim_canonical_ingredient_nutrients '
+                f'ADD COLUMN IF NOT EXISTS {col} {pg_type}'
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +144,7 @@ def run_load(**context) -> None:
     # Build dimension tables first, then facts
     date_map = _load_dim_date(engine, interactions)
     _load_dim_recipe(engine, recipes, interactions)
+    _load_dim_canonical_ingredient_nutrients(engine)
     _load_dim_user(engine, users)
     _load_fact_interactions(engine, interactions, date_map)
 
@@ -140,6 +196,18 @@ def _ensure_schema(engine) -> None:
         carbs            FLOAT,
         saturated_fat    FLOAT,
         balance_score    FLOAT
+    );
+
+    CREATE TABLE IF NOT EXISTS dim_canonical_ingredient_nutrients (
+        canonical_ingredient     TEXT PRIMARY KEY,
+        computed_date             DATE,
+        calories_per_100g         DOUBLE PRECISION,
+        protein_g_per_100g        DOUBLE PRECISION,
+        fat_g_per_100g            DOUBLE PRECISION,
+        saturated_fat_g_per_100g  DOUBLE PRECISION,
+        sugar_g_per_100g          DOUBLE PRECISION,
+        sodium_g_per_100g         DOUBLE PRECISION,
+        carbs_g_per_100g          DOUBLE PRECISION
     );
 
     CREATE TABLE IF NOT EXISTS dim_user (
@@ -212,25 +280,8 @@ def _ensure_schema(engine) -> None:
         except Exception:
             pass
 
-        # Add new recipe enrichment columns if the table pre-existed.
-        recipe_cols = [
-            'calories',
-            'protein',
-            'fat',
-            'sugar',
-            'sodium',
-            'carbs',
-            'saturated_fat',
-            'balance_score',
-        ]
-        for col in recipe_cols:
-            try:
-                conn.execute(
-                    text(f'ALTER TABLE dim_recipe ADD COLUMN IF NOT EXISTS {col} FLOAT')
-                )
-            except Exception:
-                # If the environment is too old for IF NOT EXISTS, ignore.
-                pass
+        _ensure_dim_recipe_columns(conn)
+        _ensure_dim_canonical_ingredient_nutrients_columns(conn)
 
     logger.info('Schema ensured (tables and serving view created if not existing).')
 
@@ -279,6 +330,9 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
     Computes avg_rating and review_count from interactions so these
     reflect the current batch's data.
     """
+    with engine.begin() as conn:
+        _ensure_dim_recipe_columns(conn)
+
     # Compute recipe-level aggregates from interactions
     recipe_agg = (
         interactions.groupby('recipe_id')
@@ -439,6 +493,80 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
 
     _bulk_upsert(engine, dim, upsert_sql)
     logger.info(f'dim_recipe: upserted {len(dim):,} recipes.')
+
+
+# ---------------------------------------------------------------------------
+# dim_canonical_ingredient_nutrients
+# ---------------------------------------------------------------------------
+
+
+def _load_dim_canonical_ingredient_nutrients(engine) -> None:
+    """
+    Upserts per-canonical-ingredient USDA nutrient rows from staging parquet
+    (one row per distinct canonical string from ingr_map / extract_usda_nutrients).
+    """
+    if not USDA_NUTRIENTS_STAGING.is_file():
+        logger.warning(
+            'No %s; skipping dim_canonical_ingredient_nutrients load.',
+            USDA_NUTRIENTS_STAGING,
+        )
+        return
+
+    df = pd.read_parquet(USDA_NUTRIENTS_STAGING)
+    expected = [
+        'canonical_ingredient',
+        'computed_date',
+        'calories_per_100g',
+        'protein_g_per_100g',
+        'fat_g_per_100g',
+        'saturated_fat_g_per_100g',
+        'sugar_g_per_100g',
+        'sodium_g_per_100g',
+        'carbs_g_per_100g',
+    ]
+    missing = set(expected) - set(df.columns)
+    if missing:
+        raise ValueError(
+            f'USDA nutrients parquet missing columns {missing}: {USDA_NUTRIENTS_STAGING}'
+        )
+
+    df = df[expected].drop_duplicates(subset=['canonical_ingredient'], keep='first')
+    if df.empty:
+        logger.info('dim_canonical_ingredient_nutrients: parquet has no rows to upsert.')
+        return
+
+    df['computed_date'] = pd.to_datetime(df['computed_date']).dt.date
+
+    with engine.begin() as conn:
+        _ensure_dim_canonical_ingredient_nutrients_columns(conn)
+
+    upsert_sql = """
+        INSERT INTO dim_canonical_ingredient_nutrients (
+            canonical_ingredient, computed_date,
+            calories_per_100g, protein_g_per_100g, fat_g_per_100g,
+            saturated_fat_g_per_100g, sugar_g_per_100g, sodium_g_per_100g, carbs_g_per_100g
+        )
+        VALUES (
+            :canonical_ingredient, :computed_date,
+            :calories_per_100g, :protein_g_per_100g, :fat_g_per_100g,
+            :saturated_fat_g_per_100g, :sugar_g_per_100g, :sodium_g_per_100g, :carbs_g_per_100g
+        )
+        ON CONFLICT (canonical_ingredient) DO UPDATE SET
+            computed_date = EXCLUDED.computed_date,
+            calories_per_100g = EXCLUDED.calories_per_100g,
+            protein_g_per_100g = EXCLUDED.protein_g_per_100g,
+            fat_g_per_100g = EXCLUDED.fat_g_per_100g,
+            saturated_fat_g_per_100g = EXCLUDED.saturated_fat_g_per_100g,
+            sugar_g_per_100g = EXCLUDED.sugar_g_per_100g,
+            sodium_g_per_100g = EXCLUDED.sodium_g_per_100g,
+            carbs_g_per_100g = EXCLUDED.carbs_g_per_100g
+    """
+
+    _bulk_upsert(engine, df, upsert_sql)
+    logger.info(
+        'dim_canonical_ingredient_nutrients: upserted %s canonical ingredients.',
+        f'{len(df):,}',
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +736,7 @@ def _log_row_counts(engine) -> None:
     tables = [
         'dim_date',
         'dim_recipe',
+        'dim_canonical_ingredient_nutrients',
         'dim_user',
         'fact_interactions',
         'recent_interactions',

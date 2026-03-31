@@ -19,6 +19,7 @@ services:
       - postgres
     environment:
       USDA_API_KEY: ${USDA_API_KEY}
+      FOODCOM_USDA_FORCE_REFRESH: ${FOODCOM_USDA_FORCE_REFRESH:-false}
       # Airflow metadata DB (kept in Postgres for simplicity)
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-foodcom}

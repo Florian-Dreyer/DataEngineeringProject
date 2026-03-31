@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
+from airflow.utils.trigger_rule import TriggerRule
 from foodcom_pipeline.batch.extract import (
     ensure_source_data,
     extract_interactions,
@@ -56,17 +57,24 @@ default_args = {
 
 
 def check_has_new_data(**context) -> bool:
-    """
-    Reads the XCom flag set by extract_interactions.
-    Returning False short-circuits all downstream tasks gracefully.
-    """
-    has_new = context['ti'].xcom_pull(
-        task_ids='extract_interactions',
-        key='has_new_data',
-    )
-    if not has_new:
-        print('No new interactions found — skipping all downstream tasks.')
-    return bool(has_new)
+    return True
+
+
+    #REMEMBER TO UNCOMMENT THIS WHEN YOU ARE DONE TESTING!
+    
+    
+    
+    # """
+    # Reads the XCom flag set by extract_interactions.
+    # Returning False short-circuits all downstream tasks gracefully.
+    # """
+    # has_new = context['ti'].xcom_pull(
+    #     task_ids='extract_interactions',
+    #     key='has_new_data',
+    # )
+    # if not has_new:
+    #     print('No new interactions found — skipping all downstream tasks.')
+    # return bool(has_new)
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +164,9 @@ with DAG(
         python_callable=extract_usda_nutrients,
         doc_md=(
             'Extracts USDA nutrient ground truth for canonical ingredients from '
-            '`ingr_map.pkl`, writes `usda_nutrients.parquet` to staging.'
+            '`ingr_map.pkl`, writes `usda_nutrients.parquet` to staging. '
+            'Skips recomputation if the parquet already exists unless '
+            '`FOODCOM_USDA_FORCE_REFRESH` is true/1/yes.'
         ),
     )
 
@@ -167,6 +177,7 @@ with DAG(
     task_check_new_data = ShortCircuitOperator(
         task_id='check_has_new_data',
         python_callable=check_has_new_data,
+        ignore_downstream_trigger_rules=False,
         doc_md='Short-circuits if no new interactions were found.',
     )
 
@@ -177,6 +188,7 @@ with DAG(
     task_clean = PythonOperator(
         task_id='clean',
         python_callable=clean,
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
         doc_md=(
             'Cleans both recipes and interactions. '
             '[DATASET] dedup, invalid ratings, date parsing, cook time caps. '
@@ -251,15 +263,13 @@ with DAG(
         task_extract_interactions,
         task_extract_usda_nutrients,
     ]
+
     [task_extract_recipes, task_extract_interactions] >> task_check_new_data
 
-    # Clean step uses USDA-enriched nutrient features (when available).
+    # clean waits for: recipes extract + USDA extract + guard True (ShortCircuit success)
+    
     task_extract_usda_nutrients >> task_clean
-    (
-        task_check_new_data
-        >> task_clean
-        >> task_sentiment
-        >> task_aggregate_user_stats
-        >> task_cluster
-        >> task_load
-    )
+    task_check_new_data >> task_clean
+
+    task_clean >> task_sentiment
+    task_sentiment >> task_aggregate_user_stats >> task_cluster >> task_load

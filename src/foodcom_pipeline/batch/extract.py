@@ -676,6 +676,14 @@ def _nutrient_row_from_usda_food(food: dict[str, Any]) -> dict[str, float | None
     }
 
 
+def _usda_force_refresh() -> bool:
+    return os.getenv('FOODCOM_USDA_FORCE_REFRESH', '').lower() in (
+        '1',
+        'true',
+        'yes',
+    )
+
+
 def extract_usda_nutrients(**context) -> None:
     """
     Extracts USDA FoodData Central nutrient data for canonical ingredients from ingr_map.pkl.
@@ -683,7 +691,42 @@ def extract_usda_nutrients(**context) -> None:
     Uses local bulk JSON under ``FOODCOM_USDA_JSON_DIR`` (Foundation, SR Legacy, FNDDS survey),
     not the public API. Writes `usda_nutrients.parquet` into the Airflow staging directory so
     downstream transforms can join recipe ingredients against USDA nutrient ground truth.
+
+    If ``usda_nutrients.parquet`` already exists, the task skips recomputation unless
+    ``FOODCOM_USDA_FORCE_REFRESH`` is set to a truthy value (``1``/``true``/``yes``),
+    in which case the file is rebuilt from scratch.
     """
+    force_refresh = _usda_force_refresh()
+    if USDA_NUTRIENTS_STAGING.is_file() and not force_refresh:
+        try:
+            existing = pd.read_parquet(USDA_NUTRIENTS_STAGING)
+        except Exception as e:
+            logger.warning(
+                'Could not read existing %s (%s); rebuilding USDA nutrients.',
+                USDA_NUTRIENTS_STAGING,
+                e,
+            )
+        else:
+            cov = int(existing['calories_per_100g'].notna().sum())
+            rate = cov / max(1, len(existing))
+            logger.info(
+                'Skipping USDA extract: %s already exists and '
+                'FOODCOM_USDA_FORCE_REFRESH is not set (%s rows, calories coverage %.1f%%).',
+                USDA_NUTRIENTS_STAGING,
+                len(existing),
+                100.0 * rate,
+            )
+            context['ti'].xcom_push(key='usda_coverage_rate', value=float(rate))
+            context['ti'].xcom_push(key='usda_rows', value=int(len(existing)))
+            context['ti'].xcom_push(key='usda_extract_skipped', value=True)
+            return
+
+    if force_refresh and USDA_NUTRIENTS_STAGING.is_file():
+        logger.info(
+            'FOODCOM_USDA_FORCE_REFRESH is set; rebuilding %s',
+            USDA_NUTRIENTS_STAGING,
+        )
+
     usda_dir = Path(
         os.getenv('FOODCOM_USDA_JSON_DIR', str(_default_usda_json_dir()))
     )
@@ -739,6 +782,7 @@ def extract_usda_nutrients(**context) -> None:
     )
     context['ti'].xcom_push(key='usda_coverage_rate', value=float(coverage_rate))
     context['ti'].xcom_push(key='usda_rows', value=int(len(usda_df)))
+    context['ti'].xcom_push(key='usda_extract_skipped', value=False)
 
 
 # ---------------------------------------------------------------------------
