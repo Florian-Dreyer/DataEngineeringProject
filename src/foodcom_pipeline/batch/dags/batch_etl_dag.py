@@ -55,6 +55,7 @@ default_args = {
 # Guard
 # ---------------------------------------------------------------------------
 
+ #REMEMBER TO UNCOMMENT THIS WHEN YOU ARE DONE TESTING!
 
 def check_has_new_data(**context) -> bool:
     return True
@@ -176,7 +177,7 @@ with DAG(
 
     task_check_new_data = ShortCircuitOperator(
         task_id='check_has_new_data',
-        python_callable=check_has_new_data,
+        python_callable=check_has_new_data, #remember to uncomment this when you are done testing!
         ignore_downstream_trigger_rules=False,
         doc_md='Short-circuits if no new interactions were found.',
     )
