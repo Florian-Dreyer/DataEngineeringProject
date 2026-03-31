@@ -14,17 +14,24 @@ Responsibilities:
   4. Produce cluster profile statistics for the report / Streamlit dashboard
   5. Stage results for the load step
 
-Features used for clustering (all user-level aggregates):
-  - avg_rating_given      : mean star rating across all reviews
-  - review_count          : total number of reviews submitted
-  - recipe_diversity      : number of unique recipes reviewed
-  - avg_sentiment_score   : mean DistilBERT sentiment score across reviews
+Features used for clustering:
+  Taste profile (avg rating per ingredient category):
+  - avg_rating_dairy        : avg rating given to dairy-heavy recipes
+  - avg_rating_protein      : avg rating given to protein-heavy recipes
+  - avg_rating_vegetable    : avg rating given to vegetable-heavy recipes
+  - avg_rating_baking       : avg rating given to baking-heavy recipes
+  - avg_rating_international: avg rating given to international-ingredient recipes
+  Behavioural signals:
+  - review_count            : total reviews submitted
+  - recipe_diversity        : number of unique recipes reviewed
+  - avg_sentiment_score     : mean VADER sentiment score
 
 Cluster label heuristics (assigned after fitting based on centroid values):
-  - Enthusiastic Cook  : high rating, high volume, positive sentiment
-  - Harsh Critic       : low rating, moderate volume, negative sentiment
-  - Casual Rater       : low volume, middling rating
-  - Power User         : very high volume, high diversity
+  - Indulgent Baker      : highest avg_rating_baking
+  - International Explorer: highest avg_rating_international
+  - Protein-Forward Cook : highest avg_rating_protein
+  - Health-Conscious Cook: highest avg_rating_vegetable
+  - Quick & Simple       : remainder
 """
 
 import json
@@ -32,7 +39,7 @@ import logging
 
 import numpy as np
 import pandas as pd
-from foodcom_pipeline.batch.aggregate_user_stats import load_user_stats
+from foodcom_pipeline.batch.features import load_user_stats
 from foodcom_pipeline.batch.extract import STAGING_DIR
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
@@ -48,26 +55,21 @@ CLUSTER_STAGING = STAGING_DIR / 'user_clusters.parquet'
 ELBOW_STATS_PATH = STAGING_DIR / 'elbow_stats.json'
 CLUSTER_PROFILE_PATH = STAGING_DIR / 'cluster_profiles.json'
 
-K_RANGE = range(2, 9)  # k values to evaluate in elbow method
-DEFAULT_K = 4  # fallback if elbow is ambiguous
+K_RANGE = [4, 5, 6]  # k values to evaluate via silhouette score
 RANDOM_STATE = 42
 
 CLUSTER_FEATURES = [
-    'avg_rating_given',
+    # Taste profile — avg rating per ingredient category
+    'avg_rating_dairy',
+    'avg_rating_protein',
+    'avg_rating_vegetable',
+    'avg_rating_baking',
+    'avg_rating_international',
+    # Behavioural signals — activity and consistency
     'review_count',
     'recipe_diversity',
     'avg_sentiment_score',
 ]
-
-# Human-readable label mapping: assigned post-hoc based on centroid inspection.
-# Keys are centroid rank tuples (high/low per feature) — updated after fitting.
-# These are heuristics; adjust after inspecting your actual cluster centroids.
-LABEL_HEURISTICS = {
-    'high_rating_high_volume': 'Enthusiastic Cook',
-    'low_rating_any_volume': 'Harsh Critic',
-    'low_volume': 'Casual Rater',
-    'high_volume_high_diversity': 'Power User',
-}
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +80,7 @@ LABEL_HEURISTICS = {
 def run_clustering(**context) -> None:
     """
     Main clustering entry point.
-      1. Load pre-computed user stats from aggregate_user_stats.py
+      1. Load pre-computed user stats from features.py
       2. Determine optimal k (elbow + silhouette), first run only
       3. Fit K-Means
       4. Assign interpretable labels
@@ -120,111 +122,56 @@ def run_clustering(**context) -> None:
 
 def _determine_optimal_k(user_features: pd.DataFrame) -> int:
     """
-    Runs the elbow method and silhouette analysis to find the optimal k.
-    Results are saved to ELBOW_STATS_PATH.
-
-    If the stats file already exists (subsequent DAG runs), we load the
-    previously determined k rather than recomputing — clustering should
-    be stable across runs to keep cluster IDs consistent for the dashboard.
-
-    Returns the chosen k.
+    Tests k in K_RANGE using silhouette score and selects the k with the highest score.
+    Results are cached to ELBOW_STATS_PATH; if the file exists and was computed with the
+    same K_RANGE, the cached k is reused to keep cluster IDs stable across DAG runs.
     """
     if ELBOW_STATS_PATH.exists():
         with open(ELBOW_STATS_PATH) as f:
             stats = json.load(f)
-        k = stats['chosen_k']
-        logger.info(f'Loaded existing elbow stats — using k={k} from previous run.')
-        return k
+        if stats.get('k_range') == K_RANGE:
+            k = stats['chosen_k']
+            logger.info(f'Loaded cached silhouette stats — using k={k} from previous run.')
+            return k
+        logger.info('K_RANGE changed — recomputing silhouette scores.')
 
-    logger.info(f'Running elbow method for k in {list(K_RANGE)}...')
-
+    logger.info(f'Running silhouette analysis for k in {K_RANGE}...')
     X = _scale_features(user_features)
-
-    inertias = []
     silhouettes = []
 
     for k in K_RANGE:
         km = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
         labels = km.fit_predict(X)
-        inertias.append(float(km.inertia_))
-
-        # Silhouette is expensive on large datasets — subsample if needed
         sample_size = min(10_000, len(X))
-        idx = np.random.default_rng(RANDOM_STATE).choice(
-            len(X), sample_size, replace=False
-        )
+        idx = np.random.default_rng(RANDOM_STATE).choice(len(X), sample_size, replace=False)
         sil = silhouette_score(X[idx], labels[idx])
         silhouettes.append(float(sil))
+        logger.info(f'  k={k}: silhouette={sil:.4f}')
 
-        logger.info(f'  k={k}: inertia={km.inertia_:.1f}, silhouette={sil:.4f}')
+    chosen_k = K_RANGE[int(np.argmax(silhouettes))]
+    logger.info(f'Chosen k={chosen_k} (highest silhouette score)')
 
-    chosen_k = _elbow_k(list(K_RANGE), inertias, silhouettes)
-    logger.info(f'Chosen k={chosen_k} (elbow + silhouette combined)')
-
-    stats = {
-        'k_range': list(K_RANGE),
-        'inertias': inertias,
-        'silhouettes': silhouettes,
-        'chosen_k': chosen_k,
-    }
+    stats = {'k_range': K_RANGE, 'silhouettes': silhouettes, 'chosen_k': chosen_k}
     with open(ELBOW_STATS_PATH, 'w') as f:
         json.dump(stats, f, indent=2)
 
-    _log_elbow_table(list(K_RANGE), inertias, silhouettes, chosen_k)
+    _log_silhouette_table(K_RANGE, silhouettes, chosen_k)
     return chosen_k
 
 
-def _elbow_k(
+def _log_silhouette_table(
     k_range: list[int],
-    inertias: list[float],
-    silhouettes: list[float],
-) -> int:
-    """
-    Combines two signals to pick k:
-      1. Elbow point: largest second-order difference in inertia
-         (point of diminishing returns on the inertia curve)
-      2. Silhouette peak: k with highest silhouette score
-
-    If they agree → use that k.
-    If they disagree → use silhouette peak (more interpretable metric).
-    Falls back to DEFAULT_K if both methods are inconclusive.
-    """
-    # Elbow via second-order differences in inertia
-    inertia_arr = np.array(inertias)
-    second_diff = np.diff(np.diff(inertia_arr))
-    elbow_idx = int(np.argmax(second_diff)) + 2  # offset for two diffs
-    elbow_k = k_range[elbow_idx]
-
-    # Silhouette peak
-    sil_k = k_range[int(np.argmax(silhouettes))]
-
-    logger.info(f'Elbow method suggests k={elbow_k}, silhouette suggests k={sil_k}')
-
-    if elbow_k == sil_k:
-        return elbow_k
-
-    # Disagreement — prefer silhouette as it's more interpretable
-    logger.warning(
-        f'Elbow (k={elbow_k}) and silhouette (k={sil_k}) disagree. '
-        f'Using silhouette peak k={sil_k}.'
-    )
-    return sil_k
-
-
-def _log_elbow_table(
-    k_range: list[int],
-    inertias: list[float],
     silhouettes: list[float],
     chosen_k: int,
 ) -> None:
-    logger.info('=' * 52)
-    logger.info('  Elbow Method Results')
-    logger.info('=' * 52)
-    logger.info(f"  {'k':>4}  {'Inertia':>14}  {'Silhouette':>12}  {'':>6}")
-    for k, inertia, sil in zip(k_range, inertias, silhouettes):
+    logger.info('=' * 36)
+    logger.info('  Silhouette Score Results')
+    logger.info('=' * 36)
+    logger.info(f"  {'k':>4}  {'Silhouette':>12}")
+    for k, sil in zip(k_range, silhouettes):
         marker = ' ← chosen' if k == chosen_k else ''
-        logger.info(f'  {k:>4}  {inertia:>14.1f}  {sil:>12.4f}{marker}')
-    logger.info('=' * 52)
+        logger.info(f'  {k:>4}  {sil:>12.4f}{marker}')
+    logger.info('=' * 36)
 
 
 # ---------------------------------------------------------------------------
@@ -308,43 +255,43 @@ def _assign_labels(
 
 def _heuristic_label_assignment(centroids: pd.DataFrame) -> dict[int, str]:
     """
-    Assigns labels based on relative centroid ranks.
+    Assigns labels based on which ingredient category each cluster rates most highly.
 
-    Rules (applied in order, first match wins):
-      Power User        : highest review_count
-      Harsh Critic      : lowest avg_rating_given
-      Enthusiastic Cook : highest avg_rating_given AND above-median sentiment
-      Casual Rater      : remainder (typically low volume)
+    Rules (applied in order, first match wins per category feature):
+      Indulgent Baker       : highest avg_rating_baking
+      International Explorer: highest avg_rating_international
+      Protein-Forward Cook  : highest avg_rating_protein
+      Health-Conscious Cook : highest avg_rating_vegetable
+      Quick & Simple        : remainder
     """
     label_map = {}
     used_ids = set()
 
-    def rank_cluster(feature: str, highest: bool = True) -> int:
-        sorted_c = centroids.sort_values(feature, ascending=not highest)
+    def rank_cluster(feature: str) -> int:
+        sorted_c = centroids.sort_values(feature, ascending=False)
         for cid in sorted_c['cluster_id']:
             if cid not in used_ids:
                 return int(cid)
         return -1
 
-    # Power User — highest review count
-    power_user_id = rank_cluster('review_count', highest=True)
-    label_map[power_user_id] = 'Power User'
-    used_ids.add(power_user_id)
+    assignments = [
+        ('avg_rating_baking',        'Indulgent Baker'),
+        ('avg_rating_international', 'International Explorer'),
+        ('avg_rating_protein',       'Protein-Forward Cook'),
+        ('avg_rating_vegetable',     'Health-Conscious Cook'),
+    ]
 
-    # Harsh Critic — lowest avg rating
-    harsh_critic_id = rank_cluster('avg_rating_given', highest=False)
-    label_map[harsh_critic_id] = 'Harsh Critic'
-    used_ids.add(harsh_critic_id)
+    for feature, label in assignments:
+        if feature not in centroids.columns:
+            continue
+        cid = rank_cluster(feature)
+        if cid >= 0:
+            label_map[cid] = label
+            used_ids.add(cid)
 
-    # Enthusiastic Cook — highest avg rating among remaining
-    enthusiastic_id = rank_cluster('avg_rating_given', highest=True)
-    label_map[enthusiastic_id] = 'Enthusiastic Cook'
-    used_ids.add(enthusiastic_id)
-
-    # Casual Rater — everything else
     for cid in centroids['cluster_id']:
         if int(cid) not in used_ids:
-            label_map[int(cid)] = 'Casual Rater'
+            label_map[int(cid)] = 'Quick & Simple'
 
     return label_map
 

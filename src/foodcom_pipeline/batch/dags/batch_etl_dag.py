@@ -7,8 +7,8 @@ Pipeline stages:
   1. extract_recipes + extract_interactions  [PARALLEL]
   2. check_has_new_data                      [SHORT CIRCUIT]
   3. clean                                   [SEQUENTIAL]
-  4. run_distilbert_sentiment                [SEQUENTIAL]
-  5. aggregate_user_stats                    [SEQUENTIAL]
+  4. run_vader_sentiment                     [SEQUENTIAL]
+  5. features                                [SEQUENTIAL]
   6. run_kmeans_clustering                   [SEQUENTIAL]
   7. load_to_star_schema                     [SEQUENTIAL]
 
@@ -18,10 +18,10 @@ Dependency graph:
                          ├──► check_has_new_data ──► clean ──► sentiment
   extract_interactions ──┘
 
-  ──► aggregate_user_stats ──► cluster ──► load
+  ──► features ──► cluster ──► load
 
-Rationale for separating aggregate_user_stats from cluster:
-  - Aggregation is cheap and can be retried independently of K-Means fitting
+Rationale for separating features from cluster:
+  - Feature engineering is cheap and can be retried independently of K-Means fitting
   - User stats (dim_user) are needed by the load step regardless of clustering
   - Each step has a single, clearly scoped responsibility
 """
@@ -95,12 +95,10 @@ def run_sentiment(**context):
     run_sentiment(**context)
 
 
-def aggregate_user_stats(**context):
-    from foodcom_pipeline.batch.aggregate_user_stats import (
-        run_aggregate_user_stats,
-    )
+def run_features(**context):
+    from foodcom_pipeline.batch.features import run_features as _run_features
 
-    run_aggregate_user_stats(**context)
+    _run_features(**context)
 
 
 def run_clustering(**context):
@@ -122,8 +120,8 @@ def load(**context):
 with DAG(
     dag_id='foodcom_batch_pipeline',
     description=(
-        'Lambda batch layer: parallel extract → clean → DistilBERT sentiment '
-        '→ aggregate user stats → K-Means clustering → star schema load'
+        'Lambda batch layer: parallel extract → clean → VADER sentiment '
+        '→ feature engineering → K-Means clustering → star schema load'
     ),
     default_args=default_args,
     schedule_interval='@hourly',
@@ -203,13 +201,12 @@ with DAG(
     # ------------------------------------------------------------------
 
     task_sentiment = PythonOperator(
-        task_id='run_distilbert_sentiment',
+        task_id='run_vader_sentiment',
         python_callable=run_sentiment,
         execution_timeout=timedelta(hours=2),
         doc_md=(
-            'Scores interactions with DistilBERT (SST-2). '
-            'Computes rating_sentiment_gap. '
-            'Produces VADER vs DistilBERT comparison report on first run.'
+            'Scores interactions with VADER compound polarity. '
+            'Computes rating_sentiment_gap.'
         ),
     )
 
@@ -217,15 +214,17 @@ with DAG(
     # Stage 5: Aggregate user stats
     # ------------------------------------------------------------------
 
-    task_aggregate_user_stats = PythonOperator(
-        task_id='aggregate_user_stats',
-        python_callable=aggregate_user_stats,
+    task_features = PythonOperator(
+        task_id='features',
+        python_callable=run_features,
         doc_md=(
-            'Computes per-user aggregate features from scored interactions: '
-            'avg_rating_given, review_count, recipe_diversity, '
+            'Computes all derived features before clustering. '
+            'Per-user stats: avg_rating_given, review_count, recipe_diversity, '
             'avg_sentiment_score, avg_rating_gap, std_rating_given, '
             'pct_positive_sentiment, active_days. '
-            'Output feeds both cluster.py and load.py (dim_user).'
+            'Per-recipe Bayesian sentiment_rating (inverse-frequency + shrinkage). '
+            'Ingredient-level features + substitution candidate flags. '
+            'Outputs feed cluster.py and load.py.'
         ),
     )
 
@@ -237,10 +236,10 @@ with DAG(
         task_id='run_kmeans_clustering',
         python_callable=run_clustering,
         doc_md=(
-            'Fits K-Means on user stats. '
-            'Determines optimal k via elbow + silhouette on first run. '
-            'Assigns interpretable labels (Enthusiastic Cook, Harsh Critic, '
-            'Casual Rater, Power User). '
+            'Fits K-Means on per-user ingredient category rating features. '
+            'Selects optimal k in [4,5,6] by highest silhouette score on first run. '
+            'Assigns labels (Indulgent Baker, International Explorer, '
+            'Protein-Forward Cook, Health-Conscious Cook, Quick & Simple). '
             'Produces per-cluster profile statistics.'
         ),
     )
@@ -273,4 +272,4 @@ with DAG(
     task_check_new_data >> task_clean
 
     task_clean >> task_sentiment
-    task_sentiment >> task_aggregate_user_stats >> task_cluster >> task_load
+    task_sentiment >> task_features >> task_cluster >> task_load
