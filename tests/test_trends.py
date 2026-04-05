@@ -54,15 +54,19 @@ class TestExtractGoogleTrends:
     @patch("foodcom_pipeline.extraction.trends.TrendReq")
     def test_extract_success(self, mock_trend_req):
         """Test successful extraction with mocked API."""
+        """Test successful extraction with mocked API."""
         # Create mock data
         mock_pytrends = Mock()
         mock_trend_req.return_value = mock_pytrends
 
         # Mock interest_over_time
         interest_data = pd.DataFrame({
-            "date": pd.date_range("2020-01-01", periods=3, freq="W"),
+            "date": pd.date_range("2020-01-01", periods=3, freq="ME"),  # Monthly end dates
             "pizza": [50, 60, 70],
-            "pasta": [40, 50, 60]
+            "pasta": [40, 50, 60],
+            "sushi": [30, 40, 50],
+            "tacos": [20, 30, 40],
+            "curry": [25, 35, 45]
         })
         mock_pytrends.interest_over_time.return_value = interest_data
 
@@ -79,17 +83,35 @@ class TestExtractGoogleTrends:
                     "query": ["pasta carbonara", "pasta salad"],
                     "value": [90, 70]
                 })
+            },
+            "sushi": {
+                "rising": pd.DataFrame({
+                    "query": ["sushi near me", "sushi burrito"],
+                    "value": [85, 65]
+                })
+            },
+            "tacos": {
+                "rising": pd.DataFrame({
+                    "query": ["taco bell", "fish tacos"],
+                    "value": [80, 60]
+                })
+            },
+            "curry": {
+                "rising": pd.DataFrame({
+                    "query": ["curry recipe", "chicken curry"],
+                    "value": [75, 55]
+                })
             }
         }
 
         # Create temp keywords file
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write("pizza\npasta\n")
+            f.write("pizza\npasta\nsushi\ntacos\ncurry\nsalad\n")
             f.flush()
 
             result = extract_google_trends(
                 keywords_file=f.name,
-                batch_size=5,
+                batch_size=4,  # Updated to match new default
                 sleep_time=0  # No sleep for test
             )
 
@@ -100,8 +122,8 @@ class TestExtractGoogleTrends:
         assert list(result.columns) == ["date", "interest_score", "keyword", "geo", "related_queries"]
 
         # Check data
-        assert len(result) == 6  # 3 dates * 2 keywords
-        assert result["keyword"].nunique() == 2
+        assert len(result) == 15  # 3 dates * 5 keywords
+        assert result["keyword"].nunique() == 5
         assert all(result["geo"] == "global")
 
         # Check related queries

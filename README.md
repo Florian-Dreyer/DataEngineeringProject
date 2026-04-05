@@ -13,6 +13,23 @@
 
 The pipeline includes Google Trends data extraction for analyzing search interest patterns of recipe-related keywords. This provides insights into recipe popularity trends over time.
 
+### Features ✅
+- **30 Cuisine Keywords**: Comprehensive coverage of global cuisines and food categories
+- **Monthly Granularity**: Weekly Google Trends data aggregated to monthly summaries
+- **Cross-Batch Normalization**: 'Pasta' anchor keyword ensures comparability across batches
+- **Smart Batching**: Optimized API usage with anchor-based batching (5 keywords per batch)
+- **Related Queries**: Top trending search queries for each keyword
+
+### Data Structure
+```python
+# Output DataFrame columns:
+# - keyword: str (one of 30 cuisine keywords)
+# - date: datetime (monthly end dates)
+# - interest_score: int (0-100, normalized across batches)
+# - geo: str (geographic region)
+# - related_queries: list[str] (rising search queries)
+```
+
 ### Quick Start
 
 ```bash
@@ -23,7 +40,11 @@ pip install -e .
 python extract_trends.py
 ```
 
-**API Rate Limiting**: Google Trends API may return 429 errors during peak usage. The script handles this gracefully by continuing with remaining batches. If you encounter persistent rate limiting, try running during off-peak hours or reduce batch size.
+**API Rate Limiting**: Google Trends API may return 429 errors during peak usage. The script includes exponential backoff to automatically retry failed batches. If you still encounter rate limiting:
+  - Increase `sleep_time` parameter: `python3 extract_trends.py` (adjust in script if needed)
+  - Reduce `batch_size`: Set to 2-3 instead of 4 in the script
+  - Run during off-peak hours
+  - The script will self-adjust sleep time when rate limits are detected
 
 ### Manual Usage
 
