@@ -2,133 +2,65 @@
 
 > IS3107 Data Engineering — AY2025/2026 Semester 2
 
-An end-to-end **Lambda Architecture** data pipeline over the [Food.com Recipes and User Interactions](https://www.kaggle.com/datasets/shuyangli94/food-com-recipes-and-user-interactions) dataset. The pipeline ingests recipe reviews in real time via Kafka, enriches them with NLP-based sentiment analysis, loads a PostgreSQL star schema via Airflow, and serves insights through a live Streamlit dashboard.
+- **Google Trends integration** — Extract search interest data for recipe keywords to analyze popularity trends
 
----
+## Requirements
 
-## Architecture
+- **Python 3.10+** (tested with Python 3.11)
+- Dependencies: `pip install -e .` or install from `pyproject.toml`
 
-```
-New Review (Kafka)
-       │
-  ┌────┴────┐
-  │         │
-Speed     Batch Layer (Airflow DAG)
-Layer     ├─ Extract & Clean
-│         ├─ DistilBERT Sentiment
-VADER     ├─ K-Means User Clustering
-Sentiment ├─ XGBoost Rating Prediction
-│         └─ Star Schema Load (PostgreSQL)
-  │         │
-  └────┬────┘
-       │
-  Serving Layer (PostgreSQL VIEW)
-       │
-  Streamlit Dashboard
-```
+## Google Trends Extraction
 
-The **speed layer** processes incoming reviews immediately using VADER for low-latency sentiment scoring. The **batch layer** runs on a schedule, applying DistilBERT for higher-accuracy sentiment and overwriting the VADER approximations.
+The pipeline includes Google Trends data extraction for analyzing search interest patterns of recipe-related keywords. This provides insights into recipe popularity trends over time.
 
----
-
-## Features
-
-- **Real-time stream simulation** — Kafka producer replays held-out reviews at configurable speed
-- **Dual sentiment models** — VADER (stream) and DistilBERT (batch), with quantified accuracy comparison
-- **Star schema data warehouse** — `fact_interactions` + `dim_user`, `dim_recipe`, `dim_date`
-- **`rating_sentiment_gap`** — derived feature exposing mismatches between star ratings and review text
-- **User clustering** — K-Means segmentation into interpretable profiles (e.g. Harsh Critic, Enthusiastic Cook)
-- **Rating prediction** — XGBoost regression evaluated with RMSE/MAE
-- **Live Streamlit dashboard** — Recipe Explorer, Trend Analysis, and User Segments tabs
-
----
-
-## Tech Stack
-
-| Component | Technology |
-|---|---|
-| Orchestration | Apache Airflow |
-| Message broker | Apache Kafka + Zookeeper |
-| Database | PostgreSQL |
-| Batch processing | Python, Pandas, scikit-learn |
-| Sentiment (batch) | DistilBERT via HuggingFace Transformers |
-| Sentiment (stream) | VADER via NLTK |
-| ML model | XGBoost |
-| Dashboard | Streamlit |
-| Infrastructure | Docker Compose |
-
----
-
-## Getting Started
-
-### Prerequisites
-- Docker & Docker Compose
-- Python 3.10+
-
-### Setup
+### Quick Start
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/<your-org>/foodcom-pipeline.git
-cd foodcom-pipeline
+# Install dependencies
+pip install -e .
 
-# 2. Copy and fill in environment variables
-cp .env.example .env
-
-# 3. Download the dataset from Kaggle and place in data/raw/
-#    RAW_recipes.csv and RAW_interactions.csv
-
-# 4. Start all services
-docker compose up -d
-
-# 5. Access Airflow UI at http://localhost:8080
-#    Default credentials: airflow / airflow
+# Extract and save data to CSV
+python extract_trends.py
 ```
 
-### Run the pipeline
+**API Rate Limiting**: Google Trends API may return 429 errors during peak usage. The script handles this gracefully by continuing with remaining batches. If you encounter persistent rate limiting, try running during off-peak hours or reduce batch size.
+
+### Manual Usage
 
 ```bash
-# Trigger the batch DAG manually from the Airflow UI,
-# or wait for the scheduled run.
+# Basic extraction (prints first 5 rows)
+python -c "from foodcom_pipeline import extract_google_trends; df = extract_google_trends(); print(df.head())"
 
-# Start the Kafka stream simulation (in a separate terminal)
-python src/stream/producer.py --rate 1  # 1 review/second
+# Extract and save to CSV manually
+python -c "
+from foodcom_pipeline import extract_google_trends
+df = extract_google_trends()
+df.to_csv('data/trends_raw.csv', index=False)
+print(f'Saved {df.shape[0]} rows to data/trends_raw.csv')
+"
 ```
 
-### Launch the dashboard
+### Alternative Execution (if package install fails)
 
 ```bash
-streamlit run src/dashboard/app.py
-# Opens at http://localhost:8501
+# Run directly from src directory
+cd src
+python -c "import sys; sys.path.insert(0, '.'); from foodcom_pipeline.extraction.trends import extract_google_trends; df = extract_google_trends(); print(df.head())"
 ```
 
----
+### Configuration
 
-## Project Structure
+- **Keywords**: Edit `config/trends_keywords.txt` to specify keywords (one per line). When Food.com recipe data becomes available, keywords should be automatically extracted from recipe ingredients and dish names to replace this manual file.
+- **Parameters**: Modify batch size, sleep time, timeframe in the function call
+- **Output**: DataFrame with columns `keyword`, `date`, `interest_score`, `geo`, `related_queries`
 
+**Note**: Google Trends API has rate limits. The extraction batches keywords (5 at a time) with sleep intervals to avoid throttling.
+
+### Pipeline Integration
+
+When the full batch layer is implemented, the flow will be:
 ```
-├── dags/                        # Airflow DAG definitions
-├── src/
-│   └── foodcom_pipeline/        # Main package
-│       ├── __init__.py
-│       ├── batch/                   # Batch layer (runs via Airflow)
-│       │   ├── __init__.py
-│       │   ├── extract.py           # Load CSVs into DataFrames
-│       │   ├── transform.py         # Cleaning & feature engineering
-│       │   ├── sentiment.py         # DistilBERT scoring
-│       │   ├── clustering.py        # K-Means user segmentation
-│       │   ├── model.py             # XGBoost rating prediction
-│       │   └── load.py              # PostgreSQL star schema loaders
-│       ├── stream/                  # Stream layer (speed layer)
-│       │   ├── __init__.py
-│       │   ├── producer.py          # Kafka producer (simulation replay)
-│       │   └── consumer.py          # Kafka consumer, VADER, hot table write
-│       └── dashboard/               # Streamlit app
-│           ├── __init__.py
-│           └── app.py
-├── data/
-│   └── raw/                     # Place Kaggle CSVs here (gitignored)
-├── docker-compose.yml
-├── .env.example
-└── pyproject.toml
+extract_google_trends() → clean() → transform() → load_db()
 ```
+
+**Note**: The `load_db()` function for PostgreSQL insertion is planned but not yet implemented. Keywords for trends analysis should be automatically extracted from Food.com recipe data rather than manually maintained.

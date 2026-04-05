@@ -172,3 +172,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Data files
+# Generated CSV files from data extraction scripts
+data/trends_raw.csv
