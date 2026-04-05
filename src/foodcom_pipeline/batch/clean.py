@@ -395,6 +395,7 @@ def clean_recipes(
     df = _clean_recipe_names(df)
     df = _cap_nutrition_values(df)
     df = _drop_negative_nutrition(df)
+    df = _flag_nutrition_outliers(df)
 
     df = _compute_balance_score(df)
 
@@ -802,6 +803,29 @@ def _cap_nutrition_values(df: pd.DataFrame) -> pd.DataFrame:
         )
         df['calories_pdv'] = df['calories_pdv'].clip(upper=MAX_CALORIES)
 
+    return df
+
+
+def _flag_nutrition_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    [DATASET] Flags recipes where any PDV nutritional value exceeds the 95th percentile.
+
+    Adds a boolean `nutrition_outlier` column — the recipe is retained but should be
+    excluded from nutritional benchmarking and balance_score comparisons.
+    """
+    outlier_mask = pd.Series(False, index=df.index)
+    for col in NUTRITION_COLS:
+        if col not in df.columns:
+            continue
+        threshold = df[col].quantile(0.95)
+        outlier_mask |= df[col] > threshold
+
+    df['nutrition_outlier'] = outlier_mask
+    n = int(outlier_mask.sum())
+    logger.info(
+        f'[DATASET] Nutrition outlier flagging: {n:,} recipes ({n / len(df) * 100:.1f}%) '
+        f'exceed the 95th percentile on at least one PDV column.'
+    )
     return df
 
 
