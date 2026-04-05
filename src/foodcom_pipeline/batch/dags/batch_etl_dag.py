@@ -133,8 +133,9 @@ with DAG(
         task_id='ensure_source_data',
         python_callable=ensure_source_data,
         doc_md=(
-            'Ensures RAW_recipes.csv and RAW_interactions.csv exist. '
-            'If missing, downloads them from Kaggle.'
+            'Ensures RAW_recipes.csv, RAW_interactions.csv, and ingr_map.pkl exist. '
+            'If any file is missing, downloads it from Kaggle. '
+            'Handles ZIP extraction fallback for all three files.'
         ),
     )
 

@@ -128,10 +128,11 @@ def ensure_source_data(**context) -> None:
         f'ingr_map_exists={INGR_MAP_PKL.exists()}'
     )
 
-    # If CSVs are missing but ZIPs exist from a previous Kaggle run, extract first.
+    # If files are missing but ZIPs exist from a previous Kaggle run, extract first.
     logger.info('Attempting pre-download ZIP extraction (if needed).')
     _extract_csv_from_zip_if_needed(RECIPES_CSV)
     _extract_csv_from_zip_if_needed(INTERACTIONS_CSV)
+    _extract_csv_from_zip_if_needed(INGR_MAP_PKL)
 
     recipes_exists = RECIPES_CSV.exists()
     interactions_exists = INTERACTIONS_CSV.exists()
@@ -174,6 +175,7 @@ def ensure_source_data(**context) -> None:
     logger.info('Attempting post-download ZIP extraction (if needed).')
     _extract_csv_from_zip_if_needed(RECIPES_CSV)
     _extract_csv_from_zip_if_needed(INTERACTIONS_CSV)
+    _extract_csv_from_zip_if_needed(INGR_MAP_PKL)
 
     logger.info(
         'Final source file check: '
@@ -744,10 +746,24 @@ def extract_usda_nutrients(**context) -> None:
     logger.info('Loading USDA bulk JSON from %s', usda_dir)
     foods = _load_local_usda_foods(usda_dir)
     if not foods:
-        raise FileNotFoundError(
-            f'No USDA foods loaded from {usda_dir}. Expected FDC bulk JSON files: '
-            + ', '.join(n for n, _ in _USDA_JSON_SPECS)
+        logger.warning(
+            'No USDA JSON files found in %s — writing empty usda_nutrients.parquet. '
+            'Downstream balance_score will fall back to Food.com PDV values. '
+            'To enable nutrient enrichment, download FDC bulk JSON files: %s',
+            usda_dir,
+            ', '.join(n for n, _ in _USDA_JSON_SPECS),
         )
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        empty_rows = [
+            dict({'canonical_ingredient': ing, 'computed_date': date.today()},
+                 **_empty_usda_nutrient_row())
+            for ing in canonical_ingredients
+        ]
+        pd.DataFrame(empty_rows).to_parquet(USDA_NUTRIENTS_STAGING, index=False)
+        context['ti'].xcom_push(key='usda_coverage_rate', value=0.0)
+        context['ti'].xcom_push(key='usda_rows', value=len(canonical_ingredients))
+        context['ti'].xcom_push(key='usda_extract_skipped', value=True)
+        return
 
     desc_lowers = [str(f.get('description') or '').lower() for f in foods]
     logger.info(
