@@ -170,9 +170,14 @@ def extract_google_trends(
                 # Process each keyword in the batch
                 for kw in batch:
                     if kw in interest_df.columns:
-                        # Extract data for this keyword
-                        kw_data = interest_df[[kw]].copy()
-                        kw_data = kw_data.reset_index()
+                        # Extract data for this keyword (include date column)
+                        cols_to_include = ["date", kw] if "date" in interest_df.columns else [kw]
+                        kw_data = interest_df[cols_to_include].copy()
+                        
+                        # If date wasn't in columns, reset index to get it
+                        if "date" not in kw_data.columns:
+                            kw_data = kw_data.reset_index()
+                        
                         kw_data = kw_data.rename(columns={kw: "interest_score"})
                         kw_data["keyword"] = kw
                         kw_data["geo"] = geo if geo else "global"
