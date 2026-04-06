@@ -18,9 +18,6 @@ Cleaning steps are divided into two categories:
 import ast
 import logging
 import re
-import pickle
-import sys
-import types
 from typing import Any
 
 import pandas as pd
@@ -30,6 +27,7 @@ from foodcom_pipeline.batch.extract import (
     RECIPES_STAGING,
     STAGING_DIR,
     USDA_NUTRIENTS_STAGING,
+    _load_ingr_map,
 )
 
 logger = logging.getLogger(__name__)
@@ -150,7 +148,7 @@ def clean_interactions(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-# ── [DATASET] Interactions ───────────────────────────────────────────────────
+# ── [DATASET] Interactions ─────────────────────────────────────────────
 
 
 def _parse_interaction_dates(df: pd.DataFrame) -> pd.DataFrame:
@@ -213,7 +211,7 @@ def _drop_null_keys(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── [DEFENSIVE] Interactions ─────────────────────────────────────────────────
+# ── [DEFENSIVE] Interactions ──────────────────────────────────────────────
 
 
 def _drop_future_dates(df: pd.DataFrame) -> pd.DataFrame:
@@ -278,7 +276,7 @@ def _clean_review_text(df: pd.DataFrame) -> pd.DataFrame:
     """
     import unicodedata
 
-    html_tag_pattern = re.compile(r'<[^>]+>')
+    html_tag_pattern = re.compile(r'<[^>]+')
     null_byte_pattern = re.compile(r'\x00')
 
     def normalize(text):
@@ -403,7 +401,7 @@ def clean_recipes(
     return df.reset_index(drop=True)
 
 
-# ── [DATASET] Recipes ────────────────────────────────────────────────────────
+# ── [DATASET] Recipes ────────────────────────────────────────────────────────────────────
 
 
 def _drop_null_recipe_ids(df: pd.DataFrame) -> pd.DataFrame:
@@ -717,7 +715,7 @@ def _clean_minutes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ── [DEFENSIVE] Recipes ──────────────────────────────────────────────────────
+# ── [DEFENSIVE] Recipes ───────────────────────────────────────────────────────────────────
 
 
 def _drop_duplicate_recipe_ids(df: pd.DataFrame) -> pd.DataFrame:

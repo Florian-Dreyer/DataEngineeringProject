@@ -39,14 +39,26 @@ services:
     # Use the image's airflow user so the `airflow` CLI is available on PATH.
     user: "50000:0"
     volumes:
-      # Mount repo root so pyproject.toml exists in-container
-      - ./:/opt/airflow/app
-      # Keep DAGs on Airflow's default DAG path
-      - ./src/foodcom_pipeline/batch/dags:/opt/airflow/dags
-      - ./data:/opt/airflow/data
-      - ./staging:/opt/airflow/staging
-      - ${HOME}/.kaggle:/home/airflow/.kaggle:ro
-      - ./usda_data:/opt/airflow/usda_data
+      # Long-form bind mounts avoid mis-parsing of colons in host paths (e.g. "AY25:26")
+      - type: bind
+        source: .
+        target: /opt/airflow/app
+      - type: bind
+        source: ./src/foodcom_pipeline/batch/dags
+        target: /opt/airflow/dags
+      - type: bind
+        source: ./data
+        target: /opt/airflow/data
+      - type: bind
+        source: ./staging
+        target: /opt/airflow/staging
+      - type: bind
+        source: ${HOME}/.kaggle
+        target: /home/airflow/.kaggle
+        read_only: true
+      - type: bind
+        source: ./usda_data
+        target: /opt/airflow/usda_data
     ports:
       - "8080:8080"
     command: >
