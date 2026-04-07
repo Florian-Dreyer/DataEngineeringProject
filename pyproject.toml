@@ -15,29 +15,24 @@ dependencies = [
     # ── Data & Processing ───────────────────────────────────────────
     "pandas>=2.0",
     "numpy>=1.26",
+    "pytrends>=4.9",
     "scikit-learn>=1.4",
-
     # ── Database ────────────────────────────────────────────────────
     "psycopg2-binary>=2.9",
     "sqlalchemy>=2.0",
-
     # ── Orchestration ───────────────────────────────────────────────
     "apache-airflow>=2.9",
-
     # ── Streaming ───────────────────────────────────────────────────
     "kafka-python>=2.0",
-
     # ── NLP & Sentiment ─────────────────────────────────────────────
     "nltk>=3.8",                # VADER lexicon utils (stream layer)
     "vaderSentiment>=3.3.2",    # VADER sentiment (batch + stream)
 
     # ── Machine Learning ────────────────────────────────────────────
     "xgboost>=2.0",
-
     # ── Dashboard ───────────────────────────────────────────────────
     "streamlit>=1.35",
     "plotly>=5.20",
-
     # ── Utilities ───────────────────────────────────────────────────
     "python-dotenv>=1.0",
     "requests>=2.32",

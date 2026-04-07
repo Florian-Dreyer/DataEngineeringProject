@@ -2,29 +2,32 @@
 
 > IS3107 Data Engineering — AY2025/2026 Semester 2
 
-An end-to-end **Lambda Architecture** data pipeline over the [Food.com Recipes and User Interactions](https://www.kaggle.com/datasets/shuyangli94/food-com-recipes-and-user-interactions) dataset. The pipeline ingests recipe reviews in real time via Kafka, enriches them with NLP-based sentiment analysis, loads a PostgreSQL star schema via Airflow, and serves insights through a live Streamlit dashboard.
+- **Google Trends integration** — Extract search interest data for recipe keywords to analyze popularity trends
 
----
+## Requirements
 
-## Architecture
+- **Python 3.10+** (tested with Python 3.11)
+- Dependencies: `pip install -e .` or install from `pyproject.toml`
 
-```
-New Review (Kafka)
-       │
-  ┌────┴────┐
-  │         │
-Speed     Batch Layer (Airflow DAG)
-Layer     ├─ Extract & Clean
-│         ├─ DistilBERT Sentiment
-VADER     ├─ K-Means User Clustering
-Sentiment ├─ XGBoost Rating Prediction
-│         └─ Star Schema Load (PostgreSQL)
-  │         │
-  └────┬────┘
-       │
-  Serving Layer (PostgreSQL VIEW)
-       │
-  Streamlit Dashboard
+## Google Trends Extraction
+
+The pipeline includes Google Trends data extraction for analyzing search interest patterns of recipe-related keywords. This provides insights into recipe popularity trends over time.
+
+### Features ✅
+- **30 Cuisine Keywords**: Comprehensive coverage of global cuisines and food categories
+- **Monthly Granularity**: Weekly Google Trends data aggregated to monthly summaries
+- **Cross-Batch Normalization**: 'Pasta' anchor keyword ensures comparability across batches
+- **Smart Batching**: Optimized API usage with anchor-based batching (5 keywords per batch)
+- **Related Queries**: Top trending search queries for each keyword
+
+### Data Structure
+```python
+# Output DataFrame columns:
+# - keyword: str (one of 30 cuisine keywords)
+# - date: datetime (monthly end dates)
+# - interest_score: int (0-100, normalized across batches)
+# - geo: str (geographic region)
+# - related_queries: list[str] (rising search queries)
 ```
 
 The **speed layer** processes incoming reviews immediately using VADER for low-latency sentiment scoring. The **batch layer** runs on a schedule, applying DistilBERT for higher-accuracy sentiment and overwriting the VADER approximations.
@@ -185,16 +188,56 @@ SELECT COUNT(*) FROM dim_date;
   - Staging parquet files: `/opt/airflow/staging`
 
 ### (Optional) Launch the dashboard
+### Quick Start
 
 ```bash
-streamlit run src/dashboard/app.py
-# Opens at http://localhost:8501
+# Install dependencies
+pip install -e .
+
+# Extract and save data to CSV
+python extract_trends.py
 ```
 
----
+**API Rate Limiting**: Google Trends API may return 429 errors during peak usage. The script includes exponential backoff to automatically retry failed batches. If you still encounter rate limiting:
+  - Increase `sleep_time` parameter: `python3 extract_trends.py` (adjust in script if needed)
+  - Reduce `batch_size`: Set to 2-3 instead of 4 in the script
+  - Run during off-peak hours
+  - The script will self-adjust sleep time when rate limits are detected
 
-## Project Structure
+### Manual Usage
 
+```bash
+# Basic extraction (prints first 5 rows)
+python -c "from foodcom_pipeline import extract_google_trends; df = extract_google_trends(); print(df.head())"
+
+# Extract and save to CSV manually
+python -c "
+from foodcom_pipeline import extract_google_trends
+df = extract_google_trends()
+df.to_csv('data/trends_raw.csv', index=False)
+print(f'Saved {df.shape[0]} rows to data/trends_raw.csv')
+"
+```
+
+### Alternative Execution (if package install fails)
+
+```bash
+# Run directly from src directory
+cd src
+python -c "import sys; sys.path.insert(0, '.'); from foodcom_pipeline.extraction.trends import extract_google_trends; df = extract_google_trends(); print(df.head())"
+```
+
+### Configuration
+
+- **Keywords**: Edit `config/trends_keywords.txt` to specify keywords (one per line). When Food.com recipe data becomes available, keywords should be automatically extracted from recipe ingredients and dish names to replace this manual file.
+- **Parameters**: Modify batch size, sleep time, timeframe in the function call
+- **Output**: DataFrame with columns `keyword`, `date`, `interest_score`, `geo`, `related_queries`
+
+**Note**: Google Trends API has rate limits. The extraction batches keywords (5 at a time) with sleep intervals to avoid throttling.
+
+### Pipeline Integration
+
+When the full batch layer is implemented, the flow will be:
 ```
 ├── docker-compose.yml
 ├── docker/
@@ -224,4 +267,7 @@ streamlit run src/dashboard/app.py
 │   └── RAW_interactions.csv      # Kaggle CSV (you add this)
 ├── staging/                      # Parquet staging outputs (created at runtime)
 └── pyproject.toml
+extract_google_trends() → clean() → transform() → load_db()
 ```
+
+**Note**: The `load_db()` function for PostgreSQL insertion is planned but not yet implemented. Keywords for trends analysis should be automatically extracted from Food.com recipe data rather than manually maintained.
