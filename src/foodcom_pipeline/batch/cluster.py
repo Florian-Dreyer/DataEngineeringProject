@@ -122,18 +122,16 @@ def run_clustering(**context) -> None:
 
 def _determine_optimal_k(user_features: pd.DataFrame) -> int:
     """
-    Tests k in K_RANGE using silhouette score and selects the k with the highest score.
-    Results are cached to ELBOW_STATS_PATH; if the file exists and was computed with the
-    same K_RANGE, the cached k is reused to keep cluster IDs stable across DAG runs.
+    Always recomputes silhouette scores for k in K_RANGE on current data and selects
+    the k with the highest score. If the chosen k differs from the previous run, a
+    warning is logged so the team knows cluster labels and interpretations may need review.
+
+    Results are written to ELBOW_STATS_PATH after every run.
     """
+    previous_k: int | None = None
     if ELBOW_STATS_PATH.exists():
         with open(ELBOW_STATS_PATH) as f:
-            stats = json.load(f)
-        if stats.get('k_range') == K_RANGE:
-            k = stats['chosen_k']
-            logger.info(f'Loaded cached silhouette stats — using k={k} from previous run.')
-            return k
-        logger.info('K_RANGE changed — recomputing silhouette scores.')
+            previous_k = json.load(f).get('chosen_k')
 
     logger.info(f'Running silhouette analysis for k in {K_RANGE}...')
     X = _scale_features(user_features)
@@ -150,6 +148,12 @@ def _determine_optimal_k(user_features: pd.DataFrame) -> int:
 
     chosen_k = K_RANGE[int(np.argmax(silhouettes))]
     logger.info(f'Chosen k={chosen_k} (highest silhouette score)')
+
+    if previous_k is not None and chosen_k != previous_k:
+        logger.warning(
+            f'Optimal k changed from {previous_k} to {chosen_k} — '
+            'cluster labels and segment interpretations should be reviewed.'
+        )
 
     stats = {'k_range': K_RANGE, 'silhouettes': silhouettes, 'chosen_k': chosen_k}
     with open(ELBOW_STATS_PATH, 'w') as f:
