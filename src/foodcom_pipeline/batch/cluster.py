@@ -31,7 +31,7 @@ Cluster label heuristics (assigned after fitting based on centroid values):
   - International Explorer: highest avg_rating_international
   - Protein-Forward Cook : highest avg_rating_protein
   - Health-Conscious Cook: highest avg_rating_vegetable
-  - Quick & Simple       : remainder
+  - General Cook       : remainder
 """
 
 import json
@@ -81,7 +81,7 @@ def run_clustering(**context) -> None:
     """
     Main clustering entry point.
       1. Load pre-computed user stats from features.py
-      2. Determine optimal k (elbow + silhouette), first run only
+      2. Determine optimal k via silhouette score
       3. Fit K-Means
       4. Assign interpretable labels
       5. Produce cluster profile report
@@ -91,10 +91,14 @@ def run_clustering(**context) -> None:
 
     # Load pre-aggregated user stats — computed in the previous DAG step
     user_features = load_user_stats()
-    # Also load interactions for the cluster profile rating distribution
+
     from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
+    from foodcom_pipeline.batch.clean import load_cleaned_recipes
+    from foodcom_pipeline.batch.features import load_ingredient_features
 
     interactions = load_sentiment_interactions()
+    recipes = load_cleaned_recipes()
+    ingredient_features = load_ingredient_features()
 
     logger.info(
         f'Loaded user feature matrix: '
@@ -106,7 +110,7 @@ def run_clustering(**context) -> None:
     user_features, scaler, kmeans = _fit_kmeans(user_features, k)
     user_features = _assign_labels(user_features, kmeans, scaler)
 
-    _produce_cluster_profiles(user_features, interactions)
+    _produce_cluster_profiles(user_features, interactions, recipes, ingredient_features)
 
     user_features.to_parquet(CLUSTER_STAGING, index=False)
     logger.info(f'Clustering complete. Staged to {CLUSTER_STAGING}')
@@ -266,7 +270,7 @@ def _heuristic_label_assignment(centroids: pd.DataFrame) -> dict[int, str]:
       International Explorer: highest avg_rating_international
       Protein-Forward Cook  : highest avg_rating_protein
       Health-Conscious Cook : highest avg_rating_vegetable
-      Quick & Simple        : remainder
+      General Cook        : remainder
     """
     label_map = {}
     used_ids = set()
@@ -295,7 +299,7 @@ def _heuristic_label_assignment(centroids: pd.DataFrame) -> dict[int, str]:
 
     for cid in centroids['cluster_id']:
         if int(cid) not in used_ids:
-            label_map[int(cid)] = 'Quick & Simple'
+            label_map[int(cid)] = 'General Cook'
 
     return label_map
 
@@ -308,6 +312,8 @@ def _heuristic_label_assignment(centroids: pd.DataFrame) -> dict[int, str]:
 def _produce_cluster_profiles(
     user_features: pd.DataFrame,
     interactions: pd.DataFrame,
+    recipes: pd.DataFrame,
+    ingredient_features: pd.DataFrame,
 ) -> None:
     """
     Computes and saves a detailed profile for each cluster.
@@ -316,7 +322,11 @@ def _produce_cluster_profiles(
       - Size (n users, % of total)
       - Feature means and standard deviations
       - Rating distribution (% of each star rating)
-      - Top recipes by avg rating within cluster (via interactions join)
+      - Avg rating-sentiment gap
+      - Top 5 canonical ingredients (by review frequency in cluster)
+      - Activity peak month (modal review month)
+      - Avg exclamation count per review (enthusiasm proxy)
+      - Substitute exposure rate (% of reviewed recipes containing ≥1 substitution candidate)
 
     Saved to CLUSTER_PROFILE_PATH as JSON for use in the Streamlit dashboard
     and the report discussion section.
@@ -326,12 +336,25 @@ def _produce_cluster_profiles(
     profiles = {}
     total_users = len(user_features)
 
-    # Join cluster labels onto interactions for rating distribution
+    # Join cluster labels onto interactions for rating distribution and metrics
     interactions_with_clusters = interactions.merge(
         user_features[['user_id', 'cluster_id', 'cluster_label']],
         on='user_id',
         how='left',
     )
+
+    # Pre-compute substitution candidate set for exposure rate
+    sub_candidates: set[str] = set()
+    if (
+        len(ingredient_features) > 0
+        and 'is_substitution_candidate' in ingredient_features.columns
+        and 'canonical_ingredient' in ingredient_features.columns
+    ):
+        sub_candidates = set(
+            ingredient_features.loc[
+                ingredient_features['is_substitution_candidate'], 'canonical_ingredient'
+            ]
+        )
 
     for cluster_id in sorted(user_features['cluster_id'].unique()):
         cluster_users = user_features[user_features['cluster_id'] == cluster_id]
@@ -370,6 +393,20 @@ def _produce_cluster_profiles(
             else None
         )
 
+        # Top 5 canonical ingredients by frequency across cluster's reviewed recipes
+        top_ingredients = _compute_top_ingredients(cluster_interactions, recipes)
+
+        # Activity peak month (modal month of reviews)
+        peak_month = _compute_peak_month(cluster_interactions)
+
+        # Avg exclamation count per review (enthusiasm signal)
+        avg_exclamations = _compute_avg_exclamations(cluster_interactions)
+
+        # Substitute exposure rate
+        sub_exposure = _compute_substitute_exposure(
+            cluster_interactions, recipes, sub_candidates
+        )
+
         profile = {
             'cluster_id': int(cluster_id),
             'cluster_label': cluster_label,
@@ -377,7 +414,11 @@ def _produce_cluster_profiles(
             'pct_users': round(pct_users, 2),
             'feature_stats': feature_stats,
             'rating_distribution': rating_dist,
-            'avg_rating_sentiment_gap': round(gap_mean, 4) if gap_mean else None,
+            'avg_rating_sentiment_gap': round(gap_mean, 4) if gap_mean is not None else None,
+            'top_ingredients': top_ingredients,
+            'peak_month': peak_month,
+            'avg_exclamation_count': round(avg_exclamations, 4) if avg_exclamations is not None else None,
+            'substitute_exposure_rate': round(sub_exposure, 4) if sub_exposure is not None else None,
         }
         profiles[str(cluster_id)] = profile
 
@@ -394,6 +435,73 @@ def _produce_cluster_profiles(
         json.dump(summary, f, indent=2)
 
     logger.info(f'Cluster profiles saved to {CLUSTER_PROFILE_PATH}')
+
+
+def _compute_top_ingredients(
+    cluster_interactions: pd.DataFrame,
+    recipes: pd.DataFrame,
+    top_n: int = 5,
+) -> list[str]:
+    """Top-N canonical ingredients by frequency across recipes reviewed by this cluster."""
+    if 'ingredients_canonical_list' not in recipes.columns or cluster_interactions.empty:
+        return []
+    cluster_recipe_ids = cluster_interactions['recipe_id'].unique()
+    cluster_recipes = recipes[recipes['id'].isin(cluster_recipe_ids)]
+    if cluster_recipes.empty:
+        return []
+    return (
+        cluster_recipes['ingredients_canonical_list']
+        .explode()
+        .dropna()
+        .value_counts()
+        .head(top_n)
+        .index.tolist()
+    )
+
+
+def _compute_peak_month(cluster_interactions: pd.DataFrame) -> str | None:
+    """Modal calendar month of reviews (e.g. 'December')."""
+    if 'date' not in cluster_interactions.columns or cluster_interactions.empty:
+        return None
+    months = pd.to_datetime(cluster_interactions['date'], errors='coerce').dt.month_name()
+    months = months.dropna()
+    if months.empty:
+        return None
+    return str(months.mode().iloc[0])
+
+
+def _compute_avg_exclamations(cluster_interactions: pd.DataFrame) -> float | None:
+    """Mean number of exclamation marks per review — proxy for enthusiasm."""
+    if 'review' not in cluster_interactions.columns or cluster_interactions.empty:
+        return None
+    return float(cluster_interactions['review'].fillna('').str.count('!').mean())
+
+
+def _compute_substitute_exposure(
+    cluster_interactions: pd.DataFrame,
+    recipes: pd.DataFrame,
+    sub_candidates: set[str],
+) -> float | None:
+    """
+    Fraction of reviewed recipes that contain at least one substitution-candidate
+    ingredient. Returns None when substitution candidate data is unavailable.
+    """
+    if (
+        not sub_candidates
+        or 'ingredients_canonical_list' not in recipes.columns
+        or cluster_interactions.empty
+    ):
+        return None
+    cluster_recipe_ids = cluster_interactions['recipe_id'].unique()
+    cluster_recipes = recipes[recipes['id'].isin(cluster_recipe_ids)]
+    if cluster_recipes.empty:
+        return None
+    has_sub = cluster_recipes['ingredients_canonical_list'].apply(
+        lambda ing_list: any(ing in sub_candidates for ing in ing_list)
+        if ing_list is not None and len(ing_list) > 0
+        else False
+    )
+    return float(has_sub.mean())
 
 
 def _log_cluster_profile(profile: dict) -> None:
@@ -415,6 +523,14 @@ def _log_cluster_profile(profile: dict) -> None:
     )
     if gap is not None:
         logger.info(f'  Avg rating-sentiment gap : {gap:.4f}')
+    if profile.get('top_ingredients'):
+        logger.info(f"  Top ingredients          : {', '.join(profile['top_ingredients'])}")
+    if profile.get('peak_month'):
+        logger.info(f"  Activity peak month      : {profile['peak_month']}")
+    if profile.get('avg_exclamation_count') is not None:
+        logger.info(f"  Avg exclamation count    : {profile['avg_exclamation_count']:.4f}")
+    if profile.get('substitute_exposure_rate') is not None:
+        logger.info(f"  Substitute exposure rate : {profile['substitute_exposure_rate']:.2%}")
     logger.info('─' * 52)
 
 
