@@ -1,153 +1,186 @@
-# 🍽️ Food.com Recipe Analytics Pipeline
+# Food.com Recipe Analytics Pipeline
 
 > IS3107 Data Engineering — AY2025/2026 Semester 2
 
-- **Google Trends integration** — Extract search interest data for recipe keywords to analyze popularity trends
-
-## Requirements
-
-- **Python 3.10+** (tested with Python 3.11)
-- Dependencies: `pip install -e .` or install from `pyproject.toml`
-
-## Google Trends Extraction
-
-The pipeline includes Google Trends data extraction for analyzing search interest patterns of recipe-related keywords. This provides insights into recipe popularity trends over time.
-
-### Features ✅
-- **30 Cuisine Keywords**: Comprehensive coverage of global cuisines and food categories
-- **Monthly Granularity**: Weekly Google Trends data aggregated to monthly summaries
-- **Cross-Batch Normalization**: 'Pasta' anchor keyword ensures comparability across batches
-- **Smart Batching**: Optimized API usage with anchor-based batching (5 keywords per batch)
-- **Related Queries**: Top trending search queries for each keyword
-
-### Data Structure
-```python
-# Output DataFrame columns:
-# - keyword: str (one of 30 cuisine keywords)
-# - date: datetime (monthly end dates)
-# - interest_score: int (0-100, normalized across batches)
-# - geo: str (geographic region)
-# - related_queries: list[str] (rising search queries)
-```
-
-The **speed layer** processes incoming reviews immediately using VADER for low-latency sentiment scoring. The **batch layer** runs on a schedule, applying DistilBERT for higher-accuracy sentiment and overwriting the VADER approximations.
+An **ETL pipeline** for the [Food.com](https://www.kaggle.com/datasets/shuyangli94/food-com-recipes-and-user-interactions) dataset, orchestrated with Apache Airflow and backed by a PostgreSQL data warehouse, powering a Streamlit analytics dashboard.
 
 ---
 
-## Features
+## Architecture
 
-- **Real-time stream simulation** — Kafka producer replays held-out reviews at configurable speed
-- **Dual sentiment models** — VADER (stream) and DistilBERT (batch), with quantified accuracy comparison
-- **Star schema data warehouse** — `fact_interactions` + `dim_user`, `dim_recipe`, `dim_date`
-- **`rating_sentiment_gap`** — derived feature exposing mismatches between star ratings and review text
-- **User clustering** — K-Means segmentation into interpretable profiles (e.g. Harsh Critic, Enthusiastic Cook)
-- **Rating prediction** — XGBoost regression evaluated with RMSE/MAE
-- **Live Streamlit dashboard** — Recipe Explorer, Trend Analysis, and User Segments tabs
+```text
+┌─────────────────────────────────────────────────────────┐
+│                    ETL PIPELINE (Airflow)                │
+│                                                          │
+│  ensure_source_data                                      │
+│       │                                                  │
+│       ├── extract_recipes ──────────────────────┐        │
+│       ├── extract_interactions ─► check_new ─► clean    │
+│       └── extract_usda_nutrients ───────────────┘        │
+│                    │                                     │
+│             run_vader_sentiment                          │
+│                    │                                     │
+│                features                                  │
+│                    │                                     │
+│          run_kmeans_clustering                           │
+│                    │                                     │
+│           load_to_star_schema                            │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│              DATA WAREHOUSE (PostgreSQL)                 │
+│  fact_interactions · dim_user · dim_recipe · dim_date   │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Pipeline Stages
+
+| # | Task | Description |
+| --- | --- | --- |
+| 1 | `ensure_source_data` | Downloads `RAW_recipes.csv`, `RAW_interactions.csv`, `ingr_map.pkl` from Kaggle if missing |
+| 2 | `extract_recipes` | Full extract of recipes → parquet |
+| 2 | `extract_interactions` | Incremental extract of interactions (watermark-based) → parquet |
+| 2 | `extract_usda_nutrients` | Matches canonical ingredients to USDA FoodData Central nutrient values |
+| 3 | `check_has_new_data` | Short-circuits if no new interactions found |
+| 4 | `clean` | Deduplication, invalid rating removal, date parsing, cook-time caps, nutrition outlier flagging (95th percentile), bot detection |
+| 5 | `run_vader_sentiment` | VADER compound polarity scoring + `rating_sentiment_gap` |
+| 6 | `features` | Per-user aggregate stats, ingredient category ratings, Bayesian recipe sentiment ratings, substitution candidate flagging |
+| 7 | `run_kmeans_clustering` | K-Means user segmentation (k selected by silhouette score over [4,5,6]) |
+| 8 | `load_to_star_schema` | Upsert to PostgreSQL star schema |
+
+### User Segments
+
+Clusters are auto-labelled by centroid values after fitting:
+
+| Label | Dominant feature |
+| --- | --- |
+| Indulgent Baker | Highest avg baking recipe rating |
+| International Explorer | Highest avg international recipe rating |
+| Protein-Forward Cook | Highest avg protein recipe rating |
+| Health-Conscious Cook | Highest avg vegetable recipe rating |
+| General Cook | Remainder (typically the majority cluster) |
 
 ---
 
 ## Tech Stack
 
 | Component | Technology |
-|---|---|
-| Orchestration | Apache Airflow |
-| Message broker | Apache Kafka + Zookeeper |
-| Database | PostgreSQL |
+| --- | --- |
+| Orchestration | Apache Airflow 2.9 |
+| Database | PostgreSQL 16 |
 | Batch processing | Python, Pandas, scikit-learn |
-| Sentiment (batch) | DistilBERT via HuggingFace Transformers |
-| Sentiment (stream) | VADER via NLTK |
-| ML model | XGBoost |
-| Dashboard | Streamlit |
+| Sentiment analysis | VADER (`vaderSentiment`) |
+| Clustering | K-Means (scikit-learn) |
+| Nutrient data | USDA FoodData Central |
+| Dashboard | Streamlit + Plotly |
 | Infrastructure | Docker Compose |
+
+---
+
+## Project Structure
+
+```text
+├── docker-compose.yml
+├── docker/
+│   └── airflow/
+│       └── Dockerfile              # Custom Airflow image
+├── pyproject.toml
+├── src/
+│   └── foodcom_pipeline/
+│       ├── batch/
+│       │   ├── dags/
+│       │   │   └── batch_etl_dag.py    # Airflow DAG definition
+│       │   ├── extract.py              # Kaggle + USDA extraction
+│       │   ├── clean.py                # Data cleaning
+│       │   ├── sentiment.py            # VADER scoring
+│       │   ├── features.py             # Feature engineering
+│       │   ├── cluster.py              # K-Means segmentation
+│       │   └── load.py                 # Star schema loader
+│       ├── extraction/
+│       │   └── trends.py               # Google Trends (deferred)
+│       └── dashboard/
+│           └── app.py                  # Streamlit dashboard
+├── data/                               # Raw CSVs (auto-downloaded from Kaggle)
+├── staging/                            # Parquet staging files (created at runtime)
+├── usda_data/                          # USDA FoodData Central bulk JSON (optional)
+└── tests/
+```
 
 ---
 
 ## Getting Started
 
 ### Prerequisites
-- Docker & Docker Compose
-- Python 3.10+
 
-### 1) Prepare Local Files
+- Docker Desktop
+- A Kaggle account with an API token (`~/.kaggle/kaggle.json`)
+
+### 1. Clone and prepare
 
 ```bash
-# From the repo root (same folder as docker-compose.yml)
-cp .env.example .env
+git clone <repo-url>
+cd DataEngineeringProject
+
 mkdir -p data staging
 
-# Kaggle credentials are required for auto-download:
-#   ~/.kaggle/kaggle.json
-# You can generate it from Kaggle Account -> API -> Create New Token.
-# The docker compose file mounts this into the Airflow container.
+# Kaggle credentials — generate at kaggle.com → Account → API → Create New Token
 mkdir -p ~/.kaggle
-# Copy your downloaded Kaggle token file to:
+# Copy your kaggle.json here:
 #   ~/.kaggle/kaggle.json
 chmod 600 ~/.kaggle/kaggle.json
 ```
 
-### 2) Start Services
+### 2. Start services
 
-#### 🆕 First-time setup (build required)
-> ⚠️ Only run this once, or when dependencies change (e.g. Dockerfile or requirements.txt)
+**First time (builds the custom Airflow image — takes a few minutes):**
 
 ```bash
-# Build and start all services (may take a few minutes)
 docker compose up -d --build
-
-# Subsequent runs (fast) - start services without rebuilding
-docker compose up -d
-
-# Restart services
-docker compose restart
-
-# Stop services
-docker compose down
-
-
 ```
 
-Expected:
-- `postgres` and `airflow` are both `Up` in `docker compose ps`
-- Airflow log shows webserver boot (e.g. `Listening at: http://0.0.0.0:8080`)
-- First build can take several minutes (it builds a custom Airflow image with DAG dependencies preinstalled).
+**Subsequent starts:**
+
+```bash
+docker compose up -d
+```
+
+Verify services are up:
+
+```bash
+docker compose ps
+# postgres   Up   5432/tcp
+# airflow    Up   0.0.0.0:8080->8080/tcp
+```
 
 Health check:
 
 ```bash
-curl -I http://localhost:8080/health
+curl -I http://localhost:8080/health   # expect HTTP/1.1 200 OK
 ```
 
-You should get `HTTP/1.1 200 OK`.
-
-If you see `Empty reply from server` or connection reset, wait ~20-40 seconds and retry:
+### 3. Trigger the pipeline
 
 ```bash
-curl -v http://localhost:8080/health
+# Unpause and trigger via CLI
+docker compose exec airflow airflow dags unpause foodcom_batch_pipeline
+docker compose exec airflow airflow dags trigger foodcom_batch_pipeline
 ```
 
-### 3) Open Airflow UI
+Or open the Airflow UI at **[http://localhost:8080](http://localhost:8080)** (login: `airflow` / `airflow`), find `foodcom_batch_pipeline`, unpause it, and click **Trigger DAG**.
 
-- URL: `http://localhost:8080`
-- Default credentials (from `.env`): `airflow` / `airflow`
+Expected run time on first execution: ~15–20 minutes (VADER scoring dominates).
 
-### 4) Trigger the DAG
+### 4. Launch the dashboard
 
-In Airflow UI:
-1. Open DAG `foodcom_batch_pipeline`
-2. Click **Trigger DAG**
-3. Watch tasks in this order:
-   - `ensure_source_data` (downloads RAW CSVs from Kaggle if missing)
-   - `extract_recipes` + `extract_interactions` (parallel)
-   - `clean`
-   - `run_distilbert_sentiment` (slowest step on CPU)
-   - `aggregate_user_stats`
-   - `run_kmeans_clustering`
-   - `load_to_star_schema`
+```bash
+streamlit run src/foodcom_pipeline/dashboard/app.py
+```
 
+The dashboard auto-detects the `./staging/` directory — no environment variables needed.
 
-### 5) Verify Warehouse Load
-
-Run from your Postgres client:
+### 5. Verify the warehouse
 
 ```sql
 SELECT COUNT(*) FROM fact_interactions;
@@ -158,116 +191,32 @@ SELECT COUNT(*) FROM dim_date;
 
 ---
 
+## Dashboard
+
+| Tab | Status | Content |
+| --- | --- | --- |
+| Overview | stub | Pipeline run summary |
+| Recipe Analytics | stub | Top recipes, sentiment ratings |
+| Audience & Market Intelligence | implemented | Radar chart, segment profiles, CPG brand adjacency, PDF export |
+| Pipeline Status | implemented | Row counts per stage, data loss rate, USDA coverage, Airflow task runtimes |
+
+---
+
 ## Troubleshooting
 
-- **`docker compose up` says `no configuration file provided`**
-  - Run from the repo root (where `docker-compose.yml` is located).
-- **`localhost:8080` not opening**
-  - Check `docker compose ps` (airflow must be `Up`).
-  - Check `curl -I http://localhost:8080/health` (should be 200).
-  - Check `docker compose logs --tail=200 airflow`.
-- **Browser says connection reset but health is 200**
-  - Try `http://127.0.0.1:8080` and hard refresh / incognito.
-- **`/bin/bash: --username: command not found` in airflow logs**
-  - Your compose command block is malformed; use the one in this repo (single-line `airflow users create ...`).
-- **`/bin/bash: airflow: command not found` in airflow logs**
-  - Ensure airflow container runs with `user: "50000:0"` (as in this repo).
-- **Large warning spam from `azure/... SyntaxWarning: invalid escape sequence`**
-  - This is noisy but non-fatal; ignore unless there is a traceback/error after it.
-- **`zsh: command not found: rg`**
-  - `rg` (ripgrep) is optional locally; use:
-    `docker compose logs airflow | grep -E "ERROR|Traceback|Exception|Listening at|Booting worker"`.
-- **DAG fails at extract due to missing CSV**
-  - Confirm exact paths: `data/RAW_recipes.csv`, `data/RAW_interactions.csv`.
-- **Kaggle download fails**
-  - Confirm `~/.kaggle/kaggle.json` exists on your host.
-  - Ensure file permissions are strict: `chmod 600 ~/.kaggle/kaggle.json`.
-  - Confirm `.env` has `FOODCOM_ENABLE_KAGGLE_DOWNLOAD=true`.
-- **Where data is mounted in container**
-  - Input CSVs: `/opt/airflow/data`
-  - Staging parquet files: `/opt/airflow/staging`
+| Problem | Fix |
+| --- | --- |
+| `localhost:8080` not responding | Wait 30–40 s after `docker compose up`; check `docker compose logs airflow` |
+| DAG not visible in UI | Run `docker compose exec airflow airflow dags reserialize` |
+| `ModuleNotFoundError` in DAG | Rebuild image: `docker compose up -d --build` |
+| Kaggle download fails | Check `~/.kaggle/kaggle.json` exists and `chmod 600` is set |
+| Data CSVs missing | Confirm `FOODCOM_ENABLE_KAGGLE_DOWNLOAD=true` in environment or add CSVs manually to `./data/` |
+| Staging files not found in dashboard | Ensure pipeline has completed at least one successful run |
 
-### (Optional) Launch the dashboard
-### Quick Start
+---
 
-```bash
-# Install dependencies
-pip install -e .
+## Notes
 
-# Extract and save data to CSV
-python extract_trends.py
-```
-
-**API Rate Limiting**: Google Trends API may return 429 errors during peak usage. The script includes exponential backoff to automatically retry failed batches. If you still encounter rate limiting:
-  - Increase `sleep_time` parameter: `python3 extract_trends.py` (adjust in script if needed)
-  - Reduce `batch_size`: Set to 2-3 instead of 4 in the script
-  - Run during off-peak hours
-  - The script will self-adjust sleep time when rate limits are detected
-
-### Manual Usage
-
-```bash
-# Basic extraction (prints first 5 rows)
-python -c "from foodcom_pipeline import extract_google_trends; df = extract_google_trends(); print(df.head())"
-
-# Extract and save to CSV manually
-python -c "
-from foodcom_pipeline import extract_google_trends
-df = extract_google_trends()
-df.to_csv('data/trends_raw.csv', index=False)
-print(f'Saved {df.shape[0]} rows to data/trends_raw.csv')
-"
-```
-
-### Alternative Execution (if package install fails)
-
-```bash
-# Run directly from src directory
-cd src
-python -c "import sys; sys.path.insert(0, '.'); from foodcom_pipeline.extraction.trends import extract_google_trends; df = extract_google_trends(); print(df.head())"
-```
-
-### Configuration
-
-- **Keywords**: Edit `config/trends_keywords.txt` to specify keywords (one per line). When Food.com recipe data becomes available, keywords should be automatically extracted from recipe ingredients and dish names to replace this manual file.
-- **Parameters**: Modify batch size, sleep time, timeframe in the function call
-- **Output**: DataFrame with columns `keyword`, `date`, `interest_score`, `geo`, `related_queries`
-
-**Note**: Google Trends API has rate limits. The extraction batches keywords (5 at a time) with sleep intervals to avoid throttling.
-
-### Pipeline Integration
-
-When the full batch layer is implemented, the flow will be:
-```
-├── docker-compose.yml
-├── docker/
-│   └── airflow/
-│       └── Dockerfile          # Custom Airflow image (pre-installs runtime deps)
-├── .env.example
-├── src/
-│   └── foodcom_pipeline/        # Main package
-│       ├── __init__.py
-│       ├── batch/                   # Batch layer (runs via Airflow)
-│       │   ├── __init__.py
-│       │   ├── extract.py           # Load CSVs into DataFrames
-│       │   ├── clean.py             # Cleaning & normalization
-│       │   ├── sentiment.py         # DistilBERT scoring
-│       │   ├── aggregate_user_stats.py  # User-level feature engineering
-│       │   ├── cluster.py           # K-Means user segmentation
-│       │   └── load.py              # PostgreSQL star schema loaders
-│       ├── stream/                  # Stream layer (speed layer)
-│       │   ├── __init__.py
-│       │   ├── producer.py          # Kafka producer (simulation replay)
-│       │   └── consumer.py          # Kafka consumer, VADER, hot table write
-│       └── dashboard/               # Streamlit app
-│           ├── __init__.py
-│           └── app.py
-├── data/
-│   ├── RAW_recipes.csv           # Kaggle CSV (you add this)
-│   └── RAW_interactions.csv      # Kaggle CSV (you add this)
-├── staging/                      # Parquet staging outputs (created at runtime)
-└── pyproject.toml
-extract_google_trends() → clean() → transform() → load_db()
-```
-
-**Note**: The `load_db()` function for PostgreSQL insertion is planned but not yet implemented. Keywords for trends analysis should be automatically extracted from Food.com recipe data rather than manually maintained.
+- **Google Trends integration** is implemented (`src/foodcom_pipeline/extraction/trends.py`) but not yet wired into the DAG. The `trend_index` column in `ingredient_features.parquet` is currently `null`.
+- The pipeline uses **VADER** for sentiment scoring. A higher-accuracy model can be swapped in by replacing `sentiment.py` without changing downstream steps.
+- **Incremental extraction** uses a watermark on `MAX(full_date)` from `fact_interactions ⋈ dim_date`. The first run is always a full extract.
