@@ -668,84 +668,78 @@ def _parse_tag_list(tag_str: str) -> list[str]:
     return [t.strip() for t in s.split(",") if t.strip()]
 
 
-def render() -> None:
-    # Hero header
+def _render_list_mode(df: pd.DataFrame) -> None:
+    """Render the search + filter strip + paginated compact cards."""
+
+    # --- Hero ---
     st.markdown(
         '<div style="background:linear-gradient(135deg,#10b981,#059669);border-radius:10px;'
-        'padding:24px 28px;margin-bottom:16px;">'
+        'padding:24px 28px;margin-bottom:12px;">'
         '<h1 style="color:white;margin:0;font-size:26px;">🍳 Recipe Explorer</h1>'
-        '<p style="color:#d1fae5;margin:6px 0 4px;">Search 231,637 recipes — '
-        'see Bayesian ratings, nutrition, and shop ingredients in one click.</p>',
+        '<p style="color:#d1fae5;margin:6px 0 0;">Search 231,637 recipes — '
+        'see ratings, nutrition, and shop ingredients in one click.</p>'
+        '</div>',
         unsafe_allow_html=True,
     )
-    search = st.text_input("", placeholder="Search recipes or ingredients...", label_visibility="collapsed")
-    st.markdown("</div>", unsafe_allow_html=True)
+    search = st.text_input(
+        "", placeholder="🔍 Search recipes or ingredients...", label_visibility="collapsed"
+    )
 
-    df = load_recipes()
-    if df.empty:
-        st.warning(
-            "No recipe data found. Run the batch pipeline first "
-            "(or set `FOODCOM_STAGING_DIR` to your staging directory)."
+    # --- Filter strip ---
+    with st.expander("🔍 Filters", expanded=True):
+        st.markdown(
+            '<div style="background:#f8fafc;border:1px solid #e5e7eb;'
+            'border-radius:8px;padding:16px;">',
+            unsafe_allow_html=True,
         )
-        return
+        fcol1, fcol2, fcol3, fcol4 = st.columns([1.5, 1, 1, 1.5])
+        with fcol1:
+            max_cook = st.slider("Max cook time (min)", 5, 180, 180, step=5)
+        with fcol2:
+            min_rating = st.select_slider(
+                "Min rating",
+                options=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
+                value=0.0,
+            )
+        with fcol3:
+            max_ingredients = st.slider("Max ingredients", 1, 30, 30, step=1)
+        with fcol4:
+            tag_counts: Counter = Counter()
+            for tags_str in df["tags"].dropna():
+                for t in _parse_tag_list(str(tags_str)):
+                    if t and _is_useful_tag(t):
+                        tag_counts[t] += 1
+            all_tags = [tag for tag, _ in tag_counts.most_common(60)]
+            selected_tags = st.multiselect("Filter by tag", options=all_tags, default=[])
 
-    # ---------- Filter strip ----------
-    st.markdown("#### Filters")
-    fcol1, fcol2, fcol3, fcol4 = st.columns([1.5, 1, 1, 1.5])
+        qcol1, qcol2, qcol3, qcol4, _ = st.columns([1, 1, 1, 1, 2])
+        with qcol1:
+            max_calories = st.number_input("Max calories (%DV)", min_value=0, max_value=500, value=500, step=10)
+        with qcol2:
+            min_protein = st.number_input("Min protein (%DV)", min_value=0, max_value=100, value=0, step=5)
+        with qcol3:
+            low_sugar = st.checkbox("Low sugar (<30% DV)")
+        with qcol4:
+            low_sodium = st.checkbox("Low sodium (<50% DV)")
 
-    with fcol1:
-        max_cook = st.slider("Max cook time (min)", 5, 180, 180, step=5)
-    with fcol2:
-        min_rating = st.select_slider(
-            "Min Bayesian rating",
-            options=[1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
-            value=1.0,
-        )
-    with fcol3:
-        max_ingredients = st.slider("Max ingredients", 1, 30, 30, step=1)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    with fcol4:
-        # Build clean tag list from the Python-list-repr format
-        tag_counts: Counter = Counter()
-        for tags_str in df["tags"].dropna():
-            for t in _parse_tag_list(str(tags_str)):
-                if t:
-                    tag_counts[t] += 1
-        all_tags = [tag for tag, _ in tag_counts.most_common(60)]
-        selected_tags = st.multiselect("Cuisine / tags", options=all_tags, default=[])
-
-    # Nutrition quick-filters (row 2)
-    qcol1, qcol2, qcol3, qcol4, _ = st.columns([1, 1, 1, 1, 2])
-    with qcol1:
-        max_calories = st.number_input("Max calories (%DV)", min_value=0, max_value=500, value=500, step=10)
-    with qcol2:
-        min_protein = st.number_input("Min protein (%DV)", min_value=0, max_value=100, value=0, step=5)
-    with qcol3:
-        low_sugar = st.checkbox("Low sugar (<30% DV)")
-    with qcol4:
-        low_sodium = st.checkbox("Low sodium (<50% DV)")
-
-    # Apply filters
+    # --- Apply filters ---
     filtered = apply_filters(df, search, max_cook, min_rating, selected_tags)
-    # Ingredient count filter
     if "ingredient_count" in filtered.columns:
         filtered = filtered[filtered["ingredient_count"].fillna(999) <= max_ingredients]
-    # Calorie filter
     if "calories" in filtered.columns:
         filtered = filtered[filtered["calories"].fillna(0) <= max_calories]
-    # Protein filter
     if "protein" in filtered.columns:
         filtered = filtered[filtered["protein"].fillna(0) >= min_protein]
-    # Sugar filter
     if low_sugar and "sugar" in filtered.columns:
         filtered = filtered[filtered["sugar"].fillna(100) < 30]
-    # Sodium filter
     if low_sodium and "sodium" in filtered.columns:
         filtered = filtered[filtered["sodium"].fillna(100) < 50]
 
     total = len(filtered)
 
-    # Pagination state — reset on any filter change
+    # --- Pagination state ---
     filter_hash = hash((
         search, max_cook, min_rating, max_ingredients,
         max_calories, min_protein, low_sugar, low_sodium,
@@ -758,27 +752,40 @@ def render() -> None:
     n_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, n_pages - 1))
 
-    # Result count
     start = page * PAGE_SIZE
     end   = min(start + PAGE_SIZE, total)
     st.caption(f"{total:,} recipes · showing {start + 1}–{end}" if total else "No recipes match your filters.")
 
-    # Recipe cards
+    # --- Cards ---
     page_df = filtered.iloc[start:end]
     for idx, (_, row) in enumerate(page_df.iterrows()):
-        _render_recipe_card(row, card_index=start + idx)
+        _render_compact_card(row, card_index=start + idx)
 
-    # Pagination controls
+    # --- Pagination controls ---
     pc1, pc2, pc3 = st.columns([1, 2, 1])
     with pc1:
-        if page > 0:
-            if st.button("← Previous", key="prev_page"):
-                st.session_state["_recipe_page"] = page - 1
-                st.rerun()
+        if page > 0 and st.button("← Previous", key="prev_page"):
+            st.session_state["_recipe_page"] = page - 1
+            st.rerun()
     with pc2:
         st.caption(f"Page {page + 1} of {n_pages}")
     with pc3:
-        if page < n_pages - 1:
-            if st.button("Next →", key="next_page"):
-                st.session_state["_recipe_page"] = page + 1
-                st.rerun()
+        if page < n_pages - 1 and st.button("Next →", key="next_page"):
+            st.session_state["_recipe_page"] = page + 1
+            st.rerun()
+
+
+def render() -> None:
+    df = load_recipes()
+    if df.empty:
+        st.warning(
+            "No recipe data found. Run the batch pipeline first "
+            "(or set `FOODCOM_STAGING_DIR` to your staging directory)."
+        )
+        return
+
+    selected = st.session_state.get("_selected_recipe")
+    if selected is not None:
+        _render_detail_view(selected)
+    else:
+        _render_list_mode(df)
