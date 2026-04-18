@@ -610,6 +610,15 @@ def _load_tag_options(df: pd.DataFrame, top_n: int = 60) -> list[str]:
 def _render_list_mode(df: pd.DataFrame) -> None:
     """Render the search + filter strip + paginated compact cards."""
 
+    st.markdown(
+        """<style>
+        button[data-testid="baseButton-tertiary"] {
+            padding: 6px 16px !important;
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
     # --- Hero ---
     st.markdown(
         '<div style="background:linear-gradient(135deg,#10b981,#059669);border-radius:10px;'
