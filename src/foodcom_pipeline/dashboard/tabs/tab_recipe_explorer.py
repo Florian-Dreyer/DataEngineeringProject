@@ -52,7 +52,7 @@ def _is_useful_tag(tag: str) -> bool:
     """Return True if a tag is meaningful for the cuisine/style filter."""
     if tag in _TAG_BLOCKLIST:
         return False
-    if "for-" in tag:
+    if tag.startswith("for-"):
         return False
     if "-servings" in tag:
         return False
@@ -288,146 +288,6 @@ def _nutrition_radar(row: pd.Series) -> go.Figure:
         margin=dict(t=20, b=20, l=50, r=50),
     )
     return fig
-
-
-def _render_recipe_card(row: pd.Series, card_index: int = 0) -> None:
-    """Render one full-width recipe card. Details expand on click."""
-    name          = str(row.get("name", "Unknown"))
-    cook_min      = row.get("avg_cook_minutes")
-    n_ingredients = row.get("ingredient_count")
-    bayesian      = row.get("sentiment_rating")
-    raw_rating    = row.get("avg_rating")
-    top_ingr_str  = str(row.get("top_ingredients") or "")
-    ingredients   = [i.strip() for i in top_ingr_str.split("|") if i.strip()]
-    trend_index   = row.get("trend_index")  # None/NaN when Google Trends not yet wired
-    recipe_id     = row.get("recipe_id", card_index)
-
-    amazon_url    = build_amazon_url(ingredients)
-    instacart_url = build_instacart_url(name)
-
-    with st.container():
-        st.markdown(
-            '<div style="background:white;border-radius:10px;border:1px solid #e5e7eb;'
-            'padding:20px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">',
-            unsafe_allow_html=True,
-        )
-
-        # --- Top row: name + shop buttons ---
-        col_info, col_shop = st.columns([3, 1])
-
-        with col_info:
-            subtitle_parts = []
-            if cook_min is not None and not pd.isna(cook_min):
-                subtitle_parts.append(f"⏱ {int(cook_min)} min")
-            if n_ingredients is not None and not pd.isna(n_ingredients):
-                subtitle_parts.append(f"{int(n_ingredients)} ingredients")
-            st.markdown(f"### {html.escape(name)}")
-            if subtitle_parts:
-                st.caption(" · ".join(subtitle_parts))
-
-            # Rating badges
-            badge_parts = []
-            if bayesian is not None and not pd.isna(bayesian):
-                badge_parts.append(
-                    f'<span style="background:#10b981;color:white;border-radius:4px;'
-                    f'padding:2px 8px;font-size:12px;font-weight:700;">⭐ {bayesian:.1f}</span>'
-                )
-            if raw_rating is not None and not pd.isna(raw_rating):
-                badge_parts.append(
-                    f'<span style="background:#f3f4f6;color:#374151;border-radius:4px;'
-                    f'padding:2px 8px;font-size:12px;">{raw_rating:.1f} avg</span>'
-                )
-            if (bayesian is not None and not pd.isna(bayesian)
-                    and raw_rating is not None and not pd.isna(raw_rating)):
-                delta = bayesian - raw_rating
-                if delta > 0:
-                    badge_parts.append(
-                        f'<span style="color:#059669;font-size:12px;font-weight:600;">'
-                        f'↑ +{delta:.1f} sentiment boost</span>'
-                    )
-            if trend_index is not None and not pd.isna(trend_index):
-                level = "🔥 High" if trend_index > 66 else ("📈 Medium" if trend_index > 33 else "📉 Low")
-                badge_parts.append(
-                    f'<span style="background:#fef3c7;color:#92400e;border-radius:4px;'
-                    f'padding:2px 8px;font-size:12px;">{level} trend demand</span>'
-                )
-            if badge_parts:
-                st.markdown(" &nbsp; ".join(badge_parts), unsafe_allow_html=True)
-
-        with col_shop:
-            st.markdown(
-                f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
-                f'color:white;text-align:center;border-radius:6px;padding:9px 12px;'
-                f'font-weight:700;font-size:13px;text-decoration:none;margin-bottom:6px;">'
-                f'🛒 Shop on Amazon Fresh</a>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<a href="{instacart_url}" target="_blank" style="display:block;background:white;'
-                f'color:#374151;text-align:center;border-radius:6px;padding:8px 12px;'
-                f'font-size:13px;text-decoration:none;border:1px solid #e5e7eb;">'
-                f'🥬 Instacart</a>',
-                unsafe_allow_html=True,
-            )
-
-        # --- Expandable detail section: radar | nutrition bars | ingredient pills ---
-        with st.expander("📊 Nutrition & Ingredients", expanded=False):
-            col_radar, col_bars, col_pills = st.columns([1.2, 1.5, 1])
-
-            with col_radar:
-                st.plotly_chart(
-                    _nutrition_radar(row),
-                    use_container_width=True,
-                    key=f"radar_{recipe_id}_{card_index}",
-                )
-
-            with col_bars:
-                st.markdown("**Nutrition (% Daily Value)**")
-                any_nutrition = False
-                for nutrient, label in zip(_RADAR_NUTRIENTS, _RADAR_LABELS):
-                    val = row.get(nutrient)
-                    if val is None or pd.isna(val):
-                        continue
-                    any_nutrition = True
-                    pct = float(val)
-                    color = nutrition_bar_color(pct, nutrient)
-                    st.markdown(
-                        f'<div style="display:flex;justify-content:space-between;'
-                        f'font-size:11px;color:#6b7280;margin-bottom:2px;">'
-                        f'<span>{label}</span><span>{pct:.0f}%</span></div>'
-                        f'<div style="height:6px;border-radius:3px;background:#f3f4f6;margin-bottom:6px;">'
-                        f'<div style="height:6px;border-radius:3px;background:{color};'
-                        f'width:{min(pct, 100):.0f}%;"></div></div>',
-                        unsafe_allow_html=True,
-                    )
-                if not any_nutrition:
-                    st.caption("Nutrition data not available for this recipe.")
-
-            with col_pills:
-                st.markdown("**Ingredients**")
-                if ingredients:
-                    pills_html = "".join(
-                        f'<span style="display:inline-block;background:#f3f4f6;border-radius:12px;'
-                        f'padding:3px 10px;font-size:11px;color:#6b7280;margin:2px;">'
-                        f'{html.escape(ing)}</span>'
-                        for ing in ingredients[:8]
-                    )
-                    if len(ingredients) > 8:
-                        pills_html += (
-                            f'<span style="display:inline-block;background:#e5e7eb;border-radius:12px;'
-                            f'padding:3px 10px;font-size:11px;color:#9ca3af;margin:2px;">'
-                            f'+{len(ingredients)-8} more</span>'
-                        )
-                    st.markdown(pills_html, unsafe_allow_html=True)
-                else:
-                    st.caption("—")
-
-            # Calories (not %DV — show raw kcal value if available)
-            cal_val = row.get("calories")
-            if cal_val is not None and not pd.isna(cal_val):
-                st.caption(f"Calories: {cal_val:.0f} kcal")
-
-        st.markdown("</div>", unsafe_allow_html=True)
 
 
 def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
@@ -668,6 +528,17 @@ def _parse_tag_list(tag_str: str) -> list[str]:
     return [t.strip() for t in s.split(",") if t.strip()]
 
 
+@st.cache_data(ttl=300)
+def _load_tag_options(df: pd.DataFrame, top_n: int = 60) -> list[str]:
+    """Precompute filtered tag list from full recipe dataframe (cached)."""
+    tag_counts: Counter = Counter()
+    for tags_str in df["tags"].dropna():
+        for t in _parse_tag_list(str(tags_str)):
+            if t and _is_useful_tag(t):
+                tag_counts[t] += 1
+    return [tag for tag, _ in tag_counts.most_common(top_n)]
+
+
 def _render_list_mode(df: pd.DataFrame) -> None:
     """Render the search + filter strip + paginated compact cards."""
 
@@ -704,12 +575,7 @@ def _render_list_mode(df: pd.DataFrame) -> None:
         with fcol3:
             max_ingredients = st.slider("Max ingredients", 1, 30, 30, step=1)
         with fcol4:
-            tag_counts: Counter = Counter()
-            for tags_str in df["tags"].dropna():
-                for t in _parse_tag_list(str(tags_str)):
-                    if t and _is_useful_tag(t):
-                        tag_counts[t] += 1
-            all_tags = [tag for tag, _ in tag_counts.most_common(60)]
+            all_tags = _load_tag_options(df)
             selected_tags = st.multiselect("Filter by tag", options=all_tags, default=[])
 
         qcol1, qcol2, qcol3, qcol4, _ = st.columns([1, 1, 1, 1, 2])

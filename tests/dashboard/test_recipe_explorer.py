@@ -153,3 +153,4 @@ class TestIsUsefulTag:
         assert _is_useful_tag("30-minutes-or-less") is True
         assert _is_useful_tag("asian") is True
         assert _is_useful_tag("low-fat") is True
+        assert _is_useful_tag("affordable-for-groups") is True
