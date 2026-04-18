@@ -444,7 +444,7 @@ def _render_detail_view(row: dict) -> None:
     # --- Back button + shop buttons row ---
     col_back, col_shops = st.columns([3, 2])
     with col_back:
-        if st.button("← Back to results", key="back_to_list"):
+        if st.button("← Back to results", key="back_to_list", type="primary"):
             _back_to_list()
     with col_shops:
         sc1, sc2 = st.columns(2)
@@ -609,6 +609,31 @@ def _load_tag_options(df: pd.DataFrame, top_n: int = 60) -> list[str]:
 def _render_list_mode(df: pd.DataFrame) -> None:
     """Render the search + filter strip + paginated compact cards."""
 
+    # Make secondary buttons look like plain bold headings (recipe name buttons).
+    # Pagination and back buttons use type="primary" so they keep button styling.
+    st.markdown(
+        """<style>
+        button[data-testid="baseButton-secondary"] {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            color: #111827 !important;
+            font-size: 1.05rem !important;
+            font-weight: 700 !important;
+            text-align: left !important;
+            padding: 0 0 2px 0 !important;
+            width: auto !important;
+        }
+        button[data-testid="baseButton-secondary"]:hover {
+            color: #10b981 !important;
+            background: transparent !important;
+            border: none !important;
+            text-decoration: underline !important;
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
     # --- Hero ---
     st.markdown(
         '<div style="background:linear-gradient(135deg,#10b981,#059669);border-radius:10px;'
@@ -697,13 +722,13 @@ def _render_list_mode(df: pd.DataFrame) -> None:
     # --- Pagination controls ---
     pc1, pc2, pc3 = st.columns([1, 2, 1])
     with pc1:
-        if page > 0 and st.button("← Previous", key="prev_page"):
+        if page > 0 and st.button("← Previous", key="prev_page", type="primary"):
             st.session_state["_recipe_page"] = page - 1
             st.rerun()
     with pc2:
         st.caption(f"Page {page + 1} of {n_pages}")
     with pc3:
-        if page < n_pages - 1 and st.button("Next →", key="next_page"):
+        if page < n_pages - 1 and st.button("Next →", key="next_page", type="primary"):
             st.session_state["_recipe_page"] = page + 1
             st.rerun()
 
