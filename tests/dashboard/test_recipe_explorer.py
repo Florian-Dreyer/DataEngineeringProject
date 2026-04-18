@@ -5,6 +5,7 @@ from foodcom_pipeline.dashboard.tabs.tab_recipe_explorer import (
     build_amazon_url,
     build_instacart_url,
     nutrition_bar_color,
+    _is_useful_tag,
 )
 
 
@@ -117,3 +118,38 @@ class TestNutritionBarColor:
 
     def test_fat_always_emerald(self):
         assert nutrition_bar_color(90.0, "fat") == "#10b981"
+
+
+class TestIsUsefulTag:
+    def test_blocklisted_tags_excluded(self):
+        assert _is_useful_tag("time-to-make") is False
+        assert _is_useful_tag("course") is False
+        assert _is_useful_tag("main-ingredient") is False
+        assert _is_useful_tag("preparation") is False
+        assert _is_useful_tag("occasion") is False
+        assert _is_useful_tag("equipment") is False
+        assert _is_useful_tag("dietary") is False
+        assert _is_useful_tag("technique") is False
+        assert _is_useful_tag("number-of-servings") is False
+        assert _is_useful_tag("meat") is False
+        assert _is_useful_tag("vegetables") is False
+
+    def test_for_prefix_excluded(self):
+        assert _is_useful_tag("for-large-groups") is False
+        assert _is_useful_tag("for-1-or-2-servings") is False
+
+    def test_servings_suffix_excluded(self):
+        assert _is_useful_tag("1-2-servings") is False
+        assert _is_useful_tag("4-6-servings") is False
+
+    def test_numeric_tags_excluded(self):
+        assert _is_useful_tag("60") is False
+        assert _is_useful_tag("30") is False
+
+    def test_useful_tags_pass(self):
+        assert _is_useful_tag("italian") is True
+        assert _is_useful_tag("vegetarian") is True
+        assert _is_useful_tag("desserts") is True
+        assert _is_useful_tag("30-minutes-or-less") is True
+        assert _is_useful_tag("asian") is True
+        assert _is_useful_tag("low-fat") is True
