@@ -135,9 +135,10 @@ def load_recipes() -> pd.DataFrame:
         return pd.DataFrame()
 
     nutrition_cols = ["calories", "protein", "fat", "sugar", "sodium", "carbs", "saturated_fat"]
-    probe_df = pd.read_parquet(recipes_path, columns=[])
+    import pyarrow.parquet as pq
+    schema_names = pq.read_schema(recipes_path).names
     keep = ["id", "name", "minutes", "tags", "ingredients", "n_ingredients"] + nutrition_cols
-    available = [c for c in keep if c in probe_df.columns]
+    available = [c for c in keep if c in schema_names]
 
     df = pd.read_parquet(recipes_path, columns=available).rename(columns={
         "id": "recipe_id",
