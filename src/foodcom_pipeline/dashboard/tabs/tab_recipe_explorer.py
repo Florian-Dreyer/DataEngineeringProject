@@ -216,6 +216,35 @@ def load_recipes() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=300, max_entries=100)
+def load_recipe_detail(recipe_id) -> dict:
+    """Load steps for a single recipe from parquet. Returns {"steps": [...]}."""
+    recipes_path = STAGING_DIR / "recipes_clean.parquet"
+    if not recipes_path.exists():
+        return {"steps": []}
+    try:
+        import pyarrow.parquet as pq
+        schema_names = pq.read_schema(recipes_path).names
+        if "steps" not in schema_names:
+            return {"steps": []}
+        df = pd.read_parquet(recipes_path, columns=["id", "steps"])
+        match = df[df["id"] == recipe_id]
+        if match.empty:
+            return {"steps": []}
+        raw = match.iloc[0]["steps"]
+        if hasattr(raw, "__iter__") and not isinstance(raw, str):
+            return {"steps": [str(s) for s in list(raw)]}
+        try:
+            parsed = ast.literal_eval(str(raw))
+            if isinstance(parsed, list):
+                return {"steps": [str(s) for s in parsed]}
+        except Exception:
+            pass
+        return {"steps": []}
+    except Exception:
+        return {"steps": []}
+
+
 # ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
