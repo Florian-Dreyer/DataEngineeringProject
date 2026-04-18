@@ -323,7 +323,7 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
             subtitle_parts.append(f"{int(n_ingredients)} ingredients")
         if subtitle_parts:
             st.caption(" · ".join(subtitle_parts))
-        if st.button("View full recipe →", key=f"select_{recipe_id}_{card_index}", type="tertiary"):
+        if st.button("View full recipe →", key=f"select_{recipe_id}_{card_index}", type="primary"):
             _select_recipe(row.to_dict())
 
         badge_parts = []
@@ -609,15 +609,6 @@ def _load_tag_options(df: pd.DataFrame, top_n: int = 60) -> list[str]:
 
 def _render_list_mode(df: pd.DataFrame) -> None:
     """Render the search + filter strip + paginated compact cards."""
-
-    st.markdown(
-        """<style>
-        button[data-testid="baseButton-tertiary"] {
-            padding: 6px 16px !important;
-        }
-        </style>""",
-        unsafe_allow_html=True,
-    )
 
     # --- Hero ---
     st.markdown(
