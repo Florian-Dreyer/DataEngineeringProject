@@ -314,8 +314,7 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
     col_info, col_shop = st.columns([3, 1])
 
     with col_info:
-        if st.button(name, key=f"select_{recipe_id}_{card_index}", type="tertiary"):
-            _select_recipe(row.to_dict())
+        st.markdown(f"### {html.escape(name)}")
 
         subtitle_parts = []
         if cook_min is not None and not pd.isna(cook_min):
@@ -324,6 +323,8 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
             subtitle_parts.append(f"{int(n_ingredients)} ingredients")
         if subtitle_parts:
             st.caption(" · ".join(subtitle_parts))
+        if st.button("View full recipe →", key=f"select_{recipe_id}_{card_index}", type="tertiary"):
+            _select_recipe(row.to_dict())
 
         badge_parts = []
         if display_rating is not None and not pd.isna(display_rating):
@@ -608,24 +609,6 @@ def _load_tag_options(df: pd.DataFrame, top_n: int = 60) -> list[str]:
 
 def _render_list_mode(df: pd.DataFrame) -> None:
     """Render the search + filter strip + paginated compact cards."""
-
-    # Scale up tertiary buttons (recipe name links) to heading size.
-    st.markdown(
-        """<style>
-        button[data-testid="baseButton-tertiary"] {
-            font-size: 2.25rem !important;
-            font-weight: 700 !important;
-            text-align: left !important;
-            padding: 0 0 2px 0 !important;
-            line-height: 1.2 !important;
-            color: #111827 !important;
-        }
-        button[data-testid="baseButton-tertiary"]:hover {
-            color: #10b981 !important;
-        }
-        </style>""",
-        unsafe_allow_html=True,
-    )
 
     # --- Hero ---
     st.markdown(
