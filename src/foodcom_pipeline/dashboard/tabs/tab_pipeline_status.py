@@ -109,8 +109,10 @@ def _load_airflow_runtimes() -> pd.DataFrame | None:
               )
             ORDER BY start_date;
         """
-        df = pd.read_sql(query, conn, params={"dag_id": DAG_ID})
-        conn.close()
+        try:
+            df = pd.read_sql(query, conn, params={"dag_id": DAG_ID})
+        finally:
+            conn.close()
         df = df.rename(columns={"duration": "duration_s"})
         df["duration_s"] = pd.to_numeric(df["duration_s"], errors="coerce")
         return df
@@ -121,11 +123,14 @@ def _load_airflow_runtimes() -> pd.DataFrame | None:
 @st.cache_data(ttl=60)
 def _load_data_freshness() -> dict | None:
     from datetime import datetime
-    mtimes = [
-        (STAGING_DIR / e["file"]).stat().st_mtime
-        for e in PIPELINE_STAGES
-        if (STAGING_DIR / e["file"]).exists()
-    ]
+    try:
+        mtimes = [
+            (STAGING_DIR / e["file"]).stat().st_mtime
+            for e in PIPELINE_STAGES
+            if (STAGING_DIR / e["file"]).exists()
+        ]
+    except OSError:
+        return None
     if not mtimes:
         return None
     last_run = datetime.fromtimestamp(max(mtimes))
@@ -164,6 +169,11 @@ def _load_substitution_stats() -> dict | None:
             "rate": candidates / total if total > 0 else 0.0}
 
 
+def _find_rows(stats: list[dict], label: str) -> int | None:
+    """Return the row count for the first staging stage whose label starts with `label`."""
+    return next((r["Rows"] for r in stats if r["Description"].startswith(label)), None)
+
+
 # ---------------------------------------------------------------------------
 # Render
 # ---------------------------------------------------------------------------
@@ -193,11 +203,8 @@ def render() -> None:
     st.divider()
 
     # KPI row 1: volume & loss
-    def _rows(label: str) -> int | None:
-        return next((r["Rows"] for r in stats if r["Description"].startswith(label)), None)
-
-    raw_r, clean_r = _rows("Raw recipes"), _rows("Clean recipes")
-    raw_i, clean_i = _rows("Raw interactions"), _rows("Clean interactions")
+    raw_r, clean_r = _find_rows(stats, "Raw recipes"), _find_rows(stats, "Clean recipes")
+    raw_i, clean_i = _find_rows(stats, "Raw interactions"), _find_rows(stats, "Clean interactions")
     recipe_loss = (raw_r - clean_r) / raw_r if raw_r and clean_r and raw_r > 0 else None
     int_loss    = (raw_i - clean_i) / raw_i if raw_i and clean_i and raw_i > 0 else None
 
