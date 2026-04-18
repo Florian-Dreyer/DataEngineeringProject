@@ -430,6 +430,76 @@ def _render_recipe_card(row: pd.Series, card_index: int = 0) -> None:
         st.markdown("</div>", unsafe_allow_html=True)
 
 
+def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
+    """Compact list-mode card — no chart. Recipe name triggers detail view."""
+    name          = str(row.get("name", "Unknown"))
+    cook_min      = row.get("avg_cook_minutes")
+    n_ingredients = row.get("ingredient_count")
+    display_rating = row.get("display_rating")
+    avg_rating    = row.get("avg_rating")
+    top_ingr_str  = str(row.get("top_ingredients") or "")
+    ingredients   = [i.strip() for i in top_ingr_str.split("|") if i.strip()]
+    recipe_id     = row.get("recipe_id", card_index)
+
+    amazon_url    = build_amazon_url(ingredients)
+    instacart_url = build_instacart_url(name)
+
+    subtitle_parts = []
+    if cook_min is not None and not pd.isna(cook_min):
+        subtitle_parts.append(f"⏱ {int(cook_min)} min")
+    if n_ingredients is not None and not pd.isna(n_ingredients):
+        subtitle_parts.append(f"{int(n_ingredients)} ingredients")
+    subtitle = " · ".join(subtitle_parts)
+
+    badge_parts = []
+    if display_rating is not None and not pd.isna(display_rating):
+        badge_parts.append(
+            f'<span style="background:#10b981;color:white;border-radius:4px;'
+            f'padding:2px 8px;font-size:12px;font-weight:700;">⭐ {display_rating:.1f}</span>'
+        )
+    if (avg_rating is not None and not pd.isna(avg_rating)
+            and display_rating is not None and not pd.isna(display_rating)
+            and abs(display_rating - avg_rating) > 0.2):
+        badge_parts.append(
+            f'<span style="background:#f3f4f6;color:#374151;border-radius:4px;'
+            f'padding:2px 8px;font-size:12px;">{avg_rating:.1f} avg</span>'
+        )
+    badge_html = " &nbsp; ".join(badge_parts) if badge_parts else ""
+
+    st.markdown(
+        '<div style="background:white;border-radius:10px;border:1px solid #e5e7eb;'
+        'padding:16px 20px;margin-bottom:10px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">',
+        unsafe_allow_html=True,
+    )
+    col_info, col_shop = st.columns([3, 1])
+
+    with col_info:
+        if st.button(name, key=f"select_{recipe_id}_{card_index}", type="secondary"):
+            _select_recipe(row.to_dict())
+        if subtitle:
+            st.caption(subtitle)
+        if badge_html:
+            st.markdown(badge_html, unsafe_allow_html=True)
+
+    with col_shop:
+        st.markdown(
+            f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
+            f'color:white;text-align:center;border-radius:6px;padding:9px 12px;'
+            f'font-weight:700;font-size:13px;text-decoration:none;margin-bottom:6px;">'
+            f'🛒 Shop on Amazon Fresh</a>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<a href="{instacart_url}" target="_blank" style="display:block;background:white;'
+            f'color:#374151;text-align:center;border-radius:6px;padding:8px 12px;'
+            f'font-size:13px;text-decoration:none;border:1px solid #e5e7eb;">'
+            f'🥬 Instacart</a>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 # ---------------------------------------------------------------------------
 # Main render
 # ---------------------------------------------------------------------------
