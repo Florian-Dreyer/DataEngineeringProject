@@ -52,8 +52,11 @@ CPG_ADJACENCY: dict[str, dict] = {
 def _load_cluster_profiles() -> dict | None:
     if not CLUSTER_PROFILE_PATH.exists():
         return None
-    with open(CLUSTER_PROFILE_PATH) as f:
-        return json.load(f)
+    try:
+        with open(CLUSTER_PROFILE_PATH) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def _radar_chart(profiles: dict, selected_labels: list[str]) -> go.Figure:
@@ -188,9 +191,10 @@ def render() -> None:
     st.divider()
 
     st.subheader("Export")
-    pdf_bytes = _generate_pdf(profiles, selected_labels)
-    if pdf_bytes:
-        st.download_button("Download PDF Report", data=pdf_bytes,
-                            file_name="foodcom_audience_report.pdf", mime="application/pdf")
-    else:
-        st.info("PDF export requires `fpdf2`. Install with `uv add fpdf2`.")
+    if st.button("Prepare PDF Report"):
+        pdf_bytes = _generate_pdf(profiles, selected_labels)
+        if pdf_bytes:
+            st.download_button("Download PDF Report", data=pdf_bytes,
+                                file_name="foodcom_audience_report.pdf", mime="application/pdf")
+        else:
+            st.info("PDF export requires `fpdf2`. Install with `uv add fpdf2`.")
