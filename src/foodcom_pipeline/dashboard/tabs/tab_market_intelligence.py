@@ -1,3 +1,5 @@
+"""Audience & Market Intelligence tab — CPG segment advertising tool."""
+
 import streamlit as st
 
 

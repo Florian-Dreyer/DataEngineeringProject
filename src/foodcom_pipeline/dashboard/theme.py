@@ -1,3 +1,5 @@
+"""Global CSS theme — inject_theme() writes emerald palette styles."""
+
 _CSS = """
 <style>
 /* Page background */

@@ -1,3 +1,5 @@
+"""Smart Substitutions tab — polished Coming Soon stub."""
+
 import streamlit as st
 
 

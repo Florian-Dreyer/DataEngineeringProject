@@ -1,3 +1,5 @@
+"""Pipeline Status tab — data health monitoring."""
+
 import streamlit as st
 
 
