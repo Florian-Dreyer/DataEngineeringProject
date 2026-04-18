@@ -1,5 +1,3 @@
-import streamlit as st
-
 _CSS = """
 <style>
 /* Page background */
@@ -54,4 +52,5 @@ hr { border-color: #e5e7eb; }
 
 def inject_theme() -> None:
     """Inject global Clean & Modern CSS into the Streamlit page."""
+    import streamlit as st
     st.markdown(_CSS, unsafe_allow_html=True)
