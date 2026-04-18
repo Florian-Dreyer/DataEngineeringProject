@@ -562,14 +562,8 @@ def _render_detail_view(row: dict) -> None:
                 f'<span style="display:inline-block;background:#f3f4f6;border-radius:12px;'
                 f'padding:3px 10px;font-size:11px;color:#6b7280;margin:2px;">'
                 f'{html.escape(ing)}</span>'
-                for ing in ingredients[:8]
+                for ing in ingredients
             )
-            if len(ingredients) > 8:
-                pills_html += (
-                    f'<span style="display:inline-block;background:#e5e7eb;border-radius:12px;'
-                    f'padding:3px 10px;font-size:11px;color:#9ca3af;margin:2px;">'
-                    f'+{len(ingredients)-8} more</span>'
-                )
             st.markdown(pills_html, unsafe_allow_html=True)
         else:
             st.caption("—")
@@ -625,7 +619,7 @@ def _render_list_mode(df: pd.DataFrame) -> None:
     )
 
     # --- Filter strip ---
-    with st.expander("🔍 Filters", expanded=True):
+    with st.expander("Filters", expanded=True):
         st.markdown(
             '<div style="background:#f8fafc;border:1px solid #e5e7eb;'
             'border-radius:8px;padding:16px;">',
