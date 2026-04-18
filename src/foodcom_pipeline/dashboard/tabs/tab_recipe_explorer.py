@@ -246,6 +246,22 @@ def load_recipe_detail(recipe_id) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Navigation helpers
+# ---------------------------------------------------------------------------
+
+def _select_recipe(row: dict) -> None:
+    """Switch to detail mode for the given recipe row dict."""
+    st.session_state["_selected_recipe"] = row
+    st.rerun()
+
+
+def _back_to_list() -> None:
+    """Return to list mode."""
+    st.session_state["_selected_recipe"] = None
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # UI helpers
 # ---------------------------------------------------------------------------
 
@@ -263,10 +279,13 @@ def _nutrition_radar(row: pd.Series) -> go.Figure:
         name="%DV",
     ))
     fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=9))),
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=9)),
+            angularaxis=dict(tickfont=dict(size=9)),
+        ),
         showlegend=False,
-        height=220,
-        margin=dict(t=10, b=10, l=10, r=10),
+        height=240,
+        margin=dict(t=20, b=20, l=50, r=50),
     )
     return fig
 
@@ -311,12 +330,12 @@ def _render_recipe_card(row: pd.Series, card_index: int = 0) -> None:
             if bayesian is not None and not pd.isna(bayesian):
                 badge_parts.append(
                     f'<span style="background:#10b981;color:white;border-radius:4px;'
-                    f'padding:2px 8px;font-size:12px;font-weight:700;">⭐ {bayesian:.1f} Bayesian</span>'
+                    f'padding:2px 8px;font-size:12px;font-weight:700;">⭐ {bayesian:.1f}</span>'
                 )
             if raw_rating is not None and not pd.isna(raw_rating):
                 badge_parts.append(
                     f'<span style="background:#f3f4f6;color:#374151;border-radius:4px;'
-                    f'padding:2px 8px;font-size:12px;">{raw_rating:.1f} raw</span>'
+                    f'padding:2px 8px;font-size:12px;">{raw_rating:.1f} avg</span>'
                 )
             if (bayesian is not None and not pd.isna(bayesian)
                     and raw_rating is not None and not pd.isna(raw_rating)):
