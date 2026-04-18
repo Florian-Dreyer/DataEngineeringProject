@@ -1,5 +1,6 @@
 """Recipe Explorer tab — hero search, filters, recipe cards, Shop buttons, pagination."""
 
+import html
 import os
 import urllib.parse
 from collections import Counter
@@ -177,7 +178,9 @@ def load_recipes() -> pd.DataFrame:
 
 def _nutrition_radar(row: pd.Series) -> go.Figure:
     """Plotly polar chart for 5 nutrition axes (%DV values)."""
-    values = [float(row.get(n) or 0) for n in _RADAR_NUTRIENTS]
+    def _safe_float(v) -> float:
+        return 0.0 if v is None or pd.isna(v) else float(v)
+    values = [_safe_float(row.get(n)) for n in _RADAR_NUTRIENTS]
     fig = go.Figure(go.Scatterpolar(
         r=values + [values[0]],
         theta=_RADAR_LABELS + [_RADAR_LABELS[0]],
@@ -303,7 +306,7 @@ def _render_recipe_card(row: pd.Series) -> None:
             if ingredients:
                 pills_html = "".join(
                     f'<span style="display:inline-block;background:#f3f4f6;border-radius:12px;'
-                    f'padding:3px 10px;font-size:11px;color:#6b7280;margin:2px;">{ing}</span>'
+                    f'padding:3px 10px;font-size:11px;color:#6b7280;margin:2px;">{html.escape(ing)}</span>'
                     for ing in ingredients[:8]
                 )
                 if len(ingredients) > 8:
