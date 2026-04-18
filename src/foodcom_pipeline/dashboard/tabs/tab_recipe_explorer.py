@@ -4,7 +4,6 @@ import ast
 import html
 import os
 import urllib.parse
-from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -305,127 +304,120 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
     amazon_url    = build_amazon_url(ingredients)
     instacart_url = build_instacart_url(name)
 
-    st.markdown(
-        '<div style="background:white;border-radius:10px;border:1px solid #e5e7eb;'
-        'padding:20px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">',
-        unsafe_allow_html=True,
-    )
+    with st.container(border=True):
+        col_info, col_shop = st.columns([3, 1])
 
-    col_info, col_shop = st.columns([3, 1])
+        with col_info:
+            st.markdown(f"### {html.escape(name)}")
 
-    with col_info:
-        st.markdown(f"### {html.escape(name)}")
+            subtitle_parts = []
+            if cook_min is not None and not pd.isna(cook_min):
+                subtitle_parts.append(f"⏱ {int(cook_min)} min")
+            if n_ingredients is not None and not pd.isna(n_ingredients):
+                subtitle_parts.append(f"{int(n_ingredients)} ingredients")
+            if subtitle_parts:
+                st.caption(" · ".join(subtitle_parts))
+            if st.button("View full recipe →", key=f"select_{recipe_id}_{card_index}", type="primary"):
+                _select_recipe(row.to_dict())
 
-        subtitle_parts = []
-        if cook_min is not None and not pd.isna(cook_min):
-            subtitle_parts.append(f"⏱ {int(cook_min)} min")
-        if n_ingredients is not None and not pd.isna(n_ingredients):
-            subtitle_parts.append(f"{int(n_ingredients)} ingredients")
-        if subtitle_parts:
-            st.caption(" · ".join(subtitle_parts))
-        if st.button("View full recipe →", key=f"select_{recipe_id}_{card_index}", type="primary"):
-            _select_recipe(row.to_dict())
-
-        badge_parts = []
-        if display_rating is not None and not pd.isna(display_rating):
-            badge_parts.append(
-                f'<span style="background:#10b981;color:white;border-radius:4px;'
-                f'padding:2px 8px;font-size:12px;font-weight:700;">⭐ {display_rating:.1f}</span>'
-            )
-        if avg_rating is not None and not pd.isna(avg_rating):
-            badge_parts.append(
-                f'<span style="background:#f3f4f6;color:#374151;border-radius:4px;'
-                f'padding:2px 8px;font-size:12px;">{avg_rating:.1f} avg</span>'
-            )
-        if (display_rating is not None and not pd.isna(display_rating)
-                and avg_rating is not None and not pd.isna(avg_rating)):
-            delta = display_rating - avg_rating
-            if delta > 0:
+            badge_parts = []
+            if display_rating is not None and not pd.isna(display_rating):
                 badge_parts.append(
-                    f'<span style="color:#059669;font-size:12px;font-weight:600;">'
-                    f'↑ +{delta:.1f} sentiment boost</span>'
+                    f'<span style="background:#10b981;color:white;border-radius:4px;'
+                    f'padding:2px 8px;font-size:12px;font-weight:700;">⭐ {display_rating:.1f}</span>'
                 )
-        if trend_index is not None and not pd.isna(trend_index):
-            level = "🔥 High" if trend_index > 66 else ("📈 Medium" if trend_index > 33 else "📉 Low")
-            badge_parts.append(
-                f'<span style="background:#fef3c7;color:#92400e;border-radius:4px;'
-                f'padding:2px 8px;font-size:12px;">{level} trend demand</span>'
-            )
-        if badge_parts:
-            st.markdown(" &nbsp; ".join(badge_parts), unsafe_allow_html=True)
-
-    with col_shop:
-        st.markdown(
-            f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
-            f'color:white;text-align:center;border-radius:6px;padding:9px 12px;'
-            f'font-weight:700;font-size:13px;text-decoration:none;margin-bottom:6px;">'
-            f'🛒 Shop on Amazon Fresh</a>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<a href="{instacart_url}" target="_blank" style="display:block;background:white;'
-            f'color:#374151;text-align:center;border-radius:6px;padding:8px 12px;'
-            f'font-size:13px;text-decoration:none;border:1px solid #e5e7eb;">'
-            f'🥬 Instacart</a>',
-            unsafe_allow_html=True,
-        )
-
-    with st.expander("📊 Nutrition & Ingredients", expanded=False):
-        col_radar, col_bars, col_pills = st.columns([1.2, 1.5, 1])
-
-        with col_radar:
-            st.plotly_chart(
-                _nutrition_radar(row),
-                use_container_width=True,
-                key=f"radar_{recipe_id}_{card_index}",
-            )
-
-        with col_bars:
-            st.markdown("**Nutrition (% Daily Value)**")
-            any_nutrition = False
-            for nutrient, label in zip(_RADAR_NUTRIENTS, _RADAR_LABELS):
-                val = row.get(nutrient)
-                if val is None or pd.isna(val):
-                    continue
-                any_nutrition = True
-                pct = float(val)
-                color = nutrition_bar_color(pct, nutrient)
-                st.markdown(
-                    f'<div style="display:flex;justify-content:space-between;'
-                    f'font-size:11px;color:#6b7280;margin-bottom:2px;">'
-                    f'<span>{label}</span><span>{pct:.0f}%</span></div>'
-                    f'<div style="height:6px;border-radius:3px;background:#f3f4f6;margin-bottom:6px;">'
-                    f'<div style="height:6px;border-radius:3px;background:{color};'
-                    f'width:{min(pct, 100):.0f}%;"></div></div>',
-                    unsafe_allow_html=True,
+            if avg_rating is not None and not pd.isna(avg_rating):
+                badge_parts.append(
+                    f'<span style="background:#f3f4f6;color:#374151;border-radius:4px;'
+                    f'padding:2px 8px;font-size:12px;">{avg_rating:.1f} avg</span>'
                 )
-            if not any_nutrition:
-                st.caption("Nutrition data not available for this recipe.")
-
-        with col_pills:
-            st.markdown("**Ingredients**")
-            if ingredients:
-                pills_html = "".join(
-                    f'<span style="display:inline-block;background:#f3f4f6;border-radius:12px;'
-                    f'padding:3px 10px;font-size:11px;color:#6b7280;margin:2px;">'
-                    f'{html.escape(ing)}</span>'
-                    for ing in ingredients[:8]
-                )
-                if len(ingredients) > 8:
-                    pills_html += (
-                        f'<span style="display:inline-block;background:#e5e7eb;border-radius:12px;'
-                        f'padding:3px 10px;font-size:11px;color:#9ca3af;margin:2px;">'
-                        f'+{len(ingredients)-8} more</span>'
+            if (display_rating is not None and not pd.isna(display_rating)
+                    and avg_rating is not None and not pd.isna(avg_rating)):
+                delta = display_rating - avg_rating
+                if delta > 0:
+                    badge_parts.append(
+                        f'<span style="color:#059669;font-size:12px;font-weight:600;">'
+                        f'↑ +{delta:.1f} sentiment boost</span>'
                     )
-                st.markdown(pills_html, unsafe_allow_html=True)
-            else:
-                st.caption("—")
+            if trend_index is not None and not pd.isna(trend_index):
+                level = "🔥 High" if trend_index > 66 else ("📈 Medium" if trend_index > 33 else "📉 Low")
+                badge_parts.append(
+                    f'<span style="background:#fef3c7;color:#92400e;border-radius:4px;'
+                    f'padding:2px 8px;font-size:12px;">{level} trend demand</span>'
+                )
+            if badge_parts:
+                st.markdown(" &nbsp; ".join(badge_parts), unsafe_allow_html=True)
 
-        cal_val = row.get("calories")
-        if cal_val is not None and not pd.isna(cal_val):
-            st.caption(f"Calories: {cal_val:.0f} kcal")
+        with col_shop:
+            st.markdown(
+                f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
+                f'color:white;text-align:center;border-radius:6px;padding:9px 12px;'
+                f'font-weight:700;font-size:13px;text-decoration:none;margin-bottom:6px;">'
+                f'🛒 Shop on Amazon Fresh</a>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<a href="{instacart_url}" target="_blank" style="display:block;background:white;'
+                f'color:#374151;text-align:center;border-radius:6px;padding:8px 12px;'
+                f'font-size:13px;text-decoration:none;border:1px solid #e5e7eb;">'
+                f'🥬 Instacart</a>',
+                unsafe_allow_html=True,
+            )
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        with st.expander("📊 Nutrition & Ingredients", expanded=False):
+            col_radar, col_bars, col_pills = st.columns([1.2, 1.5, 1])
+
+            with col_radar:
+                st.plotly_chart(
+                    _nutrition_radar(row),
+                    use_container_width=True,
+                    key=f"radar_{recipe_id}_{card_index}",
+                )
+
+            with col_bars:
+                st.markdown("**Nutrition per serving**")
+                any_nutrition = False
+                for nutrient, label in zip(_RADAR_NUTRIENTS, _RADAR_LABELS):
+                    val = row.get(nutrient)
+                    if val is None or pd.isna(val):
+                        continue
+                    any_nutrition = True
+                    pct = float(val)
+                    color = nutrition_bar_color(pct, nutrient)
+                    st.markdown(
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'font-size:11px;color:#6b7280;margin-bottom:2px;">'
+                        f'<span>{label}</span><span>{pct:.0f}%</span></div>'
+                        f'<div style="height:6px;border-radius:3px;background:#f3f4f6;margin-bottom:6px;">'
+                        f'<div style="height:6px;border-radius:3px;background:{color};'
+                        f'width:{min(pct, 100):.0f}%;"></div></div>',
+                        unsafe_allow_html=True,
+                    )
+                if not any_nutrition:
+                    st.caption("Nutrition data not available for this recipe.")
+
+            with col_pills:
+                st.markdown("**Ingredients**")
+                if ingredients:
+                    pills_html = "".join(
+                        f'<span style="display:inline-block;background:#f3f4f6;border-radius:12px;'
+                        f'padding:3px 10px;font-size:11px;color:#6b7280;margin:2px;">'
+                        f'{html.escape(ing)}</span>'
+                        for ing in ingredients[:8]
+                    )
+                    if len(ingredients) > 8:
+                        pills_html += (
+                            f'<span style="display:inline-block;background:#e5e7eb;border-radius:12px;'
+                            f'padding:3px 10px;font-size:11px;color:#9ca3af;margin:2px;">'
+                            f'+{len(ingredients)-8} more</span>'
+                        )
+                    st.markdown(pills_html, unsafe_allow_html=True)
+                else:
+                    st.caption("—")
+
+            cal_val = row.get("calories")
+            if cal_val is not None and not pd.isna(cal_val):
+                st.caption(f"Calories: {cal_val:.0f} kcal per serving")
 
 
 def _render_detail_view(row: dict) -> None:
@@ -534,7 +526,7 @@ def _render_detail_view(row: dict) -> None:
         )
 
     with col_bars:
-        st.markdown("**Nutrition (% Daily Value)**")
+        st.markdown("**Nutrition per serving**")
         any_nutrition = False
         for nutrient, label in zip(_RADAR_NUTRIENTS, _RADAR_LABELS):
             val = row.get(nutrient)
@@ -570,122 +562,56 @@ def _render_detail_view(row: dict) -> None:
 
     cal_val = row.get("calories")
     if cal_val is not None and not pd.isna(cal_val):
-        st.caption(f"Calories: {cal_val:.0f} kcal")
+        st.caption(f"Calories: {cal_val:.0f} kcal per serving")
 
 
 # ---------------------------------------------------------------------------
 # Main render
 # ---------------------------------------------------------------------------
 
-def _parse_tag_list(tag_str: str) -> list[str]:
-    """Parse a tag string that may be a Python list repr or a comma-separated string."""
-    s = str(tag_str).strip()
-    if s.startswith("["):
-        try:
-            parsed = ast.literal_eval(s)
-            if isinstance(parsed, list):
-                return [str(t).strip() for t in parsed if str(t).strip()]
-        except Exception:
-            pass
-    return [t.strip() for t in s.split(",") if t.strip()]
-
-
-@st.cache_data(ttl=300)
-def _load_tag_options(df: pd.DataFrame, top_n: int = 60) -> list[str]:
-    """Precompute filtered tag list from full recipe dataframe (cached)."""
-    tag_counts: Counter = Counter()
-    for tags_str in df["tags"].dropna():
-        for t in _parse_tag_list(str(tags_str)):
-            if t and _is_useful_tag(t):
-                tag_counts[t] += 1
-    return [tag for tag, _ in tag_counts.most_common(top_n)]
-
-
 def _render_list_mode(df: pd.DataFrame) -> None:
-    """Render the search + filter strip + paginated compact cards."""
+    """Render hero + search + paginated recipe cards."""
 
     # --- Hero ---
     st.markdown(
         '<div style="background:linear-gradient(135deg,#10b981,#059669);border-radius:10px;'
         'padding:24px 28px;margin-bottom:12px;">'
         '<h1 style="color:white;margin:0;font-size:26px;">🍳 Recipe Explorer</h1>'
-        '<p style="color:#d1fae5;margin:6px 0 0;">Search 231,637 recipes — '
+        '<p style="color:#d1fae5;margin:6px 0 0;">Browse recipes — '
         'see ratings, nutrition, and shop ingredients in one click.</p>'
         '</div>',
         unsafe_allow_html=True,
     )
+
+    # --- Search ---
     search = st.text_input(
-        "", placeholder="🔍 Search recipes or ingredients...", label_visibility="collapsed"
+        "",
+        placeholder="🔍 Search recipes by name or ingredient",
+        label_visibility="collapsed"
     )
+    if search:
+        prev_search = st.session_state.get("_recipe_search", "")
+        if search != prev_search:
+            st.session_state["_recipe_page"] = 0
+            st.session_state["_recipe_search"] = search
+        df = df[
+            df["name"].str.contains(search, case=False, na=False)
+            | df["top_ingredients"].str.contains(search, case=False, na=False)
+        ]
+    else:
+        st.session_state.pop("_recipe_search", None)
 
-    # --- Filter strip ---
-    with st.expander("Filters", expanded=True):
-        st.markdown(
-            '<div style="background:#f8fafc;border:1px solid #e5e7eb;'
-            'border-radius:8px;padding:16px;">',
-            unsafe_allow_html=True,
-        )
-        fcol1, fcol2, fcol3, fcol4 = st.columns([1.5, 1, 1, 1.5])
-        with fcol1:
-            max_cook = st.slider("Max cook time (min)", 5, 180, 180, step=5)
-        with fcol2:
-            min_rating = st.select_slider(
-                "Min rating",
-                options=[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
-                value=0.0,
-            )
-        with fcol3:
-            max_ingredients = st.slider("Max ingredients", 1, 30, 30, step=1)
-        with fcol4:
-            all_tags = _load_tag_options(df)
-            selected_tags = st.multiselect("Filter by tag", options=all_tags, default=[])
-
-        qcol1, qcol2, qcol3, qcol4, _ = st.columns([1, 1, 1, 1, 2])
-        with qcol1:
-            max_calories = st.number_input("Max calories (%DV)", min_value=0, max_value=500, value=500, step=10)
-        with qcol2:
-            min_protein = st.number_input("Min protein (%DV)", min_value=0, max_value=100, value=0, step=5)
-        with qcol3:
-            low_sugar = st.checkbox("Low sugar (<30% DV)")
-        with qcol4:
-            low_sodium = st.checkbox("Low sodium (<50% DV)")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # --- Apply filters ---
-    filtered = apply_filters(df, search, max_cook, min_rating, selected_tags)
-    if "ingredient_count" in filtered.columns:
-        filtered = filtered[filtered["ingredient_count"].fillna(999) <= max_ingredients]
-    if "calories" in filtered.columns:
-        filtered = filtered[filtered["calories"].fillna(0) <= max_calories]
-    if "protein" in filtered.columns:
-        filtered = filtered[filtered["protein"].fillna(0) >= min_protein]
-    if low_sugar and "sugar" in filtered.columns:
-        filtered = filtered[filtered["sugar"].fillna(100) < 30]
-    if low_sodium and "sodium" in filtered.columns:
-        filtered = filtered[filtered["sodium"].fillna(100) < 50]
-
-    total = len(filtered)
-
-    # --- Pagination state ---
-    filter_hash = hash((
-        search, max_cook, min_rating, max_ingredients,
-        max_calories, min_protein, low_sugar, low_sodium,
-        tuple(sorted(selected_tags)),
-    ))
-    if st.session_state.get("_recipe_filter_hash") != filter_hash:
-        st.session_state["_recipe_page"] = 0
-        st.session_state["_recipe_filter_hash"] = filter_hash
+    total = len(df)
     page = st.session_state.get("_recipe_page", 0)
     n_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, n_pages - 1))
 
     start = page * PAGE_SIZE
     end   = min(start + PAGE_SIZE, total)
-    st.caption(f"{total:,} recipes · showing {start + 1}–{end}" if total else "No recipes match your filters.")
+    st.caption(f"{total:,} recipes · showing {start + 1}–{end}")
 
     # --- Cards ---
-    page_df = filtered.iloc[start:end]
+    page_df = df.iloc[start:end]
     for idx, (_, row) in enumerate(page_df.iterrows()):
         _render_compact_card(row, card_index=start + idx)
 
