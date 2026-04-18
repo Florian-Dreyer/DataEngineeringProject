@@ -2,6 +2,7 @@
 
 import os
 import urllib.parse
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -350,12 +351,13 @@ def render() -> None:
     with filter_col2:
         min_rating = st.select_slider("Min Bayesian rating", options=[1.0, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0], value=3.0)
     with filter_col3:
-        all_tags = sorted({
+        tag_counts = Counter(
             tag.strip()
             for tags_str in df["tags"].dropna()
             for tag in str(tags_str).split(",")
             if tag.strip()
-        })[:40]
+        )
+        all_tags = [tag for tag, _ in tag_counts.most_common(40)]
         selected_tags = st.multiselect("Cuisine / tags", options=all_tags, default=[])
 
     filtered = apply_filters(df, search, max_cook, min_rating, selected_tags)
