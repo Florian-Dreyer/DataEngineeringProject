@@ -500,6 +500,157 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def _render_detail_view(row: dict) -> None:
+    """Full-page detail view for a single recipe, including steps and nutrition."""
+    recipe_id     = row.get("recipe_id")
+    name          = str(row.get("name", "Unknown"))
+    cook_min      = row.get("avg_cook_minutes")
+    n_ingredients = row.get("ingredient_count")
+    display_rating = row.get("display_rating")
+    avg_rating    = row.get("avg_rating")
+    top_ingr_str  = str(row.get("top_ingredients") or "")
+    ingredients   = [i.strip() for i in top_ingr_str.split("|") if i.strip()]
+
+    amazon_url    = build_amazon_url(ingredients)
+    instacart_url = build_instacart_url(name)
+
+    # --- Back button + shop buttons row ---
+    col_back, col_shops = st.columns([3, 2])
+    with col_back:
+        if st.button("← Back to results", key="back_to_list"):
+            _back_to_list()
+    with col_shops:
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            st.markdown(
+                f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
+                f'color:white;text-align:center;border-radius:6px;padding:9px 12px;'
+                f'font-weight:700;font-size:13px;text-decoration:none;">'
+                f'🛒 Shop on Amazon Fresh</a>',
+                unsafe_allow_html=True,
+            )
+        with sc2:
+            st.markdown(
+                f'<a href="{instacart_url}" target="_blank" style="display:block;background:white;'
+                f'color:#374151;text-align:center;border-radius:6px;padding:8px 12px;'
+                f'font-size:13px;text-decoration:none;border:1px solid #e5e7eb;">'
+                f'🥬 Instacart</a>',
+                unsafe_allow_html=True,
+            )
+
+    # --- Recipe title + metadata ---
+    st.markdown(f"# {html.escape(name)}")
+
+    meta_parts = []
+    if cook_min is not None and not pd.isna(cook_min):
+        meta_parts.append(f"⏱ {int(cook_min)} min")
+    if n_ingredients is not None and not pd.isna(n_ingredients):
+        meta_parts.append(f"{int(n_ingredients)} ingredients")
+
+    badge_parts = []
+    if display_rating is not None and not pd.isna(display_rating):
+        badge_parts.append(
+            f'<span style="background:#10b981;color:white;border-radius:4px;'
+            f'padding:2px 8px;font-size:13px;font-weight:700;">⭐ {display_rating:.1f}</span>'
+        )
+    if (avg_rating is not None and not pd.isna(avg_rating)
+            and display_rating is not None and not pd.isna(display_rating)
+            and abs(display_rating - avg_rating) > 0.2):
+        badge_parts.append(
+            f'<span style="background:#f3f4f6;color:#374151;border-radius:4px;'
+            f'padding:2px 8px;font-size:13px;">{avg_rating:.1f} avg</span>'
+        )
+
+    meta_html = " &nbsp;·&nbsp; ".join(meta_parts)
+    if badge_parts:
+        if meta_html:
+            meta_html += " &nbsp; "
+        meta_html += " &nbsp; ".join(badge_parts)
+    if meta_html:
+        st.markdown(meta_html, unsafe_allow_html=True)
+
+    st.divider()
+
+    # --- Steps ---
+    st.markdown("### Steps")
+    detail = load_recipe_detail(recipe_id)
+    steps = detail.get("steps", [])
+    if steps:
+        steps_html = "".join(
+            f'<div style="display:flex;align-items:flex-start;margin-bottom:14px;">'
+            f'<span style="background:#10b981;color:white;border-radius:50%;'
+            f'min-width:26px;height:26px;display:flex;align-items:center;'
+            f'justify-content:center;font-size:12px;font-weight:700;'
+            f'flex-shrink:0;margin-right:14px;">{i}</span>'
+            f'<span style="font-size:14px;line-height:1.6;color:#111827;">'
+            f'{html.escape(str(step))}</span>'
+            f'</div>'
+            for i, step in enumerate(steps, 1)
+        )
+        st.markdown(steps_html, unsafe_allow_html=True)
+    else:
+        st.info("Recipe steps not available for this recipe.")
+
+    st.divider()
+
+    # --- Nutrition & Ingredients ---
+    st.markdown("### Nutrition & Ingredients")
+    row_series = pd.Series(row)
+    col_radar, col_bars, col_pills = st.columns([1.2, 1.5, 1])
+
+    with col_radar:
+        st.plotly_chart(
+            _nutrition_radar(row_series),
+            use_container_width=True,
+            key=f"detail_radar_{recipe_id}",
+        )
+
+    with col_bars:
+        st.markdown("**Nutrition (% Daily Value)**")
+        any_nutrition = False
+        for nutrient, label in zip(_RADAR_NUTRIENTS, _RADAR_LABELS):
+            val = row.get(nutrient)
+            if val is None or pd.isna(val):
+                continue
+            any_nutrition = True
+            pct = float(val)
+            color = nutrition_bar_color(pct, nutrient)
+            st.markdown(
+                f'<div style="display:flex;justify-content:space-between;'
+                f'font-size:11px;color:#6b7280;margin-bottom:2px;">'
+                f'<span>{label}</span><span>{pct:.0f}%</span></div>'
+                f'<div style="height:6px;border-radius:3px;background:#f3f4f6;margin-bottom:6px;">'
+                f'<div style="height:6px;border-radius:3px;background:{color};'
+                f'width:{min(pct, 100):.0f}%;"></div></div>',
+                unsafe_allow_html=True,
+            )
+        if not any_nutrition:
+            st.caption("Nutrition data not available for this recipe.")
+
+    with col_pills:
+        st.markdown("**Ingredients**")
+        if ingredients:
+            pills_html = "".join(
+                f'<span style="display:inline-block;background:#f3f4f6;border-radius:12px;'
+                f'padding:3px 10px;font-size:11px;color:#6b7280;margin:2px;">'
+                f'{html.escape(ing)}</span>'
+                for ing in ingredients[:8]
+            )
+            if len(ingredients) > 8:
+                pills_html += (
+                    f'<span style="display:inline-block;background:#e5e7eb;border-radius:12px;'
+                    f'padding:3px 10px;font-size:11px;color:#9ca3af;margin:2px;">'
+                    f'+{len(ingredients)-8} more</span>'
+                )
+            st.markdown(pills_html, unsafe_allow_html=True)
+        else:
+            st.caption("—")
+
+    cal_val = row.get("calories")
+    if cal_val is not None and not pd.isna(cal_val):
+        st.caption(f"Calories: {cal_val:.0f} kcal")
+
+
 # ---------------------------------------------------------------------------
 # Main render
 # ---------------------------------------------------------------------------
