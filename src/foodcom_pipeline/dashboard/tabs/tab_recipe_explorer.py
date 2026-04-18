@@ -618,11 +618,12 @@ def _render_list_mode(df: pd.DataFrame) -> None:
             border: none !important;
             box-shadow: none !important;
             color: #111827 !important;
-            font-size: 1.05rem !important;
+            font-size: 2.25rem !important;
             font-weight: 700 !important;
             text-align: left !important;
             padding: 0 0 2px 0 !important;
             width: auto !important;
+            line-height: 1.2 !important;
         }
         button[data-testid="baseButton-secondary"]:hover {
             color: #10b981 !important;
