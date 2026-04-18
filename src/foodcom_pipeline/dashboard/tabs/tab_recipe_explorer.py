@@ -314,7 +314,7 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
     col_info, col_shop = st.columns([3, 1])
 
     with col_info:
-        if st.button(name, key=f"select_{recipe_id}_{card_index}", type="secondary"):
+        if st.button(name, key=f"select_{recipe_id}_{card_index}", type="tertiary"):
             _select_recipe(row.to_dict())
 
         subtitle_parts = []
@@ -609,27 +609,19 @@ def _load_tag_options(df: pd.DataFrame, top_n: int = 60) -> list[str]:
 def _render_list_mode(df: pd.DataFrame) -> None:
     """Render the search + filter strip + paginated compact cards."""
 
-    # Make secondary buttons look like plain bold headings (recipe name buttons).
-    # Pagination and back buttons use type="primary" so they keep button styling.
+    # Scale up tertiary buttons (recipe name links) to heading size.
     st.markdown(
         """<style>
-        button[data-testid="baseButton-secondary"] {
-            background: transparent !important;
-            border: none !important;
-            box-shadow: none !important;
-            color: #111827 !important;
+        button[data-testid="baseButton-tertiary"] {
             font-size: 2.25rem !important;
             font-weight: 700 !important;
             text-align: left !important;
             padding: 0 0 2px 0 !important;
-            width: auto !important;
             line-height: 1.2 !important;
+            color: #111827 !important;
         }
-        button[data-testid="baseButton-secondary"]:hover {
+        button[data-testid="baseButton-tertiary"]:hover {
             color: #10b981 !important;
-            background: transparent !important;
-            border: none !important;
-            text-decoration: underline !important;
         }
         </style>""",
         unsafe_allow_html=True,
