@@ -159,6 +159,8 @@ def load_recipes() -> pd.DataFrame:
     if sentiment_path.exists():
         sent = pd.read_parquet(sentiment_path, columns=["recipe_id", "sentiment_rating"])
         df = df.merge(sent, on="recipe_id", how="left")
+        # VADER compound scores are 0–1; scale to 1–5 to match the UI slider
+        df["sentiment_rating"] = df["sentiment_rating"] * 5
     else:
         df["sentiment_rating"] = float("nan")
 
