@@ -3,7 +3,7 @@
 import ast
 import html
 import os
-import urllib.parse
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -64,19 +64,20 @@ def _is_useful_tag(tag: str) -> bool:
 # Pure helpers (independently testable — no Streamlit dependency)
 # ---------------------------------------------------------------------------
 
-def build_amazon_url(ingredients: list[str]) -> str:
-    """Build an Amazon Fresh search URL for the first 8 ingredients."""
-    top = ingredients[:8]
-    if not top:
-        return "https://www.amazon.com/s?i=amazonfresh"
-    query = "+".join(urllib.parse.quote_plus(ing) for ing in top)
-    return f"https://www.amazon.com/s?k={query}&i=amazonfresh"
+def _restore_apostrophes(name: str) -> str:
+    """Restore possessive apostrophes stripped by the Kaggle dataset (e.g. "mom s" → "mom's")."""
+    # Match 2+ alpha chars followed by standalone " s " or " s" at end of string
+    name = re.sub(r"\b([a-zA-Z]{2,}) s ([a-zA-Z])", r"\1's \2", name)
+    name = re.sub(r"\b([a-zA-Z]{2,}) s$", r"\1's", name)
+    return name
 
 
-def build_instacart_url(recipe_name: str) -> str:
-    """Build an Instacart search URL for a recipe name."""
-    query = urllib.parse.quote_plus(f"{recipe_name} ingredients")
-    return f"https://www.instacart.com/store/s?k={query}"
+def build_amazon_url(_ingredients: list[str]) -> str:
+    return "https://www.amazon.com/fresh"
+
+
+def build_instacart_url(_recipe_name: str) -> str:
+    return "https://www.instacart.com"
 
 
 def apply_filters(
@@ -308,9 +309,11 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
         col_info, col_shop = st.columns([3, 1])
 
         with col_info:
-            st.markdown(f"### {html.escape(name)}")
+            st.markdown(f"### {html.escape(_restore_apostrophes(html.unescape(name)))}")
 
             subtitle_parts = []
+            if display_rating is not None and not pd.isna(display_rating):
+                subtitle_parts.append(f"⭐ {display_rating:.1f}")
             if cook_min is not None and not pd.isna(cook_min):
                 subtitle_parts.append(f"⏱ {int(cook_min)} min")
             if n_ingredients is not None and not pd.isna(n_ingredients):
@@ -321,11 +324,6 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
                 _select_recipe(row.to_dict())
 
             badge_parts = []
-            if display_rating is not None and not pd.isna(display_rating):
-                badge_parts.append(
-                    f'<span style="background:#10b981;color:white;border-radius:4px;'
-                    f'padding:2px 8px;font-size:12px;font-weight:700;">⭐ {display_rating:.1f}</span>'
-                )
             if avg_rating is not None and not pd.isna(avg_rating):
                 badge_parts.append(
                     f'<span style="background:#f3f4f6;color:#374151;border-radius:4px;'
@@ -459,35 +457,26 @@ def _render_detail_view(row: dict) -> None:
             )
 
     # --- Recipe title + metadata ---
-    st.markdown(f"# {html.escape(name)}")
+    st.markdown(f"# {html.escape(_restore_apostrophes(html.unescape(name)))}")
 
     meta_parts = []
+    if display_rating is not None and not pd.isna(display_rating):
+        meta_parts.append(f"⭐ {display_rating:.1f}")
     if cook_min is not None and not pd.isna(cook_min):
         meta_parts.append(f"⏱ {int(cook_min)} min")
     if n_ingredients is not None and not pd.isna(n_ingredients):
         meta_parts.append(f"{int(n_ingredients)} ingredients")
 
-    badge_parts = []
-    if display_rating is not None and not pd.isna(display_rating):
-        badge_parts.append(
-            f'<span style="background:#10b981;color:white;border-radius:4px;'
-            f'padding:2px 8px;font-size:13px;font-weight:700;">⭐ {display_rating:.1f}</span>'
-        )
     if (avg_rating is not None and not pd.isna(avg_rating)
             and display_rating is not None and not pd.isna(display_rating)
             and abs(display_rating - avg_rating) > 0.2):
-        badge_parts.append(
+        meta_parts.append(
             f'<span style="background:#f3f4f6;color:#374151;border-radius:4px;'
             f'padding:2px 8px;font-size:13px;">{avg_rating:.1f} avg</span>'
         )
 
-    meta_html = " &nbsp;·&nbsp; ".join(meta_parts)
-    if badge_parts:
-        if meta_html:
-            meta_html += " &nbsp; "
-        meta_html += " &nbsp; ".join(badge_parts)
-    if meta_html:
-        st.markdown(meta_html, unsafe_allow_html=True)
+    if meta_parts:
+        st.markdown(" &nbsp;·&nbsp; ".join(meta_parts), unsafe_allow_html=True)
 
     st.divider()
 
