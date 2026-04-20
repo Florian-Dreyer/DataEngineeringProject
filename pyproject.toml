@@ -27,7 +27,6 @@ dependencies = [
     # ── NLP & Sentiment ─────────────────────────────────────────────
     "nltk>=3.8",                # VADER lexicon utils (stream layer)
     "vaderSentiment>=3.3.2",    # VADER sentiment (batch + stream)
-
     # ── Machine Learning ────────────────────────────────────────────
     "xgboost>=2.0",
     # ── Dashboard ───────────────────────────────────────────────────

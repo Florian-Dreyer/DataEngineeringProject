@@ -63,7 +63,6 @@ services:
       - "8080:8080"
     command: >
       bash -lc "set -euo pipefail;
-      pip install -e /opt/airflow/app --no-deps;
       airflow db migrate;
       airflow users create --username \"${AIRFLOW_USERNAME:-airflow}\" --password \"${AIRFLOW_PASSWORD:-airflow}\" --firstname \"${AIRFLOW_FIRSTNAME:-Air}\" --lastname \"${AIRFLOW_LASTNAME:-Flow}\" --role Admin --email \"${AIRFLOW_EMAIL:-airflow@example.com}\" || true;
       airflow scheduler & exec airflow webserver"

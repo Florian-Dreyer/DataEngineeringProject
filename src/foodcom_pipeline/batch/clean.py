@@ -17,7 +17,10 @@ Cleaning steps are divided into two categories:
 
 import ast
 import logging
+import pickle
 import re
+import sys
+import types
 from typing import Any
 
 import pandas as pd
@@ -448,63 +451,6 @@ def _parse_nutrition(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _load_ingr_map(path) -> dict[str, str]:
-    def _pickle_load_with_pandas_shim(fh):
-        try:
-            return pickle.load(fh)
-        except ModuleNotFoundError as e:
-            if "pandas.core.indexes.numeric" not in str(e):
-                raise
-            import pandas as _pd
-
-            shim = types.ModuleType("pandas.core.indexes.numeric")
-            for cls_name in [
-                "Int64Index",
-                "UInt64Index",
-                "Float64Index",
-                "NumericIndex",
-            ]:
-                setattr(shim, cls_name, _pd.Index)
-            sys.modules["pandas.core.indexes.numeric"] = shim
-            fh.seek(0)
-            return pickle.load(fh)
-
-    with path.open('rb') as f:
-        obj: Any = _pickle_load_with_pandas_shim(f)
-
-    if isinstance(obj, dict):
-        out: dict[str, str] = {}
-        for k, v in obj.items():
-            if v is None:
-                continue
-            out[str(k).strip().lower()] = str(v).strip().lower()
-        return out
-
-    # Kaggle's ingr_map.pkl is often a DataFrame with raw ingredient variants
-    # mapped to a canonical replacement string (usually in "replaced").
-    if isinstance(obj, pd.DataFrame):
-        cols = {c.lower(): c for c in obj.columns}
-        raw_col = cols.get('raw_ingr') or cols.get('raw_ingredient') or cols.get('raw')
-        canon_col = (
-            cols.get('replaced') or cols.get('canonical') or cols.get('canonical_form')
-        )
-
-        if raw_col and canon_col:
-            out: dict[str, str] = {}
-            for _, row in obj.iterrows():
-                raw = row.get(raw_col)
-                canon = row.get(canon_col)
-                if pd.notnull(raw) and pd.notnull(canon):
-                    out[str(raw).strip().lower()] = str(canon).strip().lower()
-            if out:
-                return out
-
-        raise TypeError(
-            'Unsupported ingr_map.pkl DataFrame shape. '
-            f'Columns found: {list(obj.columns)}'
-        )
-
-    raise TypeError(f'Unsupported ingr_map.pkl structure: {type(obj)!r}')
 
 
 def _normalize_ingredients(
