@@ -377,7 +377,21 @@ def extract_interactions(**context) -> None:
         logger.info(f'Initial load: processing all {total_rows} interactions')
 
     if df.empty:
-        logger.info('No new interactions found. Nothing to stage.')
+        logger.info(
+            'No new interactions after watermark — staging empty parquet so paths '
+            'exist for downstream (e.g. clean when check_has_new_data is forced).'
+        )
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        empty = pd.DataFrame(
+            {
+                'user_id': pd.Series(dtype='int64'),
+                'recipe_id': pd.Series(dtype='int64'),
+                'date': pd.Series(dtype='datetime64[ns]'),
+                'rating': pd.Series(dtype='int8'),
+                'review': pd.Series(dtype='object'),
+            }
+        )
+        empty.to_parquet(INTERACTIONS_STAGING, index=False)
         context['ti'].xcom_push(key='interactions_record_count', value=0)
         context['ti'].xcom_push(key='has_new_data', value=False)
         return

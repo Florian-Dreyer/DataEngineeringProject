@@ -92,6 +92,18 @@ def run_clustering(**context) -> None:
     # Load pre-aggregated user stats — computed in the previous DAG step
     user_features = load_user_stats()
 
+    if len(user_features) == 0:
+        logger.warning(
+            'No users in user_stats — skipping K-Means and writing empty cluster output.'
+        )
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            columns=['user_id', 'cluster_id', 'cluster_label'],
+        ).to_parquet(CLUSTER_STAGING, index=False)
+        context['ti'].xcom_push(key='n_clusters', value=0)
+        context['ti'].xcom_push(key='n_users_clustered', value=0)
+        return
+
     from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
     from foodcom_pipeline.batch.clean import load_cleaned_recipes
     from foodcom_pipeline.batch.features import load_ingredient_features

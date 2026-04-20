@@ -140,10 +140,14 @@ def clean_interactions(df: pd.DataFrame) -> pd.DataFrame:
     df = _drop_bot_interactions(df)
 
     removed = original_count - len(df)
+    pct = (
+        f'{(removed / original_count * 100):.1f}%'
+        if original_count > 0
+        else 'n/a'
+    )
     logger.info(
         f'Interactions cleaning complete: '
-        f'{len(df):,} rows retained, {removed:,} removed '
-        f'({removed / original_count * 100:.1f}%)'
+        f'{len(df):,} rows retained, {removed:,} removed ({pct})'
     )
     return df.reset_index(drop=True)
 
