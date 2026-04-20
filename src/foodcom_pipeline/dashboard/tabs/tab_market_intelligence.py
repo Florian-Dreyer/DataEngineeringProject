@@ -10,9 +10,17 @@ import streamlit as st
 
 
 def _resolve_staging_dir() -> Path:
-    if env_val := os.getenv("FOODCOM_STAGING_DIR"):
-        return Path(env_val)
     project_root = Path(__file__).resolve().parents[4]
+    if env_val := os.getenv("FOODCOM_STAGING_DIR"):
+        env_path = Path(env_val).expanduser()
+        candidates = [env_path]
+        if not env_path.is_absolute():
+            # Support launching Streamlit from directories other than repo root.
+            candidates.append((project_root / env_path).resolve())
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
     candidate = project_root / "staging"
     if candidate.exists():
         return candidate
