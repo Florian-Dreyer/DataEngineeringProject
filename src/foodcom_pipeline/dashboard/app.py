@@ -5,6 +5,15 @@ Run locally (from project root):
   FOODCOM_STAGING_DIR=./staging streamlit run src/foodcom_pipeline/dashboard/app.py
 """
 
+import sys
+from pathlib import Path
+
+# Streamlit runs this file as a script, so `src/` is not on sys.path unless the
+# project is installed (e.g. `pip install -e .`). Add it so `foodcom_pipeline` imports work.
+_SRC_ROOT = Path(__file__).resolve().parents[2]
+if _SRC_ROOT.name == 'src' and str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
 import streamlit as st
 
 from foodcom_pipeline.dashboard.theme import inject_theme
