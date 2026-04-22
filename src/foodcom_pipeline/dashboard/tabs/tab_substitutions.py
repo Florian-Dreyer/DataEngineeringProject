@@ -371,71 +371,93 @@ def render() -> None:
         f"weighted review depth={base_weight:.2f}."
     )
 
-    rendered_candidates: set[str] = set()
-    for _, row in recs.iterrows():
-        candidate = row["candidate_ingredient"]
-        if candidate in rendered_candidates:
-            continue
-        rendered_candidates.add(candidate)
+    available_candidates = sorted(recs["candidate_ingredient"].dropna().astype(str).unique().tolist())
+    st.markdown("### Ingredients in this recipe")
+    st.caption("Click an ingredient to view available substitutes.")
 
-        candidate_rows = recs[recs["candidate_ingredient"] == candidate]
-        st.markdown(f"### Replace `{candidate}`")
-        for _, cand_row in candidate_rows.iterrows():
-            sub = cand_row["substitute_ingredient"]
-            with st.container(border=True):
-                head_left, head_right = st.columns([4, 1])
-                with head_left:
-                    st.markdown(
-                        f"**Suggested substitute:** `{sub}`  \n"
-                        f"Recommendation score: `{cand_row['recommendation_score']:.3f}`"
-                    )
-                with head_right:
-                    is_active = active_swaps.get(candidate) == sub
-                    if st.button(
-                        "Applied ✅" if is_active else "Apply swap",
-                        key=f"swap_{selected_recipe_id}_{candidate}_{sub}",
-                        type="primary" if is_active else "secondary",
+    selected_candidate_key = f"_subs_selected_candidate_{int(selected_recipe_id)}"
+    if selected_candidate_key not in st.session_state:
+        st.session_state[selected_candidate_key] = available_candidates[0] if available_candidates else None
+    if st.session_state[selected_candidate_key] not in available_candidates and available_candidates:
+        st.session_state[selected_candidate_key] = available_candidates[0]
+
+    ingredient_cols = st.columns(min(4, max(1, len(available_candidates))))
+    for idx, candidate in enumerate(available_candidates):
+        is_active_candidate = st.session_state[selected_candidate_key] == candidate
+        with ingredient_cols[idx % len(ingredient_cols)]:
+            if st.button(
+                f"{'✅ ' if is_active_candidate else ''}{candidate}",
+                key=f"pick_ing_{selected_recipe_id}_{candidate}",
+                type="primary" if is_active_candidate else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state[selected_candidate_key] = candidate
+                st.rerun()
+
+    selected_candidate = st.session_state[selected_candidate_key]
+    candidate_rows = (
+        recs[recs["candidate_ingredient"] == selected_candidate]
+        .sort_values("recommendation_score", ascending=False)
+        .reset_index(drop=True)
+    )
+    st.divider()
+    st.markdown(f"### Substitutes for `{selected_candidate}`")
+
+    for _, cand_row in candidate_rows.iterrows():
+        sub = cand_row["substitute_ingredient"]
+        with st.container(border=True):
+            head_left, head_right = st.columns([4, 1])
+            with head_left:
+                st.markdown(
+                    f"**Suggested substitute:** `{sub}`  \n"
+                    f"Recommendation score: `{cand_row['recommendation_score']:.3f}`"
+                )
+            with head_right:
+                is_active = active_swaps.get(selected_candidate) == sub
+                if st.button(
+                    "Applied ✅" if is_active else "Apply swap",
+                    key=f"swap_{selected_recipe_id}_{selected_candidate}_{sub}",
+                    type="primary" if is_active else "secondary",
+                    use_container_width=True,
+                ):
+                    if is_active:
+                        active_swaps.pop(selected_candidate, None)
+                    else:
+                        active_swaps[selected_candidate] = sub
+                    st.session_state[swap_key] = active_swaps
+                    st.rerun()
+
+            stat_a, stat_b, stat_c = st.columns(3)
+            stat_a.metric("Rating delta", _format_delta(cand_row.get("rating_delta"), True))
+            stat_b.metric("Sentiment delta", _format_delta(cand_row.get("sentiment_delta"), True))
+            stat_c.metric("Health delta", _format_delta(cand_row.get("health_delta"), True))
+
+            n1, n2, n3, n4 = st.columns(4)
+            n1.metric("Protein", _format_delta(cand_row.get("protein_delta"), True))
+            n2.metric("Sat fat", _format_delta(cand_row.get("saturated_fat_delta"), False))
+            n3.metric("Sugar", _format_delta(cand_row.get("sugar_delta"), False))
+            n4.metric("Sodium", _format_delta(cand_row.get("sodium_delta"), False))
+
+            st.markdown('<div class="subs-section-title">Sponsored picks</div>', unsafe_allow_html=True)
+            promo_cols = st.columns(2)
+            with promo_cols[0]:
+                with st.container(border=True):
+                    st.markdown(f"#### 🛒 Buy `{sub}`")
+                    st.caption("Fast checkout for this recommended substitute.")
+                    st.link_button(
+                        "Shop substitute",
+                        _buy_link_for_ingredient(sub),
                         use_container_width=True,
-                    ):
-                        if is_active:
-                            active_swaps.pop(candidate, None)
-                        else:
-                            active_swaps[candidate] = sub
-                        st.session_state[swap_key] = active_swaps
-                        st.rerun()
-
-                stat_a, stat_b, stat_c = st.columns(3)
-                stat_a.metric("Rating delta", _format_delta(cand_row.get("rating_delta"), True))
-                stat_b.metric("Sentiment delta", _format_delta(cand_row.get("sentiment_delta"), True))
-                stat_c.metric("Health delta", _format_delta(cand_row.get("health_delta"), True))
-
-                n1, n2, n3, n4 = st.columns(4)
-                n1.metric("Protein", _format_delta(cand_row.get("protein_delta"), True))
-                n2.metric("Sat fat", _format_delta(cand_row.get("saturated_fat_delta"), False))
-                n3.metric("Sugar", _format_delta(cand_row.get("sugar_delta"), False))
-                n4.metric("Sodium", _format_delta(cand_row.get("sodium_delta"), False))
-
-                st.markdown('<div class="subs-section-title">Sponsored picks</div>', unsafe_allow_html=True)
-                promo_cols = st.columns(2)
-                with promo_cols[0]:
-                    with st.container(border=True):
-                        st.markdown(f"#### 🛒 Buy `{sub}`")
-                        st.caption("Fast checkout for this recommended substitute.")
-                        st.link_button(
-                            "Shop substitute",
-                            _buy_link_for_ingredient(sub),
-                            use_container_width=True,
-                            help="Opens an external page to buy this substitute ingredient.",
-                        )
-                with promo_cols[1]:
-                    with st.container(border=True):
-                        st.markdown(f"#### 🔍 Explore `{candidate}`")
-                        st.caption("Compare brands and alternatives for the original ingredient.")
-                        st.link_button(
-                            "View alternatives",
-                            _buy_link_for_ingredient(candidate),
-                            use_container_width=True,
-                            help="Opens an external page to buy the original ingredient.",
-                        )
-            st.markdown("")
-        st.divider()
+                        help="Opens an external page to buy this substitute ingredient.",
+                    )
+            with promo_cols[1]:
+                with st.container(border=True):
+                    st.markdown(f"#### 🔍 Explore `{selected_candidate}`")
+                    st.caption("Compare brands and alternatives for the original ingredient.")
+                    st.link_button(
+                        "View alternatives",
+                        _buy_link_for_ingredient(selected_candidate),
+                        use_container_width=True,
+                        help="Opens an external page to buy the original ingredient.",
+                    )
+        st.markdown("")
