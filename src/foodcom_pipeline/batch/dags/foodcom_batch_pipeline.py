@@ -27,7 +27,8 @@ from foodcom_pipeline.batch.sentiment import run_sentiment
 from foodcom_pipeline.batch.aggregate_user_stats import run_aggregate_user_stats
 from foodcom_pipeline.batch.cluster import run_clustering
 from foodcom_pipeline.batch.load import run_load, load_trends
-from foodcom_pipeline.batch.tag_recipes import run_tag_recipes
+from foodcom_pipeline.batch.tag_recipes import run_tag_recipes, tag_signals
+from foodcom_pipeline.batch.dags.tasks.compute_gap import compute_gap_analysis
 
 # ─────────────────────────────────────────────────────────────────────────
 # DAG Definition
@@ -145,6 +146,18 @@ task_tag_recipes = PythonOperator(
     dag=dag,
 )
 
+task_tag_signals = PythonOperator(
+    task_id='tag_signals',
+    python_callable=tag_signals,
+    dag=dag,
+)
+
+task_compute_gap = PythonOperator(
+    task_id='compute_gap_analysis',
+    python_callable=compute_gap_analysis,
+    dag=dag,
+)
+
 # ─────────────────────────────────────────────────────────────────────────
 # Task Dependencies
 # ─────────────────────────────────────────────────────────────────────────
@@ -163,6 +176,9 @@ task_ensure_source_data >> [
 # load_trends runs after both extracts so all 5 tables are populated together
 [task_extract_google_trends, task_extract_ai_mode] >> task_load_trends
 
+# tag_signals runs after load_trends so both staging files are guaranteed to exist
+task_load_trends >> task_tag_signals
+
 # Clean phase: depends only on the core extracts; unblocked by trends/AI mode
 [
     task_extract_recipes,
@@ -172,6 +188,9 @@ task_ensure_source_data >> [
 
 # Tagging runs in parallel with sentiment after clean
 task_clean >> [task_sentiment, task_tag_recipes]
+
+# Gap analysis needs both recipe tags and AI Mode demand signal
+task_tag_recipes >> task_compute_gap
 
 # Aggregation reads sentiment output, so it must run after sentiment
 task_sentiment >> task_aggregate_user_stats

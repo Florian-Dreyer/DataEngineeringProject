@@ -4,19 +4,30 @@ ai_mode.py
 Extracts AI Mode text blocks from Google Search via SerpAPI and derives
 food/cuisine term-frequency scores from the returned content.
 
-Three public functions used by the batch pipeline:
+Two public functions used by the batch pipeline:
   fetch_ai_mode_blocks  — calls SerpAPI, returns raw text-block rows
   score_terms           — counts token frequency, applies z-score normalisation
-  merge_with_trends     — left-joins term scores against google_trends_normalised
 """
 
 import logging
 import re
 from collections import Counter
 from datetime import date
-from pathlib import Path
-
 import pandas as pd
+
+# Patterns that indicate an AI assistant UI string, not food content
+_JUNK_PATTERNS = re.compile(
+    r'would you like'
+    r'|something went wrong'
+    r'|ai response wasn\'t generated'
+    r'|let me know if'
+    r'|i hope (that |this )?helps'
+    r'|here are some'
+    r'|feel free to ask'
+    r'|shopping list',
+    flags=re.IGNORECASE,
+)
+_MIN_BODY_LENGTH = 10
 
 logger = logging.getLogger(__name__)
 
@@ -122,13 +133,18 @@ def fetch_ai_mode_blocks(seeds, api_key) -> pd.DataFrame:
                     or ""
                 )
 
+                body_clean = str(body).strip()
+                if len(body_clean) < _MIN_BODY_LENGTH or _JUNK_PATTERNS.search(body_clean):
+                    logger.debug("Dropping junk block for %r: %r", seed, body_clean[:80])
+                    continue
+
                 rows.append(
                     {
                         "seed_query": seed,
                         "prompted_query": prompted_query,
                         "block_index": idx,
                         "title": title,
-                        "body": str(body).strip(),
+                        "body": body_clean,
                         "fetched_date": fetched_date,
                     }
                 )
@@ -274,60 +290,3 @@ def score_terms(raw_df: pd.DataFrame) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
-
-# ---------------------------------------------------------------------------
-# Public: merge with Google Trends
-# ---------------------------------------------------------------------------
-
-
-def merge_with_trends(
-    term_scores_df: pd.DataFrame,
-    trends_normalised_path: Path | str,
-) -> pd.DataFrame:
-    """
-    Left-joins ai_mode_term_scores with google_trends_normalised on
-    term ↔ related_query (aggregating trends scores to one row per term).
-
-    combined_score = mean of whichever of (ai_mode_score, trends_score) are
-    non-null; falls back to the single available score when only one exists.
-
-    Columns: term, ai_mode_score, trends_score, combined_score, fetched_date.
-    """
-    trends_path = Path(trends_normalised_path)
-
-    if trends_path.is_file():
-        trends_df = pd.read_parquet(trends_path)
-        # Aggregate to one normalised_score per related_query (mean across seeds/types)
-        trends_agg = (
-            trends_df.groupby("related_query")["normalised_score"]
-            .mean()
-            .reset_index()
-            .rename(
-                columns={
-                    "related_query": "term",
-                    "normalised_score": "trends_score",
-                }
-            )
-        )
-    else:
-        logger.warning(
-            "google_trends_normalised.parquet not found at %s; "
-            "market_signals will have no trends_score.",
-            trends_normalised_path,
-        )
-        trends_agg = pd.DataFrame(columns=["term", "trends_score"])
-
-    merged = (
-        term_scores_df[["term", "normalised_score", "fetched_date"]]
-        .rename(columns={"normalised_score": "ai_mode_score"})
-        .merge(trends_agg, on="term", how="left")
-    )
-
-    # combined_score: pandas mean(skipna=True) gives the single value when only one exists
-    merged["combined_score"] = (
-        merged[["ai_mode_score", "trends_score"]].mean(axis=1, skipna=True)
-    )
-
-    return merged[
-        ["term", "ai_mode_score", "trends_score", "combined_score", "fetched_date"]
-    ]

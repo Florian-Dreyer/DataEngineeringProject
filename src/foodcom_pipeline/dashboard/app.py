@@ -5,8 +5,14 @@ Run locally (from project root):
   FOODCOM_STAGING_DIR=./staging streamlit run src/foodcom_pipeline/dashboard/app.py
 """
 
+import os
 import sys
 from pathlib import Path
+
+from dotenv import load_dotenv
+load_dotenv()
+SERP_API_KEY  = os.getenv("SERP_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Streamlit runs this file as a script, so `src/` is not on sys.path unless the
 # project is installed (e.g. `pip install -e .`). Add it so `foodcom_pipeline` imports work.

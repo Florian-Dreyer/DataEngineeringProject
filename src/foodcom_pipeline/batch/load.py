@@ -44,7 +44,6 @@ from foodcom_pipeline.batch.extract import (
     TRENDS_NORMALISED_STAGING,
     AI_MODE_RAW_STAGING,
     AI_MODE_TERM_SCORES_STAGING,
-    MARKET_SIGNALS_STAGING,
     USDA_NUTRIENTS_STAGING,
 )
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
@@ -836,7 +835,6 @@ def load_trends(**context) -> None:
       google_trends_normalised  — z-score normalised related-query scores
       ai_mode_raw               — raw text blocks from Google AI Mode
       ai_mode_term_scores       — term frequency + normalised scores
-      market_signals            — merged AI Mode + Trends combined score
     """
     engine = create_engine(POSTGRES_CONN)
 
@@ -866,7 +864,6 @@ def load_trends(**context) -> None:
             CREATE TABLE IF NOT EXISTS ai_mode_raw (
                 seed_query   TEXT    NOT NULL,
                 block_index  INTEGER NOT NULL,
-                title        TEXT,
                 body         TEXT    NOT NULL,
                 fetched_date DATE    NOT NULL,
                 PRIMARY KEY (seed_query, block_index, fetched_date)
@@ -878,16 +875,6 @@ def load_trends(**context) -> None:
                 raw_frequency    INTEGER          NOT NULL,
                 normalised_score DOUBLE PRECISION NOT NULL,
                 fetched_date     DATE             NOT NULL,
-                PRIMARY KEY (term, fetched_date)
-            )
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS market_signals (
-                term           TEXT             NOT NULL,
-                ai_mode_score  DOUBLE PRECISION,
-                trends_score   DOUBLE PRECISION,
-                combined_score DOUBLE PRECISION,
-                fetched_date   DATE             NOT NULL,
                 PRIMARY KEY (term, fetched_date)
             )
         """))
@@ -906,21 +893,15 @@ def load_trends(**context) -> None:
     )
     _load_staging_table(
         engine, AI_MODE_RAW_STAGING, 'ai_mode_raw',
-        cols='seed_query, block_index, title, body, fetched_date',
+        cols='seed_query, block_index, body, fetched_date',
         conflict='(seed_query, block_index, fetched_date)',
-        update='title = EXCLUDED.title, body = EXCLUDED.body',
+        update='body = EXCLUDED.body',
     )
     _load_staging_table(
         engine, AI_MODE_TERM_SCORES_STAGING, 'ai_mode_term_scores',
         cols='term, raw_frequency, normalised_score, fetched_date',
         conflict='(term, fetched_date)',
         update='raw_frequency = EXCLUDED.raw_frequency, normalised_score = EXCLUDED.normalised_score',
-    )
-    _load_staging_table(
-        engine, MARKET_SIGNALS_STAGING, 'market_signals',
-        cols='term, ai_mode_score, trends_score, combined_score, fetched_date',
-        conflict='(term, fetched_date)',
-        update='ai_mode_score = EXCLUDED.ai_mode_score, trends_score = EXCLUDED.trends_score, combined_score = EXCLUDED.combined_score',
     )
 
 

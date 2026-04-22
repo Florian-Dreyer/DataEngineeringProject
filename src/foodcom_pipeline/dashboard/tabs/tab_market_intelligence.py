@@ -1,4 +1,4 @@
-"""Audience & Market Intelligence tab — CPG segment advertising tool."""
+"""Audience & Market Intelligence tab — CPG segment advertising + search demand intelligence."""
 
 import json
 import os
@@ -9,13 +9,16 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Staging directory resolution
+# ─────────────────────────────────────────────────────────────────────────
+
 def _resolve_staging_dir() -> Path:
     project_root = Path(__file__).resolve().parents[4]
     if env_val := os.getenv("FOODCOM_STAGING_DIR"):
         env_path = Path(env_val).expanduser()
         candidates = [env_path]
         if not env_path.is_absolute():
-            # Support launching Streamlit from directories other than repo root.
             candidates.append((project_root / env_path).resolve())
         for candidate in candidates:
             if candidate.exists():
@@ -28,33 +31,43 @@ def _resolve_staging_dir() -> Path:
 
 
 STAGING_DIR = _resolve_staging_dir()
-CLUSTER_PROFILE_PATH = STAGING_DIR / "cluster_profiles.json"
+
+CLUSTER_PROFILE_PATH         = STAGING_DIR / "cluster_profiles.json"
+AI_MODE_TERM_SCORES_PATH     = STAGING_DIR / "ai_mode_term_scores.parquet"
+GAP_ANALYSIS_PATH            = STAGING_DIR / "gap_analysis.parquet"
+TRENDS_NORMALISED_PATH       = STAGING_DIR / "google_trends_normalised.parquet"
+
+# ─────────────────────────────────────────────────────────────────────────
+# CPG segment config (unchanged)
+# ─────────────────────────────────────────────────────────────────────────
 
 RADAR_FEATURES = ["avg_rating_dairy", "avg_rating_protein", "avg_rating_vegetable",
                   "avg_rating_baking", "avg_rating_international"]
 RADAR_LABELS   = ["Dairy", "Protein", "Vegetable", "Baking", "International"]
 
-# Emerald palette for segment colours
 SEGMENT_COLORS = ["#10b981", "#059669", "#34d399", "#6ee7b7", "#a7f3d0"]
 
 CPG_ADJACENCY: dict[str, dict] = {
-    "Indulgent Baker":       {"top_categories": ["baking", "dairy"],
-                              "brands": ["King Arthur Baking", "Ghirardelli", "Domino Sugar", "Land O'Lakes"],
-                              "cpm_range": "$4 – $8"},
-    "International Explorer":{"top_categories": ["international", "protein"],
-                              "brands": ["Kikkoman", "Blue Dragon", "Goya Foods", "McCormick"],
-                              "cpm_range": "$5 – $9"},
-    "Protein-Forward Cook":  {"top_categories": ["protein", "dairy"],
-                              "brands": ["Tyson Foods", "Beyond Meat", "Kirkland Signature", "Applegate"],
-                              "cpm_range": "$6 – $10"},
-    "Health-Conscious Cook": {"top_categories": ["vegetable", "international"],
-                              "brands": ["Amy's Kitchen", "Whole Foods 365", "Green Giant", "Earthbound Farm"],
-                              "cpm_range": "$7 – $12"},
-    "General Cook":          {"top_categories": ["dairy", "vegetable"],
-                              "brands": ["Heinz", "Kraft", "Campbell's", "Birds Eye"],
-                              "cpm_range": "$3 – $6"},
+    "Indulgent Baker":        {"top_categories": ["baking", "dairy"],
+                               "brands": ["King Arthur Baking", "Ghirardelli", "Domino Sugar", "Land O'Lakes"],
+                               "cpm_range": "$4 – $8"},
+    "International Explorer": {"top_categories": ["international", "protein"],
+                               "brands": ["Kikkoman", "Blue Dragon", "Goya Foods", "McCormick"],
+                               "cpm_range": "$5 – $9"},
+    "Protein-Forward Cook":   {"top_categories": ["protein", "dairy"],
+                               "brands": ["Tyson Foods", "Beyond Meat", "Kirkland Signature", "Applegate"],
+                               "cpm_range": "$6 – $10"},
+    "Health-Conscious Cook":  {"top_categories": ["vegetable", "international"],
+                               "brands": ["Amy's Kitchen", "Whole Foods 365", "Green Giant", "Earthbound Farm"],
+                               "cpm_range": "$7 – $12"},
+    "General Cook":           {"top_categories": ["dairy", "vegetable"],
+                               "brands": ["Heinz", "Kraft", "Campbell's", "Birds Eye"],
+                               "cpm_range": "$3 – $6"},
 }
 
+# ─────────────────────────────────────────────────────────────────────────
+# Data loaders
+# ─────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
 def _load_cluster_profiles() -> dict | None:
@@ -66,6 +79,20 @@ def _load_cluster_profiles() -> dict | None:
     except (json.JSONDecodeError, OSError):
         return None
 
+
+@st.cache_data(ttl=300)
+def _load_parquet(path: Path) -> pd.DataFrame | None:
+    if not path.is_file():
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CPG helpers (unchanged)
+# ─────────────────────────────────────────────────────────────────────────
 
 def _radar_chart(profiles: dict, selected_labels: list[str]) -> go.Figure:
     fig = go.Figure()
@@ -156,8 +183,103 @@ def _generate_pdf(profiles: dict, selected_labels: list[str]) -> bytes:
     return bytes(pdf.output())
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Search demand helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+_TIER_COLORS = {"High": "#ef4444", "Medium": "#f97316", "Low": "#9ca3af"}
+
+
+def _gap_bar_chart(gap_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    for tier in ("High", "Medium", "Low"):
+        subset = gap_df[gap_df["opportunity_tier"] == tier]
+        if subset.empty:
+            continue
+        fig.add_trace(go.Bar(
+            x=subset["term"],
+            y=subset["gap_score"],
+            name=tier,
+            marker_color=_TIER_COLORS[tier],
+        ))
+    fig.update_layout(
+        barmode="overlay",
+        xaxis_title="Term",
+        yaxis_title="Gap Score",
+        xaxis_tickangle=-40,
+        height=420,
+        legend_title="Opportunity Tier",
+        margin=dict(l=40, r=20, t=30, b=120),
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Main render
+# ─────────────────────────────────────────────────────────────────────────
+
 def render() -> None:
-    st.header("📊 Audience & Market Intelligence")
+    st.header("📊 Market Intelligence")
+
+    # ── Section A: AI-Powered Search Inspiration ──────────────────────────
+    st.subheader("What consumers are searching for right now")
+    st.markdown("*Sourced from Google AI Mode — the AI answers users see before any search results*")
+
+    ai_df = _load_parquet(AI_MODE_TERM_SCORES_PATH)
+    if ai_df is None:
+        st.warning("Data not yet available — run the pipeline first.")
+    else:
+        top15 = (
+            ai_df.sort_values("normalised_score", ascending=False)
+            .head(15)
+            [["term", "normalised_score", "fetched_date"]]
+            .rename(columns={"normalised_score": "AI Prominence Score"})
+            .reset_index(drop=True)
+        )
+        st.dataframe(top15, use_container_width=True, hide_index=True)
+        st.caption(
+            "These are the food topics appearing in AI-generated search summaries — "
+            "the first thing a user reads when they Google a meal idea."
+        )
+
+    st.divider()
+
+    # ── Section B: Demand vs Supply Gap ───────────────────────────────────
+    st.subheader("Where consumer demand outpaces available recipes")
+
+    gap_df = _load_parquet(GAP_ANALYSIS_PATH)
+    if gap_df is None:
+        st.warning("Data not yet available — run the pipeline first.")
+    else:
+        gap_sorted = gap_df.sort_values("gap_score", ascending=False).reset_index(drop=True)
+        st.plotly_chart(_gap_bar_chart(gap_sorted), use_container_width=True)
+        st.info(
+            "These are the cuisines and ingredients where consumer demand is outpacing available "
+            "content — these are the emerging markets you should be moving into."
+        )
+        st.dataframe(gap_sorted, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Section C: Google Trends Signal ───────────────────────────────────
+    st.subheader("Trending recipe searches on Google")
+
+    trends_df = _load_parquet(TRENDS_NORMALISED_PATH)
+    if trends_df is None:
+        st.warning("Data not yet available — run the pipeline first.")
+    else:
+        top20 = (
+            trends_df.sort_values("normalised_score", ascending=False)
+            .head(20)
+            [["related_query", "query_type", "normalised_score", "fetched_date"]]
+            .reset_index(drop=True)
+        )
+        st.dataframe(top20, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── CPG Audience Segments ─────────────────────────────────────────────
+    st.subheader("Audience & CPG Segments")
 
     profiles_data = _load_cluster_profiles()
     if profiles_data is None:
@@ -167,13 +289,11 @@ def render() -> None:
     profiles = profiles_data.get("clusters", {})
     all_labels = [p["cluster_label"] for p in profiles.values()]
 
-    st.subheader("Segment Filter")
     selected_labels = st.multiselect("Select segments to display", options=all_labels, default=all_labels)
     if not selected_labels:
         st.warning("Select at least one segment.")
         return
 
-    # KPI row — metric cards styled by theme.py
     total_users = profiles_data.get("total_users", 0)
     n_clusters  = profiles_data.get("n_clusters", len(profiles))
     c1, c2 = st.columns(2)

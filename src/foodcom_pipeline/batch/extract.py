@@ -59,9 +59,8 @@ TRENDS_RAW_STAGING = STAGING_DIR / 'google_trends_raw.parquet'
 TRENDS_NORMALISED_STAGING = STAGING_DIR / 'google_trends_normalised.parquet'
 AI_MODE_RAW_STAGING = STAGING_DIR / 'ai_mode_raw.parquet'
 AI_MODE_TERM_SCORES_STAGING = STAGING_DIR / 'ai_mode_term_scores.parquet'
-MARKET_SIGNALS_STAGING = STAGING_DIR / 'market_signals.parquet'
 
-_TRENDS_SEEDS: list[str] = ['recipe', 'recipes']
+from foodcom_pipeline.extraction.trends import SEEDS as _TRENDS_SEEDS
 
 _AI_MODE_SEEDS: list[str] = [
     'dinner ideas',
@@ -846,13 +845,11 @@ def extract_usda_nutrients(**context) -> None:
 def extract_ai_mode(**context) -> None:
     """
     Calls the SerpAPI Google AI Mode engine for each seed in _AI_MODE_SEEDS,
-    scores food/cuisine term frequency from the returned text blocks, and
-    merges with Google Trends normalised scores to produce market_signals.
+    scores food/cuisine term frequency from the returned text blocks.
 
-    Writes three staging files:
+    Writes two staging files:
       ai_mode_raw.parquet          — one row per text block
       ai_mode_term_scores.parquet  — term frequencies + normalised scores
-      market_signals.parquet       — merged AI Mode + Trends scores per term
 
     SERPAPI_KEY must be set as an environment variable.
     """
@@ -860,7 +857,6 @@ def extract_ai_mode(**context) -> None:
     from foodcom_pipeline.extraction.ai_mode import (
         fetch_ai_mode_blocks,
         score_terms,
-        merge_with_trends,
     )
 
     if not is_ai_mode_stale():
@@ -886,12 +882,6 @@ def extract_ai_mode(**context) -> None:
     logger.info(
         'AI Mode term scores staged: %d terms → %s',
         len(term_scores), AI_MODE_TERM_SCORES_STAGING,
-    )
-
-    market_signals = merge_with_trends(term_scores, TRENDS_NORMALISED_STAGING)
-    atomic_parquet(market_signals, MARKET_SIGNALS_STAGING)
-    logger.info(
-        'Market signals staged: %d terms → %s', len(market_signals), MARKET_SIGNALS_STAGING
     )
 
     save_ai_mode_metadata(date.today())
@@ -920,6 +910,12 @@ def extract_google_trends(**context) -> None:
         logger.warning('No trend rows returned; skipping parquet write.')
         return
 
+    raw_df = _clean_trend_queries(raw_df)
+
+    if raw_df.empty:
+        logger.warning('No food-relevant trend rows after filtering; skipping parquet write.')
+        return
+
     normalised_df = batch_normalise(raw_df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
@@ -934,6 +930,42 @@ def extract_google_trends(**context) -> None:
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _clean_trend_queries(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip seed-word noise from related_query and drop non-food rows.
+
+    Seeds are 'recipe'/'recipes', so every related query is polluted with
+    those words (e.g. 'chicken recipe', 'easy recipe').  After stripping them,
+    non-food residue like 'easy', 'box', or 'allrecipes' is removed by
+    requiring a match against at least one keyword in TAG_PATTERNS.
+    """
+    import re as _re
+    # Deferred to avoid circular import (tag_recipes → extract)
+    from foodcom_pipeline.batch.tag_recipes import TAG_PATTERNS
+
+    _noise = _re.compile(r'\brecipes?\b', flags=_re.IGNORECASE)
+
+    df = df.copy()
+    df['related_query'] = (
+        df['related_query']
+        .str.replace(_noise, '', regex=True)
+        .str.strip()
+    )
+    df = df[df['related_query'] != '']
+
+    def _is_food(query: str) -> bool:
+        q = query.lower()
+        return any(
+            any(p.search(q) for p in patterns)
+            for patterns in TAG_PATTERNS.values()
+        )
+
+    mask = df['related_query'].apply(_is_food)
+    dropped = (~mask).sum()
+    if dropped:
+        logger.info('Trend query filter: dropped %d non-food rows.', dropped)
+    return df[mask].reset_index(drop=True)
 
 
 def _log_extraction_stats(name: str, df: pd.DataFrame) -> None:

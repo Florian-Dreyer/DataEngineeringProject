@@ -24,13 +24,20 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────
 
-from foodcom_pipeline.batch.extract import STAGING_DIR, POSTGRES_CONN, atomic_parquet
+from foodcom_pipeline.batch.extract import (
+    STAGING_DIR,
+    POSTGRES_CONN,
+    atomic_parquet,
+    AI_MODE_TERM_SCORES_STAGING,
+    TRENDS_NORMALISED_STAGING,
+)
 
 CLEANED_STAGING = STAGING_DIR / "recipes_clean.parquet"
 TAGS_STAGING = STAGING_DIR / "recipe_tags.parquet"
+SIGNAL_TAGS_STAGING = STAGING_DIR / "signal_tags.parquet"
 
 MAX_LLM_RECIPES = 20
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-3-flash"
 
 # ---------------------------------------------------------------------
 # Expanded tag dictionary
@@ -165,7 +172,6 @@ TAG_DICT = {
     ],
 }
 
-# Normalize expressive search / AI-mode modifiers down to more canonical text
 PHRASE_NORMALIZATION_RULES = [
     (r"\bmarry me\b", ""),
     (r"\bviral\b", ""),
@@ -180,7 +186,6 @@ PHRASE_NORMALIZATION_RULES = [
     (r"\brecipes\b", ""),
 ]
 
-# Precompile patterns once
 TAG_PATTERNS = {
     tag: [re.compile(r"\b" + re.escape(keyword.lower()) + r"\b") for keyword in keywords]
     for tag, keywords in TAG_DICT.items()
@@ -200,6 +205,24 @@ def _normalize_text(text: str) -> str:
     return text
 
 
+def _normalize_term(text: str) -> str:
+    text = _normalize_text(text)
+    text = re.sub(r"\b(and|with|style)\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -/")
+    return text
+
+
+def _canonicalize_recipe_term(name: str) -> str:
+    """
+    Normalize the recipe name into a comparable canonical dish phrase.
+    Intended to align more closely with ai_mode dish terms.
+    """
+    text = _normalize_term(name)
+    text = re.sub(r"\b(dinner|lunch|breakfast|meal|ideas|idea)\b", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -/")
+    return text
+
+
 def _get_recipe_text(name: str, ingredients: str) -> str:
     return f"{name} {ingredients}".strip()
 
@@ -208,90 +231,76 @@ def _get_recipe_text(name: str, ingredients: str) -> str:
 # Stage 1: Regex tagging
 # ─────────────────────────────────────────────────────────────────────────
 
-def tag_recipe_regex(name: str, ingredients: str) -> set[str]:
+def tag_recipe_regex(name: str, ingredients: str) -> set[tuple[str, str]]:
     """
     Apply regex matching to normalized recipe name + ingredients.
-    Returns a set of matched tags.
-
-    This version is more robust for:
-    - Food.com recipe titles
-    - Google AI dish phrases
-    - Google Trends recipe-like queries
+    Returns a set of (tag, matched_term) pairs.
     """
     raw_text = _get_recipe_text(name, ingredients)
     normalized_text = _normalize_text(raw_text)
 
-    matched_tags: set[str] = set()
+    matched_pairs: set[tuple[str, str]] = set()
 
     for tag, patterns in TAG_PATTERNS.items():
         for pattern in patterns:
-            if pattern.search(normalized_text):
-                matched_tags.add(tag)
+            match = pattern.search(normalized_text)
+            if match:
+                matched_term = _normalize_term(match.group())
+                matched_pairs.add((tag, matched_term))
                 break
 
-    return matched_tags
+    return matched_pairs
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Stage 2: LLM fallback tagging (Gemini)
+# Stage 2: LLM tagging
 # ─────────────────────────────────────────────────────────────────────────
 
-def _get_gemini_api_key() -> str | None:
-    return os.environ.get("GEMINI_API_KEY")
+_VALID_TAGS: frozenset[str] = frozenset(TAG_DICT.keys())
+
+_LLM_PROMPT_TEMPLATE = """You are a food recipe classifier. Given a recipe name and its ingredients, return only the tags that apply from the list below. Output a comma-separated list of tag names only — no explanations, no extra text.
+
+Valid tags:
+{tags}
+
+Recipe name: {name}
+Ingredients: {ingredients}
+
+Tags:"""
 
 
 def tag_recipe_llm(name: str, ingredients: str, api_key: str) -> set[str]:
     """
-    Use Gemini API to tag a recipe/query via LLM.
-    Returns only tags present in TAG_DICT.
+    Use Gemini to assign tags from TAG_DICT to a recipe that regex under-tagged.
+    Returns a set of valid tag strings (subset of TAG_DICT keys).
     """
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+
+    prompt = _LLM_PROMPT_TEMPLATE.format(
+        tags=", ".join(sorted(_VALID_TAGS)),
+        name=name,
+        ingredients=ingredients[:500],
+    )
+
     try:
-        import google.generativeai as genai
-
-        genai.configure(api_key=api_key)
-
-        tag_list = ", ".join(sorted(TAG_DICT.keys()))
-
-        prompt = (
-            f"Given this recipe or dish query, assign up to 5 tags from this list only: {tag_list}. "
-            f"Recipe name: {name}. "
-            f"Ingredients: {ingredients}. "
-            "Choose tags that best capture protein/base, dish format, cuisine, and intent where relevant. "
-            "Return only a JSON array of strings. No explanation."
-        )
-
-        model = genai.GenerativeModel(
-            GEMINI_MODEL,
-            system_instruction=(
-                "You are a culinary taxonomy assistant. "
-                f"Assign up to 5 tags from this exact allowed list only: {tag_list}. "
-                "Return ONLY a JSON array."
-            ),
-        )
         response = model.generate_content(prompt)
-
-        response_text = response.text.strip()
-        cleaned_text = re.sub(r"^```json\s*|\s*```$", "", response_text, flags=re.MULTILINE)
-        tags = json.loads(cleaned_text)
-
-        if not isinstance(tags, list):
-            logger.warning("Gemini returned non-list for %s: %s", name, tags)
-            return set()
-
-        normalized_tags = set()
-        for tag in tags:
-            tag_lower = str(tag).strip().lower()
-            if tag_lower in TAG_DICT:
-                normalized_tags.add(tag_lower)
-
-        return normalized_tags
-
-    except json.JSONDecodeError as e:
-        logger.warning("Failed to parse Gemini JSON response for recipe '%s': %s", name, e)
+        raw = response.text.strip()
+    except Exception as exc:
+        logger.warning("Gemini call failed for %r: %s", name, exc)
         return set()
-    except Exception as e:
-        logger.error("Gemini API call failed for recipe '%s': %s", name, e)
-        return set()
+
+    tags: set[str] = set()
+    for part in raw.split(","):
+        token = part.strip().lower().replace(" ", "_")
+        if token in _VALID_TAGS:
+            tags.add(token)
+        elif token.replace("_", " ") in _VALID_TAGS:
+            tags.add(token.replace("_", " "))
+
+    return tags
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -327,6 +336,7 @@ def run_tag_recipes(**context) -> None:
     for _, row in cleaned_df.iterrows():
         recipe_id = row["id"]
         name = str(row.get("name", "")).strip()
+        canonical_term = _canonicalize_recipe_term(name)
 
         ingredients = ""
         for col in ["ingredients_canonical_normalized", "ingredients_normalized", "ingredients"]:
@@ -334,13 +344,15 @@ def run_tag_recipes(**context) -> None:
                 ingredients = str(row[col]).strip()
                 break
 
-        matched_tags = tag_recipe_regex(name, ingredients)
+        matched_pairs = tag_recipe_regex(name, ingredients)
 
-        for tag in matched_tags:
+        for tag, matched_term in matched_pairs:
             tags_list.append(
                 {
                     "recipe_id": recipe_id,
                     "tag": tag,
+                    "matched_term": matched_term,
+                    "canonical_term": canonical_term,
                     "source": "regex",
                 }
             )
@@ -359,7 +371,6 @@ def run_tag_recipes(**context) -> None:
         recipe_id = row["recipe_id"]
         tag_counts_by_recipe[recipe_id] = tag_counts_by_recipe.get(recipe_id, 0) + 1
 
-    # send recipes with 0 or 1 tags to LLM fallback
     weakly_tagged_ids = {
         recipe_id for recipe_id in cleaned_df["id"].tolist()
         if tag_counts_by_recipe.get(recipe_id, 0) <= 1
@@ -371,7 +382,7 @@ def run_tag_recipes(**context) -> None:
     llm_skipped_count = 0
 
     if len(untagged_recipes) > 0:
-        api_key = _get_gemini_api_key()
+        api_key = os.environ["GEMINI_API_KEY"]
 
         if not api_key:
             logger.warning("Gemini API key not found (GEMINI_API_KEY env var)")
@@ -387,14 +398,15 @@ def run_tag_recipes(**context) -> None:
                     llm_skipped_count,
                 )
 
-            existing_pairs = {
-                (row["recipe_id"], row["tag"])
+            existing_rows = {
+                (row["recipe_id"], row["tag"], row["matched_term"], row["canonical_term"])
                 for row in tags_list
             }
 
             for _, row in recipes_to_tag.iterrows():
                 recipe_id = row["id"]
                 name = str(row.get("name", "")).strip()
+                canonical_term = _canonicalize_recipe_term(name)
 
                 ingredients = ""
                 for col in ["ingredients_canonical_normalized", "ingredients_normalized", "ingredients"]:
@@ -403,29 +415,35 @@ def run_tag_recipes(**context) -> None:
                         break
 
                 llm_tags = tag_recipe_llm(name, ingredients, api_key)
+                fallback_term = canonical_term
 
                 for tag in llm_tags:
-                    if (recipe_id, tag) in existing_pairs:
+                    dedupe_key = (recipe_id, tag, fallback_term, canonical_term)
+                    if dedupe_key in existing_rows:
                         continue
 
                     tags_list.append(
                         {
                             "recipe_id": recipe_id,
                             "tag": tag,
+                            "matched_term": fallback_term,
+                            "canonical_term": canonical_term,
                             "source": "llm",
                         }
                     )
-                    existing_pairs.add((recipe_id, tag))
+                    existing_rows.add(dedupe_key)
                     llm_tag_count += 1
 
     logger.info("LLM tagging added %s tags", llm_tag_count)
 
     if not tags_list:
         logger.warning("No tags generated")
-        tags_df = pd.DataFrame(columns=["recipe_id", "tag", "source"])
+        tags_df = pd.DataFrame(
+            columns=["recipe_id", "tag", "matched_term", "canonical_term", "source"]
+        )
     else:
         tags_df = pd.DataFrame(tags_list).drop_duplicates(
-            subset=["recipe_id", "tag", "source"]
+            subset=["recipe_id", "tag", "matched_term", "canonical_term", "source"]
         )
 
     logger.info("Total tags generated: %s", len(tags_df))
@@ -453,22 +471,43 @@ def _write_tags_to_db(tags_df: pd.DataFrame) -> None:
                 text(
                     """
                     CREATE TABLE IF NOT EXISTS recipe_tags (
-                        recipe_id INTEGER NOT NULL,
-                        tag       TEXT    NOT NULL,
-                        source    TEXT    NOT NULL,
-                        PRIMARY KEY (recipe_id, tag, source)
+                        recipe_id      INTEGER NOT NULL,
+                        tag            TEXT    NOT NULL,
+                        matched_term   TEXT    NOT NULL,
+                        canonical_term TEXT    NOT NULL,
+                        source         TEXT    NOT NULL
                     )
                     """
                 )
             )
 
-        tags_df = tags_df.drop_duplicates(subset=["recipe_id", "tag", "source"])
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE recipe_tags
+                    ADD COLUMN IF NOT EXISTS matched_term TEXT
+                    """
+                )
+            )
+
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE recipe_tags
+                    ADD COLUMN IF NOT EXISTS canonical_term TEXT
+                    """
+                )
+            )
+
+        tags_df = tags_df.drop_duplicates(
+            subset=["recipe_id", "tag", "matched_term", "canonical_term", "source"]
+        )
         records = tags_df.to_dict(orient="records")
 
         upsert_sql = """
-            INSERT INTO recipe_tags (recipe_id, tag, source)
-            VALUES (:recipe_id, :tag, :source)
-            ON CONFLICT (recipe_id, tag, source) DO NOTHING
+            INSERT INTO recipe_tags (recipe_id, tag, matched_term, canonical_term, source)
+            VALUES (:recipe_id, :tag, :matched_term, :canonical_term, :source)
+            ON CONFLICT DO NOTHING
         """
 
         batch_size = 5000
@@ -481,3 +520,115 @@ def _write_tags_to_db(tags_df: pd.DataFrame) -> None:
 
     except Exception as e:
         logger.error("Failed to write tags to PostgreSQL: %s", e, exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Signal tagging: tag AI Mode terms + Google Trends related queries
+# ─────────────────────────────────────────────────────────────────────────
+
+def tag_signals(**context) -> None:
+    """
+    Apply regex tagging to AI Mode term scores and Google Trends related queries.
+    Writes results to signal_tags.parquet and PostgreSQL signal_tags table.
+    """
+    logger.info("Starting signal tagging task...")
+
+    terms: list[dict] = []
+
+    if AI_MODE_TERM_SCORES_STAGING.is_file():
+        ai_df = pd.read_parquet(AI_MODE_TERM_SCORES_STAGING)
+        for _, row in ai_df.iterrows():
+            terms.append({
+                "term": str(row["term"]).strip(),
+                "data_source": "ai_mode",
+            })
+        logger.info("Loaded %d AI Mode terms", len(ai_df))
+    else:
+        logger.warning("AI Mode term scores not found: %s", AI_MODE_TERM_SCORES_STAGING)
+
+    if TRENDS_NORMALISED_STAGING.is_file():
+        trends_df = pd.read_parquet(TRENDS_NORMALISED_STAGING)
+        for _, row in trends_df.iterrows():
+            terms.append({
+                "term": str(row["related_query"]).strip(),
+                "data_source": "trends",
+            })
+        logger.info("Loaded %d Trends related queries", len(trends_df))
+    else:
+        logger.warning("Trends normalised staging not found: %s", TRENDS_NORMALISED_STAGING)
+
+    if not terms:
+        logger.warning("No signal terms to tag — skipping")
+        return
+
+    rows: list[dict] = []
+    for item in terms:
+        term = item["term"]
+        canonical_term = _canonicalize_recipe_term(term)
+        matched_pairs = tag_recipe_regex(term, "")
+        for tag, matched_term in matched_pairs:
+            rows.append({
+                "term": term,
+                "canonical_term": canonical_term,
+                "data_source": item["data_source"],
+                "tag": tag,
+                "matched_term": matched_term,
+            })
+
+    if not rows:
+        logger.warning("No tags produced for any signal terms")
+        signal_df = pd.DataFrame(
+            columns=["term", "canonical_term", "data_source", "tag", "matched_term"]
+        )
+    else:
+        signal_df = pd.DataFrame(rows).drop_duplicates(
+            subset=["term", "data_source", "tag"]
+        )
+
+    logger.info("Signal tagging produced %d rows", len(signal_df))
+
+    SIGNAL_TAGS_STAGING.parent.mkdir(parents=True, exist_ok=True)
+    atomic_parquet(signal_df, SIGNAL_TAGS_STAGING)
+    logger.info("Signal tags staged to %s", SIGNAL_TAGS_STAGING)
+
+    if not signal_df.empty:
+        _write_signal_tags_to_db(signal_df)
+
+    context["ti"].xcom_push(key="signal_tag_count", value=len(signal_df))
+
+
+def _write_signal_tags_to_db(signal_df: pd.DataFrame) -> None:
+    """Write signal tags to PostgreSQL signal_tags table."""
+    try:
+        engine = create_engine(POSTGRES_CONN)
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS signal_tags (
+                    term           TEXT NOT NULL,
+                    canonical_term TEXT,
+                    data_source    TEXT NOT NULL,
+                    tag            TEXT NOT NULL,
+                    matched_term   TEXT NOT NULL
+                )
+            """))
+            conn.execute(text("""
+                ALTER TABLE signal_tags ADD COLUMN IF NOT EXISTS canonical_term TEXT
+            """))
+
+        records = signal_df.to_dict(orient="records")
+        upsert_sql = """
+            INSERT INTO signal_tags (term, canonical_term, data_source, tag, matched_term)
+            VALUES (:term, :canonical_term, :data_source, :tag, :matched_term)
+            ON CONFLICT DO NOTHING
+        """
+
+        batch_size = 5000
+        for i in range(0, len(records), batch_size):
+            with engine.begin() as conn:
+                conn.execute(text(upsert_sql), records[i : i + batch_size])
+
+        logger.info("Wrote %d signal tags to PostgreSQL", len(records))
+
+    except Exception as exc:
+        logger.error("Failed to write signal tags to PostgreSQL: %s", exc, exc_info=True)
