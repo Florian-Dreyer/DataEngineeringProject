@@ -46,11 +46,15 @@ _STOPWORDS: frozenset[str] = frozenset(
 def build_ai_query(seed: str) -> str:
     return (
         f"{seed}. "
-        "Generate a list of 20 high-volume search terms and trending dishes. "
-        "Each item must be distilled to its core dish name, meaning the primary keyword used to identify broad search intent. "
-        "Remove descriptive or branded adjectives such as 'viral', 'marry me', 'one-pot', 'sheet-pan', 'crispy', 'creamy', or similar stylistic modifiers unless they are essential to the dish identity. "
-        "Do not include explanations, categories, numbering, or extra commentary. "
-        "Only output dish names, separated by commas. "
+        "You are a structured data generator, not a conversational assistant. "
+        "Output a list of 20 dish names only. "
+        "Each item must be a core dish name representing a real recipe or search term. "
+        "Remove descriptive modifiers such as 'viral', 'one-pot', 'sheet-pan', 'easy', 'quick'. "
+        "Do not include explanations, descriptions, questions, suggestions, or conversational text. "
+        "Do not ask follow-up questions. "
+        "Do not include phrases like 'would you like', 'let me know', or similar. "
+        "Output format must be a single comma-separated list of dish names only. "
+        "No numbering, no bullet points, no extra sentences. "
         "Examples: Tortellini, Garlic Chicken, Korean Beef Bowl, Feta Pasta, Birria Tacos."
     )
 
