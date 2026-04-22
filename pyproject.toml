@@ -17,6 +17,7 @@ dependencies = [
     "numpy>=1.26",
     "pytrends>=4.9",
     "scikit-learn>=1.4",
+    "google-generativeai>=0.8.0"
     # ── Database ────────────────────────────────────────────────────
     "psycopg2-binary>=2.9",
     "sqlalchemy>=2.0",

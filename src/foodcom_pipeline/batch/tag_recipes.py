@@ -125,12 +125,17 @@ def tag_recipe_llm(name: str, ingredients: str, api_key: str) -> set[str]:
 
         prompt = f"""Given this recipe name and ingredients, return up to 3 food category tags from this list only: {tag_list}. Recipe name: {name}. Ingredients: {ingredients}. Return only a JSON array of strings, no explanation."""
 
-        model = genai.GenerativeModel(GEMINI_MODEL)
+        model = genai.GenerativeModel(
+            GEMINI_MODEL,
+            system_instruction=f"You are a culinary expert. Assign up to 3 tags from this list: {tag_list}. Return ONLY a JSON array."
+        )
         response = model.generate_content(prompt)
 
         # Parse JSON response
         response_text = response.text.strip()
-        tags = json.loads(response_text)
+        # Remove potential markdown formatting
+        cleaned_text = re.sub(r'^```json\s*|\s*```$', '', response_text, flags=re.MULTILINE)
+        tags = json.loads(cleaned_text)
 
         if not isinstance(tags, list):
             logger.warning(f"Gemini returned non-list for {name}: {tags}")
