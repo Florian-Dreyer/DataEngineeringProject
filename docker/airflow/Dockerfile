@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir \
     sqlalchemy \
     psycopg2-binary \
     transformers \
+    sentence-transformers \
     torch \
     vaderSentiment
 

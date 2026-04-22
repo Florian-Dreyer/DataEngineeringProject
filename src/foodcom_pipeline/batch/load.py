@@ -43,7 +43,6 @@ from foodcom_pipeline.batch.features import (
     load_recipe_sentiment_ratings,
     load_substitution_engine,
 )
-from foodcom_pipeline.batch.ingredient_clusters import load_ingredient_clusters
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 from sqlalchemy import create_engine, text
 
@@ -119,6 +118,77 @@ def _ensure_dim_canonical_ingredient_nutrients_columns(conn) -> None:
         )
 
 
+def _ensure_fact_substitution_recommendations_columns(conn) -> None:
+    """Aligns fact_substitution_recommendations with ingredient-pair schema."""
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS substitute_ingredient TEXT'
+        )
+    )
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS substitute_similarity DOUBLE PRECISION'
+        )
+    )
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS rating_delta DOUBLE PRECISION'
+        )
+    )
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS sentiment_delta DOUBLE PRECISION'
+        )
+    )
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS protein_delta DOUBLE PRECISION'
+        )
+    )
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS saturated_fat_delta DOUBLE PRECISION'
+        )
+    )
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS sugar_delta DOUBLE PRECISION'
+        )
+    )
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS sodium_delta DOUBLE PRECISION'
+        )
+    )
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS calories_delta DOUBLE PRECISION'
+        )
+    )
+    conn.execute(
+        text(
+            'ALTER TABLE public.fact_substitution_recommendations '
+            'ADD COLUMN IF NOT EXISTS health_delta DOUBLE PRECISION'
+        )
+    )
+    conn.execute(
+        text(
+            'CREATE UNIQUE INDEX IF NOT EXISTS '
+            'uq_fact_sub_candidate_substitute '
+            'ON public.fact_substitution_recommendations (candidate_ingredient, substitute_ingredient)'
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entry point called by Airflow
 # ---------------------------------------------------------------------------
@@ -140,7 +210,6 @@ def run_load(**context) -> None:
     recipe_sentiment_ratings = load_recipe_sentiment_ratings()
     user_stats = load_user_stats()
     user_clusters = load_user_clusters()
-    ingredient_clusters = load_ingredient_clusters()
     substitution_recommendations = load_substitution_engine()
 
     # Merge cluster labels into user stats
@@ -154,7 +223,6 @@ def run_load(**context) -> None:
     date_map = _load_dim_date(engine, interactions)
     _load_dim_recipe(engine, recipes, interactions, recipe_sentiment_ratings)
     _load_dim_canonical_ingredient_nutrients(engine)
-    _load_dim_canonical_ingredient_cluster(engine, ingredient_clusters)
     _load_dim_user(engine, users)
     _load_fact_interactions(engine, interactions, date_map)
     _load_fact_substitution_recommendations(engine, substitution_recommendations)
@@ -228,13 +296,6 @@ def _ensure_schema(engine) -> None:
         carbs_g_per_100g          DOUBLE PRECISION
     );
 
-    CREATE TABLE IF NOT EXISTS dim_canonical_ingredient_cluster (
-        canonical_ingredient     TEXT PRIMARY KEY,
-        ingredient_cluster_id    INTEGER,
-        nutrient_feature_count   INTEGER,
-        updated_at               TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
-    );
-
     CREATE TABLE IF NOT EXISTS dim_user (
         user_id                 BIGINT PRIMARY KEY,
         review_count            INTEGER,
@@ -266,10 +327,10 @@ def _ensure_schema(engine) -> None:
     CREATE TABLE IF NOT EXISTS fact_substitution_recommendations (
         candidate_ingredient     TEXT NOT NULL,
         substitute_ingredient    TEXT NOT NULL,
+        substitute_similarity    DOUBLE PRECISION,
         recommendation_score     DOUBLE PRECISION,
         rating_delta             DOUBLE PRECISION,
         sentiment_delta          DOUBLE PRECISION,
-        trend_score              DOUBLE PRECISION,
         protein_delta            DOUBLE PRECISION,
         saturated_fat_delta      DOUBLE PRECISION,
         sugar_delta              DOUBLE PRECISION,
@@ -303,10 +364,10 @@ def _ensure_schema(engine) -> None:
         SELECT
             candidate_ingredient,
             substitute_ingredient,
+            substitute_similarity,
             recommendation_score,
             rating_delta,
             sentiment_delta,
-            trend_score,
             protein_delta,
             saturated_fat_delta,
             sugar_delta,
@@ -328,6 +389,7 @@ def _ensure_schema(engine) -> None:
     with engine.begin() as conn:
         _ensure_dim_recipe_columns(conn)
         _ensure_dim_canonical_ingredient_nutrients_columns(conn)
+        _ensure_fact_substitution_recommendations_columns(conn)
 
     logger.info('Schema ensured (tables and serving view created if not existing).')
 
@@ -610,73 +672,6 @@ def _load_dim_canonical_ingredient_nutrients(engine) -> None:
 
 
 # ---------------------------------------------------------------------------
-# dim_canonical_ingredient_cluster
-# ---------------------------------------------------------------------------
-
-
-def _load_dim_canonical_ingredient_cluster(
-    engine, ingredient_clusters: pd.DataFrame
-) -> None:
-    """
-    Upserts canonical ingredient cluster assignments from staging parquet.
-    """
-    if ingredient_clusters is None or ingredient_clusters.empty:
-        logger.warning(
-            'No ingredient cluster data found in staging; '
-            'skipping dim_canonical_ingredient_cluster load.'
-        )
-        return
-
-    expected = [
-        'canonical_ingredient',
-        'ingredient_cluster_id',
-        'nutrient_feature_count',
-    ]
-    missing = set(expected) - set(ingredient_clusters.columns)
-    if missing:
-        raise ValueError(
-            'Ingredient clusters are missing expected columns: '
-            f'{sorted(missing)}'
-        )
-
-    df = ingredient_clusters[expected].drop_duplicates(
-        subset=['canonical_ingredient'], keep='first'
-    )
-    df['ingredient_cluster_id'] = pd.to_numeric(
-        df['ingredient_cluster_id'], errors='coerce'
-    ).astype('Int64')
-    df['nutrient_feature_count'] = pd.to_numeric(
-        df['nutrient_feature_count'], errors='coerce'
-    ).astype('Int64')
-    df = df.dropna(subset=['canonical_ingredient', 'ingredient_cluster_id'])
-    if df.empty:
-        logger.warning(
-            'Ingredient cluster staging had no valid rows after coercion; '
-            'skipping dim_canonical_ingredient_cluster load.'
-        )
-        return
-
-    upsert_sql = """
-        INSERT INTO dim_canonical_ingredient_cluster (
-            canonical_ingredient, ingredient_cluster_id, nutrient_feature_count, updated_at
-        )
-        VALUES (
-            :canonical_ingredient, :ingredient_cluster_id, :nutrient_feature_count, NOW()
-        )
-        ON CONFLICT (canonical_ingredient) DO UPDATE SET
-            ingredient_cluster_id = EXCLUDED.ingredient_cluster_id,
-            nutrient_feature_count = EXCLUDED.nutrient_feature_count,
-            updated_at = NOW()
-    """
-
-    _bulk_upsert(engine, df, upsert_sql)
-    logger.info(
-        'dim_canonical_ingredient_cluster: upserted %s canonical ingredients.',
-        f'{len(df):,}',
-    )
-
-
-# ---------------------------------------------------------------------------
 # dim_user
 # ---------------------------------------------------------------------------
 
@@ -823,10 +818,10 @@ def _load_fact_substitution_recommendations(
     expected_cols = [
         'candidate_ingredient',
         'substitute_ingredient',
+        'substitute_similarity',
         'recommendation_score',
         'rating_delta',
         'sentiment_delta',
-        'trend_score',
         'protein_delta',
         'saturated_fat_delta',
         'sugar_delta',
@@ -842,25 +837,28 @@ def _load_fact_substitution_recommendations(
         )
 
     df = substitution_recommendations[expected_cols].copy()
+    df = df.dropna(subset=['candidate_ingredient', 'substitute_ingredient'])
+    df['candidate_ingredient'] = df['candidate_ingredient'].astype(str)
+    df['substitute_ingredient'] = df['substitute_ingredient'].astype(str)
 
     upsert_sql = """
         INSERT INTO fact_substitution_recommendations (
-            candidate_ingredient, substitute_ingredient,
-            recommendation_score, rating_delta, sentiment_delta, trend_score,
-            protein_delta, saturated_fat_delta, sugar_delta, sodium_delta,
-            calories_delta, health_delta, updated_at
+            candidate_ingredient, substitute_ingredient, substitute_similarity,
+            recommendation_score, rating_delta, sentiment_delta, protein_delta,
+            saturated_fat_delta, sugar_delta, sodium_delta, calories_delta,
+            health_delta, updated_at
         )
         VALUES (
-            :candidate_ingredient, :substitute_ingredient,
-            :recommendation_score, :rating_delta, :sentiment_delta, :trend_score,
-            :protein_delta, :saturated_fat_delta, :sugar_delta, :sodium_delta,
-            :calories_delta, :health_delta, NOW()
+            :candidate_ingredient, :substitute_ingredient, :substitute_similarity,
+            :recommendation_score, :rating_delta, :sentiment_delta, :protein_delta,
+            :saturated_fat_delta, :sugar_delta, :sodium_delta, :calories_delta,
+            :health_delta, NOW()
         )
         ON CONFLICT (candidate_ingredient, substitute_ingredient) DO UPDATE SET
+            substitute_similarity = EXCLUDED.substitute_similarity,
             recommendation_score = EXCLUDED.recommendation_score,
             rating_delta = EXCLUDED.rating_delta,
             sentiment_delta = EXCLUDED.sentiment_delta,
-            trend_score = EXCLUDED.trend_score,
             protein_delta = EXCLUDED.protein_delta,
             saturated_fat_delta = EXCLUDED.saturated_fat_delta,
             sugar_delta = EXCLUDED.sugar_delta,
@@ -915,7 +913,6 @@ def _log_row_counts(engine) -> None:
         'dim_date',
         'dim_recipe',
         'dim_canonical_ingredient_nutrients',
-        'dim_canonical_ingredient_cluster',
         'dim_user',
         'fact_interactions',
         'fact_substitution_recommendations',

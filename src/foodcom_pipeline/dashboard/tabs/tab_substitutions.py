@@ -50,6 +50,7 @@ def _load_substitution_pairs() -> pd.DataFrame:
                 SELECT
                     candidate_ingredient,
                     substitute_ingredient,
+                    substitute_similarity,
                     recommendation_score,
                     rating_delta,
                     sentiment_delta,

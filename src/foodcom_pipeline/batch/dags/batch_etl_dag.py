@@ -101,12 +101,6 @@ def run_features(**context):
     _run_features(**context)
 
 
-def run_ingredient_clustering(**context):
-    from foodcom_pipeline.batch.ingredient_clusters import run_ingredient_clustering
-
-    run_ingredient_clustering(**context)
-
-
 def run_clustering(**context):
     from foodcom_pipeline.batch.cluster import run_clustering
 
@@ -235,15 +229,6 @@ with DAG(
         ),
     )
 
-    task_ingredient_clusters = PythonOperator(
-        task_id='cluster_canonical_ingredients',
-        python_callable=run_ingredient_clustering,
-        doc_md=(
-            'Fits K-Means on staged USDA nutrient vectors per canonical ingredient '
-            'and writes `ingredient_clusters.parquet` for substitution compatibility gating.'
-        ),
-    )
-
     # ------------------------------------------------------------------
     # Stage 6: Clustering
     # ------------------------------------------------------------------
@@ -288,6 +273,5 @@ with DAG(
     task_check_new_data >> task_clean
 
     task_clean >> task_sentiment
-    task_extract_usda_nutrients >> task_ingredient_clusters
-    [task_sentiment, task_ingredient_clusters] >> task_features
+    [task_sentiment, task_extract_usda_nutrients] >> task_features
     task_features >> task_cluster >> task_load
