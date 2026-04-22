@@ -7,7 +7,7 @@ Computes all derived features needed before clustering:
   1. Per-user aggregate stats (avg_rating, review_count, sentiment stats, etc.)
   2. Per-recipe Bayesian sentiment_rating (inverse-frequency + Bayesian shrinkage)
   3. Ingredient-level features (avg rating, avg sentiment, recipe count)
-  4. Substitution candidate flags (low-rated ingredients for the substitution engine)
+  4. Substitution coverage across all canonical ingredients
 
 Outputs (staged as parquet for downstream steps):
   user_stats.parquet               — one row per user → cluster.py, load.py
@@ -46,7 +46,6 @@ Output columns — ingredient_features.parquet (one row per canonical_ingredient
   recipe_count              : number of distinct recipes containing this ingredient
   avg_rating                : mean recipe avg_rating across those recipes
   avg_sentiment             : mean recipe avg_sentiment across those recipes
-  is_substitution_candidate : True when avg_rating < threshold and recipe_count >= min_count
   trend_index               : reserved nullable column for compatibility
 """
 
@@ -82,6 +81,9 @@ USER_STATS_STAGING = STAGING_DIR / 'user_stats.parquet'
 RECIPE_SENTIMENT_STAGING = STAGING_DIR / 'recipe_sentiment_ratings.parquet'
 INGREDIENT_FEATURES_STAGING = STAGING_DIR / 'ingredient_features.parquet'
 SUBSTITUTION_ENGINE_STAGING = STAGING_DIR / 'substitution_engine.parquet'
+CANONICAL_INGREDIENT_EMBEDDINGS_STAGING = (
+    STAGING_DIR / 'canonical_ingredient_embeddings.parquet'
+)
 
 # Ingredient categories for user taste segmentation feature vector.
 # Keyword matching on already-normalised canonical ingredient strings.
@@ -116,9 +118,7 @@ INGREDIENT_CATEGORIES: dict[str, list[str]] = {
 # Higher values pull recipes with few reviews more strongly toward the global mean.
 BAYESIAN_PSEUDO_COUNT = 10
 
-# Substitution candidate thresholds
-SUBSTITUTION_RATING_THRESHOLD = 3.5  # avg_rating below this → candidate
-SUBSTITUTION_MIN_RECIPE_COUNT = 5    # ingredient must appear in at least this many recipes
+# Substitution coverage now includes all canonical ingredients observed in recipes.
 
 # Ollama compatibility gate config.
 OLLAMA_BASE_URL = os.getenv('FOODCOM_OLLAMA_BASE_URL', 'http://host.docker.internal:11434')
@@ -178,7 +178,7 @@ def run_features(**context) -> None:
     ingredient_features.to_parquet(INGREDIENT_FEATURES_STAGING, index=False)
     substitution_engine.to_parquet(SUBSTITUTION_ENGINE_STAGING, index=False)
 
-    n_candidates = int(ingredient_features['is_substitution_candidate'].sum())
+    n_candidates = int(len(ingredient_features))
     logger.info(
         f'Feature engineering complete. '
         f'{len(user_stats):,} users, '
@@ -191,6 +191,22 @@ def run_features(**context) -> None:
     context['ti'].xcom_push(key='n_recipe_ratings', value=len(recipe_ratings))
     context['ti'].xcom_push(key='n_substitution_candidates', value=n_candidates)
     context['ti'].xcom_push(key='n_substitution_pairs', value=len(substitution_engine))
+
+
+def run_embed_canonical_ingredients(**context) -> None:
+    """
+    Builds and stages canonical ingredient hybrid embeddings from USDA nutrient rows.
+    This is separated from run_features so embedding generation can run independently.
+    """
+    logger.info('Building canonical ingredient embedding index.')
+    embedding_df = _build_canonical_embedding_index()
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    embedding_df.to_parquet(CANONICAL_INGREDIENT_EMBEDDINGS_STAGING, index=False)
+    logger.info(
+        'Canonical ingredient embeddings staged: %s rows.',
+        f'{len(embedding_df):,}',
+    )
+    context['ti'].xcom_push(key='n_canonical_embeddings', value=int(len(embedding_df)))
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +495,6 @@ def _compute_ingredient_features(
                 'recipe_count',
                 'avg_rating',
                 'avg_sentiment',
-                'is_substitution_candidate',
                 'trend_index',
             ]
         )
@@ -518,20 +533,13 @@ def _compute_ingredient_features(
     ingr_features['avg_rating'] = ingr_features['avg_rating'].round(4)
     ingr_features['avg_sentiment'] = ingr_features['avg_sentiment'].round(4)
 
-    ingr_features['is_substitution_candidate'] = (
-        (ingr_features['avg_rating'] < SUBSTITUTION_RATING_THRESHOLD)
-        & (ingr_features['recipe_count'] >= SUBSTITUTION_MIN_RECIPE_COUNT)
-    )
-
     # Reserved nullable field (Google Trends no longer used in substitution logic).
     ingr_features['trend_index'] = None
 
-    n_candidates = int(ingr_features['is_substitution_candidate'].sum())
+    n_candidates = int(len(ingr_features))
     logger.info(
         f'Ingredient features computed for {len(ingr_features):,} canonical ingredients. '
-        f'{n_candidates} substitution candidates '
-        f'(avg_rating < {SUBSTITUTION_RATING_THRESHOLD}, '
-        f'recipe_count >= {SUBSTITUTION_MIN_RECIPE_COUNT}).'
+        f'{n_candidates} substitution candidates (all canonical ingredients).'
     )
     return ingr_features
 
@@ -591,60 +599,52 @@ def _normalize_ingredient_text(value: str) -> str:
     return text
 
 
-def _compute_substitution_engine(
-    ingredient_features: pd.DataFrame, recipes: pd.DataFrame
-) -> pd.DataFrame:
-    """
-    Generates ingredient substitution recommendations.
+def _empty_substitution_engine_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            'candidate_ingredient',
+            'substitute_ingredient',
+            'substitute_similarity',
+            'recommendation_score',
+            'rating_delta',
+            'sentiment_delta',
+            'protein_delta',
+            'saturated_fat_delta',
+            'sugar_delta',
+            'sodium_delta',
+            'calories_delta',
+            'health_delta',
+        ]
+    )
 
-    Builds recipe-level substitution recommendations using a hybrid embedding space:
-      - Text embeddings over canonical ingredient names
-      - Standardized USDA nutrient vectors
-      - Weighted concatenation + cosine nearest neighbors
-    Produces one row per (candidate_ingredient, substitute_ingredient) pair.
-    """
-    if (
-        recipes is None
-        or recipes.empty
-        or 'id' not in recipes.columns
-        or 'ingredients_canonical_list' not in recipes.columns
-    ):
-        return pd.DataFrame(
-            columns=[
-                'candidate_ingredient',
-                'substitute_ingredient',
-                'substitute_similarity',
-                'recommendation_score',
-                'rating_delta',
-                'sentiment_delta',
-                'protein_delta',
-                'saturated_fat_delta',
-                'sugar_delta',
-                'sodium_delta',
-                'calories_delta',
-                'health_delta',
-            ]
-        )
 
+def _safe_float(value) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_delta(new_value, base_value) -> float | None:
+    new_float = _safe_float(new_value)
+    base_float = _safe_float(base_value)
+    if new_float is None or base_float is None:
+        return None
+    return new_float - base_float
+
+
+def _round_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), 4)
+
+
+def _build_canonical_embedding_index() -> pd.DataFrame:
     if not USDA_NUTRIENTS_STAGING.is_file():
-        logger.warning(
-            'No USDA nutrient staging file found; substitution recommendations will be empty.'
-        )
-        return pd.DataFrame(
-            columns=[
-                'candidate_ingredient',
-                'substitute_ingredient',
-                'substitute_similarity',
-                'recommendation_score',
-                'rating_delta',
-                'sentiment_delta',
-                'protein_delta',
-                'saturated_fat_delta',
-                'sugar_delta',
-                'sodium_delta',
-                'calories_delta',
-                'health_delta',
-            ]
+        raise FileNotFoundError(
+            f'USDA nutrients staging not found: {USDA_NUTRIENTS_STAGING}'
         )
 
     nutrients = pd.read_parquet(USDA_NUTRIENTS_STAGING)
@@ -666,23 +666,7 @@ def _compute_substitution_engine(
     )
     canonical_df = canonical_df[canonical_df['canonical_ingredient'] != '']
     if canonical_df.empty:
-        logger.warning('USDA nutrient staging has no canonical ingredients.')
-        return pd.DataFrame(
-            columns=[
-                'candidate_ingredient',
-                'substitute_ingredient',
-                'substitute_similarity',
-                'recommendation_score',
-                'rating_delta',
-                'sentiment_delta',
-                'protein_delta',
-                'saturated_fat_delta',
-                'sugar_delta',
-                'sodium_delta',
-                'calories_delta',
-                'health_delta',
-            ]
-        )
+        return pd.DataFrame(columns=['canonical_ingredient', 'combined_embedding'])
 
     if SentenceTransformer is None:
         raise ImportError(
@@ -713,6 +697,60 @@ def _compute_substitution_engine(
     norms[norms == 0] = 1.0
     combined_embeddings = combined_embeddings / norms
 
+    out = canonical_df.reset_index(drop=True).copy()
+    out['combined_embedding'] = [row.tolist() for row in combined_embeddings]
+    return out
+
+
+def _compute_substitution_engine(
+    ingredient_features: pd.DataFrame, recipes: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Generates ingredient substitution recommendations.
+
+    Builds recipe-level substitution recommendations using a hybrid embedding space:
+      - Text embeddings over canonical ingredient names
+      - Standardized USDA nutrient vectors
+      - Weighted concatenation + cosine nearest neighbors
+    Produces one row per (candidate_ingredient, substitute_ingredient) pair.
+    """
+    if (
+        recipes is None
+        or recipes.empty
+        or 'id' not in recipes.columns
+        or 'ingredients_canonical_list' not in recipes.columns
+    ):
+        return _empty_substitution_engine_frame()
+
+    if not CANONICAL_INGREDIENT_EMBEDDINGS_STAGING.is_file():
+        logger.warning(
+            'No canonical embedding index found at %s; substitution recommendations will be empty.',
+            CANONICAL_INGREDIENT_EMBEDDINGS_STAGING,
+        )
+        return _empty_substitution_engine_frame()
+
+    canonical_df = pd.read_parquet(CANONICAL_INGREDIENT_EMBEDDINGS_STAGING)
+    if canonical_df.empty:
+        logger.warning('USDA nutrient staging has no canonical ingredients.')
+        return _empty_substitution_engine_frame()
+
+    required_cols = {'canonical_ingredient', 'combined_embedding', *SUBSTITUTION_NUTRIENT_COLS}
+    if not required_cols.issubset(canonical_df.columns):
+        missing = sorted(required_cols - set(canonical_df.columns))
+        raise ValueError(
+            'canonical_ingredient_embeddings.parquet missing required columns: '
+            f'{missing}'
+        )
+
+    canonical_df = canonical_df.copy()
+    canonical_df['canonical_ingredient'] = (
+        canonical_df['canonical_ingredient'].astype(str).str.strip().str.lower()
+    )
+    ingredient_names = canonical_df['canonical_ingredient'].reset_index(drop=True)
+    combined_embeddings = np.asarray(
+        canonical_df['combined_embedding'].tolist(), dtype=np.float32
+    )
+
     nn = NearestNeighbors(metric='cosine', algorithm='brute')
     nn.fit(combined_embeddings)
 
@@ -741,22 +779,7 @@ def _compute_substitution_engine(
         logger.warning(
             'No recipe ingredients overlap with canonical USDA ingredients.'
         )
-        return pd.DataFrame(
-            columns=[
-                'candidate_ingredient',
-                'substitute_ingredient',
-                'substitute_similarity',
-                'recommendation_score',
-                'rating_delta',
-                'sentiment_delta',
-                'protein_delta',
-                'saturated_fat_delta',
-                'sugar_delta',
-                'sodium_delta',
-                'calories_delta',
-                'health_delta',
-            ]
-        )
+        return _empty_substitution_engine_frame()
 
     feature_base = ingredient_features.copy()
     if not feature_base.empty and 'canonical_ingredient' in feature_base.columns:
@@ -798,36 +821,43 @@ def _compute_substitution_engine(
             substitute_nut = nutrition_lookup.loc[substitute]
 
             rating_delta = (
-                float(substitute_feat['avg_rating'] - candidate_feat['avg_rating'])
+                _safe_delta(substitute_feat['avg_rating'], candidate_feat['avg_rating'])
                 if candidate_feat is not None and substitute_feat is not None
                 else None
             )
             sentiment_delta = (
-                float(substitute_feat['avg_sentiment'] - candidate_feat['avg_sentiment'])
+                _safe_delta(
+                    substitute_feat['avg_sentiment'], candidate_feat['avg_sentiment']
+                )
                 if candidate_feat is not None and substitute_feat is not None
                 else None
             )
-            protein_delta = float(
-                substitute_nut['protein_g_per_100g'] - candidate_nut['protein_g_per_100g']
+            protein_delta = _safe_delta(
+                substitute_nut['protein_g_per_100g'],
+                candidate_nut['protein_g_per_100g'],
             )
-            saturated_fat_delta = float(
-                substitute_nut['saturated_fat_g_per_100g']
-                - candidate_nut['saturated_fat_g_per_100g']
+            saturated_fat_delta = _safe_delta(
+                substitute_nut['saturated_fat_g_per_100g'],
+                candidate_nut['saturated_fat_g_per_100g'],
             )
-            sugar_delta = float(
-                substitute_nut['sugar_g_per_100g'] - candidate_nut['sugar_g_per_100g']
+            sugar_delta = _safe_delta(
+                substitute_nut['sugar_g_per_100g'],
+                candidate_nut['sugar_g_per_100g'],
             )
-            sodium_delta = float(
-                substitute_nut['sodium_g_per_100g'] - candidate_nut['sodium_g_per_100g']
+            sodium_delta = _safe_delta(
+                substitute_nut['sodium_g_per_100g'],
+                candidate_nut['sodium_g_per_100g'],
             )
-            calories_delta = float(
-                substitute_nut['calories_per_100g'] - candidate_nut['calories_per_100g']
+            calories_delta = _safe_delta(
+                substitute_nut['calories_per_100g'],
+                candidate_nut['calories_per_100g'],
             )
             health_delta = (
-                0.4 * protein_delta
-                - 0.25 * saturated_fat_delta
-                - 0.2 * sugar_delta
-                - 0.15 * sodium_delta
+                0.4 * (protein_delta if protein_delta is not None else 0.0)
+                - 0.25
+                * (saturated_fat_delta if saturated_fat_delta is not None else 0.0)
+                - 0.2 * (sugar_delta if sugar_delta is not None else 0.0)
+                - 0.15 * (sodium_delta if sodium_delta is not None else 0.0)
             )
             recommendation_score = (
                 0.6 * similarity
@@ -841,17 +871,13 @@ def _compute_substitution_engine(
                     'substitute_ingredient': substitute,
                     'substitute_similarity': round(similarity, 4),
                     'recommendation_score': round(float(recommendation_score), 4),
-                    'rating_delta': round(float(rating_delta), 4)
-                    if rating_delta is not None
-                    else None,
-                    'sentiment_delta': round(float(sentiment_delta), 4)
-                    if sentiment_delta is not None
-                    else None,
-                    'protein_delta': round(float(protein_delta), 4),
-                    'saturated_fat_delta': round(float(saturated_fat_delta), 4),
-                    'sugar_delta': round(float(sugar_delta), 4),
-                    'sodium_delta': round(float(sodium_delta), 4),
-                    'calories_delta': round(float(calories_delta), 4),
+                    'rating_delta': _round_or_none(rating_delta),
+                    'sentiment_delta': _round_or_none(sentiment_delta),
+                    'protein_delta': _round_or_none(protein_delta),
+                    'saturated_fat_delta': _round_or_none(saturated_fat_delta),
+                    'sugar_delta': _round_or_none(sugar_delta),
+                    'sodium_delta': _round_or_none(sodium_delta),
+                    'calories_delta': _round_or_none(calories_delta),
                     'health_delta': round(float(health_delta), 4),
                 }
             )
@@ -861,22 +887,7 @@ def _compute_substitution_engine(
 
     recommendations = pd.DataFrame(rows)
     if recommendations.empty:
-        return pd.DataFrame(
-            columns=[
-                'candidate_ingredient',
-                'substitute_ingredient',
-                'substitute_similarity',
-                'recommendation_score',
-                'rating_delta',
-                'sentiment_delta',
-                'protein_delta',
-                'saturated_fat_delta',
-                'sugar_delta',
-                'sodium_delta',
-                'calories_delta',
-                'health_delta',
-            ]
-        )
+        return _empty_substitution_engine_frame()
 
     recommendations = recommendations.drop_duplicates(
         subset=['candidate_ingredient', 'substitute_ingredient']

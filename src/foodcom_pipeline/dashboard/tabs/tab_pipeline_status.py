@@ -171,9 +171,9 @@ def _load_substitution_stats() -> dict | None:
     path = STAGING_DIR / "ingredient_features.parquet"
     if not path.exists():
         return None
-    df = pd.read_parquet(path, columns=["is_substitution_candidate"])
+    df = pd.read_parquet(path)
     total = len(df)
-    candidates = int(df["is_substitution_candidate"].sum())
+    candidates = total
     return {"total_ingredients": total, "candidates": candidates,
             "rate": candidates / total if total > 0 else 0.0}
 

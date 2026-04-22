@@ -101,6 +101,14 @@ def run_features(**context):
     _run_features(**context)
 
 
+def run_embed_canonical_ingredients(**context):
+    from foodcom_pipeline.batch.features import (
+        run_embed_canonical_ingredients as _run_embed_canonical_ingredients,
+    )
+
+    _run_embed_canonical_ingredients(**context)
+
+
 def run_clustering(**context):
     from foodcom_pipeline.batch.cluster import run_clustering
 
@@ -228,6 +236,15 @@ with DAG(
             'Outputs feed cluster.py and load.py.'
         ),
     )
+    task_embed_canonical_ingredients = PythonOperator(
+        task_id='embed_canonical_ingredients',
+        python_callable=run_embed_canonical_ingredients,
+        doc_md=(
+            'Builds hybrid text+nutrition embeddings for canonical ingredients '
+            'from `usda_nutrients.parquet` and stages '
+            '`canonical_ingredient_embeddings.parquet` for substitution scoring.'
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Stage 6: Clustering
@@ -273,5 +290,6 @@ with DAG(
     task_check_new_data >> task_clean
 
     task_clean >> task_sentiment
-    [task_sentiment, task_extract_usda_nutrients] >> task_features
+    task_extract_usda_nutrients >> task_embed_canonical_ingredients
+    [task_sentiment, task_embed_canonical_ingredients] >> task_features
     task_features >> task_cluster >> task_load
