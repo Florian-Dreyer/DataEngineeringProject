@@ -244,6 +244,32 @@ def _buy_link_for_ingredient(ingredient: str) -> str:
     return f"https://www.amazon.com/s?k={query}&i=grocery"
 
 
+def _update_swap_map(
+    active_swaps: dict[str, str],
+    candidate_ingredient: str,
+    substitute_ingredient: str | None,
+) -> dict[str, str]:
+    updated_swaps = dict(active_swaps)
+    if substitute_ingredient is None:
+        updated_swaps.pop(candidate_ingredient, None)
+    else:
+        updated_swaps[candidate_ingredient] = substitute_ingredient
+    return updated_swaps
+
+
+def _set_recipe_swap(
+    swap_key: str,
+    candidate_ingredient: str,
+    substitute_ingredient: str | None,
+) -> None:
+    active_swaps = dict(st.session_state.get(swap_key, {}))
+    st.session_state[swap_key] = _update_swap_map(
+        active_swaps,
+        candidate_ingredient,
+        substitute_ingredient,
+    )
+
+
 def _recompute_bayesian_sentiment(
     base_sentiment_rating: float | None,
     weighted_review_count: float | None,
@@ -512,17 +538,14 @@ def _render_swap_workspace(
                 )
             with head_right:
                 is_active = active_swaps.get(selected_candidate) == sub
-                if st.button(
+                st.button(
                     "Applied ✅" if is_active else "Apply swap",
                     key=f"swap_{selected_recipe_id}_{selected_candidate}_{sub}",
                     type="primary" if is_active else "secondary",
                     use_container_width=True,
-                ):
-                    if is_active:
-                        active_swaps.pop(selected_candidate, None)
-                    else:
-                        active_swaps[selected_candidate] = sub
-                    st.session_state[swap_key] = active_swaps
+                    on_click=_set_recipe_swap,
+                    args=(swap_key, selected_candidate, None if is_active else sub),
+                )
 
             stat_a, stat_b, stat_c = st.columns(3)
             stat_a.metric("Rating delta", _format_delta(cand_row.get("rating_delta"), True))
