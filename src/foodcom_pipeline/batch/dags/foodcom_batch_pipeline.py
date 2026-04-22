@@ -19,6 +19,8 @@ from foodcom_pipeline.batch.extract import (
     extract_recipes,
     extract_interactions,
     extract_usda_nutrients,
+    extract_google_trends,
+    extract_ai_mode,
 )
 from foodcom_pipeline.batch.clean import run_clean
 from foodcom_pipeline.batch.sentiment import run_sentiment
@@ -76,6 +78,18 @@ task_extract_usda_nutrients = PythonOperator(
     dag=dag,
 )
 
+task_extract_google_trends = PythonOperator(
+    task_id='extract_google_trends',
+    python_callable=extract_google_trends,
+    dag=dag,
+)
+
+task_extract_ai_mode = PythonOperator(
+    task_id='extract_ai_mode',
+    python_callable=extract_ai_mode,
+    dag=dag,
+)
+
 # ─────────────────────────────────────────────────────────────────────────
 # Clean Phase
 # ─────────────────────────────────────────────────────────────────────────
@@ -122,15 +136,24 @@ task_load = PythonOperator(
 # Task Dependencies
 # ─────────────────────────────────────────────────────────────────────────
 
-# Extract phase: ensure source data first, then extract tasks can run in parallel
+# Extract phase: ensure source data first, then independent extracts run in parallel
 task_ensure_source_data >> [
     task_extract_recipes,
     task_extract_interactions,
     task_extract_usda_nutrients,
+    task_extract_google_trends,
 ]
 
-# Clean phase: depends on all extracts
-[task_extract_recipes, task_extract_interactions, task_extract_usda_nutrients] >> task_clean
+# AI Mode depends on recipes (food context) and trends (term scoring baseline)
+[task_extract_recipes, task_extract_google_trends] >> task_extract_ai_mode
+
+# Clean phase: waits for all extract work; recipes and trends feed clean
+# transitively through ai_mode so only the remaining three are listed directly
+[
+    task_extract_interactions,
+    task_extract_usda_nutrients,
+    task_extract_ai_mode,
+] >> task_clean
 
 # Sentiment & aggregation depend on clean
 task_clean >> [task_sentiment, task_aggregate_user_stats]

@@ -43,6 +43,25 @@ INGR_MAP_PKL = DATA_DIR / 'ingr_map.pkl'
 RECIPES_STAGING = STAGING_DIR / 'recipes_extracted.parquet'
 INTERACTIONS_STAGING = STAGING_DIR / 'interactions_extracted.parquet'
 USDA_NUTRIENTS_STAGING = STAGING_DIR / 'usda_nutrients.parquet'
+TRENDS_RAW_STAGING = STAGING_DIR / 'google_trends_raw.parquet'
+TRENDS_NORMALISED_STAGING = STAGING_DIR / 'google_trends_normalised.parquet'
+AI_MODE_RAW_STAGING = STAGING_DIR / 'ai_mode_raw.parquet'
+AI_MODE_TERM_SCORES_STAGING = STAGING_DIR / 'ai_mode_term_scores.parquet'
+MARKET_SIGNALS_STAGING = STAGING_DIR / 'market_signals.parquet'
+
+_TRENDS_SEEDS: list[str] = ['recipe', 'recipes']
+
+_AI_MODE_SEEDS: list[str] = [
+    'dinner ideas',
+    'lunch ideas',
+    'breakfast ideas',
+    'easy weeknight meals',
+    'healthy meal ideas',
+    'quick recipes',
+    'what to cook tonight',
+    'meal prep ideas',
+    'party food ideas',
+]
 
 # USDA FoodData Central bulk JSON (Foundation, SR Legacy, FNDDS survey)
 _USDA_JSON_SPECS: tuple[tuple[str, str], ...] = (
@@ -813,6 +832,94 @@ def extract_usda_nutrients(**context) -> None:
     context['ti'].xcom_push(key='usda_coverage_rate', value=float(coverage_rate))
     context['ti'].xcom_push(key='usda_rows', value=int(len(usda_df)))
     context['ti'].xcom_push(key='usda_extract_skipped', value=False)
+
+
+# ---------------------------------------------------------------------------
+# Google Trends extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_ai_mode(**context) -> None:
+    """
+    Calls the SerpAPI Google AI Mode engine for each seed in _AI_MODE_SEEDS,
+    scores food/cuisine term frequency from the returned text blocks, and
+    merges with Google Trends normalised scores to produce market_signals.
+
+    Writes three staging files:
+      ai_mode_raw.parquet          — one row per text block
+      ai_mode_term_scores.parquet  — term frequencies + normalised scores
+      market_signals.parquet       — merged AI Mode + Trends scores per term
+
+    SERPAPI_KEY must be set as an Airflow Variable; raises clearly if missing.
+    """
+    from airflow.models import Variable
+    from foodcom_pipeline.extraction.ai_mode import (
+        fetch_ai_mode_blocks,
+        score_terms,
+        merge_with_trends,
+    )
+
+    try:
+        api_key = Variable.get('SERPAPI_KEY')
+    except KeyError:
+        raise RuntimeError('SERPAPI_KEY Airflow Variable not set')
+
+    raw_df = fetch_ai_mode_blocks(_AI_MODE_SEEDS, api_key)
+
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    raw_df.to_parquet(AI_MODE_RAW_STAGING, index=False)
+    logger.info('AI Mode raw blocks staged: %d rows → %s', len(raw_df), AI_MODE_RAW_STAGING)
+
+    if raw_df.empty:
+        logger.warning('No AI Mode blocks returned; term scoring and merge skipped.')
+        return
+
+    term_scores = score_terms(raw_df)
+    term_scores.to_parquet(AI_MODE_TERM_SCORES_STAGING, index=False)
+    logger.info(
+        'AI Mode term scores staged: %d terms → %s',
+        len(term_scores), AI_MODE_TERM_SCORES_STAGING,
+    )
+
+    market_signals = merge_with_trends(term_scores, TRENDS_NORMALISED_STAGING)
+    market_signals.to_parquet(MARKET_SIGNALS_STAGING, index=False)
+    logger.info(
+        'Market signals staged: %d terms → %s', len(market_signals), MARKET_SIGNALS_STAGING
+    )
+
+
+def extract_google_trends(**context) -> None:
+    """
+    Extracts Google Trends related queries for _TRENDS_SEEDS and stages two
+    Parquet files: google_trends_raw.parquet and google_trends_normalised.parquet.
+
+    Skips seeds whose last fetch is within 7 days (checked via trends_metadata.parquet).
+    Imports from load.py are deferred to avoid the circular extract ↔ load import.
+    """
+    # Deferred to avoid circular import: load.py imports STAGING_DIR from extract.py
+    from foodcom_pipeline.batch.load import is_trends_stale, save_trends_metadata
+    from foodcom_pipeline.extraction.trends import fetch_related_queries, batch_normalise
+
+    stale_seeds = [s for s in _TRENDS_SEEDS if is_trends_stale(s)]
+    if not stale_seeds:
+        logger.info('Trends data is fresh, skipping fetch.')
+        return
+
+    raw_df = fetch_related_queries(stale_seeds)
+
+    if raw_df.empty:
+        logger.warning('No trend rows returned; skipping parquet write.')
+        return
+
+    normalised_df = batch_normalise(raw_df)
+
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    raw_df.to_parquet(TRENDS_RAW_STAGING, index=False)
+    normalised_df.to_parquet(TRENDS_NORMALISED_STAGING, index=False)
+    logger.info('Trends staged: %d rows → %s', len(raw_df), STAGING_DIR)
+
+    for seed in raw_df['seed_query'].unique():
+        save_trends_metadata(seed, date.today())
 
 
 # ---------------------------------------------------------------------------

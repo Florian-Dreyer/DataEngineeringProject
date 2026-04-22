@@ -7,11 +7,17 @@ Reads: trends_keywords.txt for keyword list
 Purpose: Actual data extraction logic with rate limiting and error handling
 """
 
+import logging
 import time
 import os
+from datetime import date
 
 import pandas as pd
 from pytrends.request import TrendReq
+
+logger = logging.getLogger(__name__)
+
+_BREAKOUT_VALUE = 5000  # pytrends encodes >5000% rising as the string "Breakout"
 
 
 def extract_google_trends(
@@ -271,3 +277,118 @@ def load_keywords_from_file(file_path):
             for line in f
             if line.strip() and not line.startswith("#")
         ]
+
+
+# ---------------------------------------------------------------------------
+# Related-queries extraction (used by the batch pipeline DAG task)
+# ---------------------------------------------------------------------------
+
+
+def fetch_related_queries(
+    seeds: list[str],
+    *,
+    batch_size: int = 5,
+    batch_sleep_secs: int = 5,
+    rate_limit_sleep_secs: int = 60,
+) -> pd.DataFrame:
+    """
+    Calls pytrends related_queries() for each seed and returns a DataFrame with
+    columns: seed_query, related_query, query_type, fetched_date, raw_value.
+
+    Seeds are processed in batches of `batch_size` (pytrends max is 5 keywords
+    per payload).  Between batches the caller sleeps `batch_sleep_secs` seconds.
+    On HTTP 429 the function sleeps `rate_limit_sleep_secs` seconds and retries
+    once; on a second failure that batch is skipped so the rest can continue.
+    """
+    pytrends = TrendReq(hl="en-US", tz=360)
+    fetched_date = date.today()
+    rows: list[dict] = []
+
+    for batch_num, start in enumerate(range(0, len(seeds), batch_size), start=1):
+        batch = seeds[start : start + batch_size]
+        logger.info("Batch %d — keywords: %s", batch_num, batch)
+        _fetch_related_batch(pytrends, batch, fetched_date, rows, rate_limit_sleep_secs)
+        if start + batch_size < len(seeds):
+            time.sleep(batch_sleep_secs)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["seed_query", "related_query", "query_type", "fetched_date", "raw_value"]
+        )
+
+    df = pd.DataFrame(rows)
+    df["raw_value"] = df["raw_value"].astype(int)
+    return df[["seed_query", "related_query", "query_type", "fetched_date", "raw_value"]]
+
+
+def batch_normalise(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds a normalised_score column via z-score within each seed_query group:
+        normalised_score = (raw_value - group_mean) / group_std
+
+    Groups with std == 0 receive normalised_score = 0.0.
+    """
+    df = raw_df.copy()
+    df["normalised_score"] = 0.0
+    for _seed, group in df.groupby("seed_query"):
+        mean = group["raw_value"].mean()
+        std = group["raw_value"].std()
+        if pd.isna(std) or std == 0.0:
+            df.loc[group.index, "normalised_score"] = 0.0
+        else:
+            df.loc[group.index, "normalised_score"] = (
+                (group["raw_value"] - mean) / std
+            ).round(6)
+    return df
+
+
+def _fetch_related_batch(
+    pytrends: TrendReq,
+    batch: list[str],
+    fetched_date: date,
+    rows: list[dict],
+    rate_limit_sleep_secs: int,
+) -> None:
+    """Fetches related_queries for one batch; appends result dicts to rows."""
+    for attempt in range(2):
+        try:
+            pytrends.build_payload(batch, cat=0, timeframe="today 3-m", geo="")
+            related: dict = pytrends.related_queries()
+            for seed in batch:
+                seed_data = related.get(seed) or {}
+                for query_type in ("top", "rising"):
+                    df = seed_data.get(query_type)
+                    if df is None or df.empty:
+                        continue
+                    for _, r in df.iterrows():
+                        raw_value = r.get("value", 0)
+                        if isinstance(raw_value, str):
+                            raw_value = _BREAKOUT_VALUE
+                        try:
+                            raw_value = int(raw_value)
+                        except (ValueError, TypeError):
+                            raw_value = 0
+                        rows.append(
+                            {
+                                "seed_query": seed,
+                                "related_query": str(r["query"]),
+                                "query_type": query_type,
+                                "fetched_date": fetched_date,
+                                "raw_value": raw_value,
+                            }
+                        )
+            return
+        except Exception as exc:
+            if "429" in str(exc):
+                if attempt == 0:
+                    logger.warning(
+                        "HTTP 429 on batch %s — sleeping %ds then retrying.",
+                        batch, rate_limit_sleep_secs,
+                    )
+                    time.sleep(rate_limit_sleep_secs)
+                else:
+                    logger.error("HTTP 429 on retry for batch %s — skipping.", batch)
+                    return
+            else:
+                logger.error("Error on batch %s: %s — skipping.", batch, exc)
+                return

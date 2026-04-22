@@ -38,7 +38,7 @@ from foodcom_pipeline.batch.clean import (
     load_cleaned_recipes,
 )
 from foodcom_pipeline.batch.cluster import load_user_clusters
-from foodcom_pipeline.batch.extract import USDA_NUTRIENTS_STAGING
+from foodcom_pipeline.batch.extract import STAGING_DIR, USDA_NUTRIENTS_STAGING
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 from sqlalchemy import create_engine, text
 
@@ -735,3 +735,51 @@ def _log_row_counts(engine) -> None:
                 logger.info(f'  {table:<25}: {n:>10,}')
             except Exception as e:
                 logger.warning(f'  {table:<25}: could not query ({e})')
+
+
+# ---------------------------------------------------------------------------
+# Trends metadata — tracks when each seed query was last fetched so the
+# extract_google_trends task can skip fetches that are still fresh.
+# Stored as a small Parquet file alongside other staging artefacts.
+# ---------------------------------------------------------------------------
+
+_TRENDS_METADATA_PATH = STAGING_DIR / 'trends_metadata.parquet'
+_TRENDS_STALENESS_DAYS = 7
+
+
+def is_trends_stale(seed_query: str) -> bool:
+    """Returns True if trends data for *seed_query* is missing or older than 7 days."""
+    if not _TRENDS_METADATA_PATH.is_file():
+        return True
+
+    df = pd.read_parquet(_TRENDS_METADATA_PATH)
+    match = df[df['seed_query'] == seed_query]
+    if match.empty:
+        return True
+
+    last_fetched = match.iloc[0]['last_fetched_date']
+    # Normalise to a plain date regardless of how it was stored
+    if hasattr(last_fetched, 'date'):
+        last_fetched = last_fetched.date()
+    elif isinstance(last_fetched, str):
+        last_fetched = date.fromisoformat(last_fetched)
+
+    return (date.today() - last_fetched).days > _TRENDS_STALENESS_DAYS
+
+
+def save_trends_metadata(seed_query: str, fetched_date: date) -> None:
+    """Upserts a *trends_metadata* row for *seed_query* with *fetched_date*."""
+    if _TRENDS_METADATA_PATH.is_file():
+        df = pd.read_parquet(_TRENDS_METADATA_PATH)
+        df = df[df['seed_query'] != seed_query]
+    else:
+        df = pd.DataFrame(columns=['seed_query', 'last_fetched_date'])
+
+    new_row = pd.DataFrame(
+        [{'seed_query': seed_query, 'last_fetched_date': fetched_date}]
+    )
+    df = pd.concat([df, new_row], ignore_index=True)
+
+    _TRENDS_METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_TRENDS_METADATA_PATH, index=False)
+    logger.info('trends_metadata updated: %s → %s', seed_query, fetched_date)
