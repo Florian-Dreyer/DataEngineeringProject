@@ -1,15 +1,3 @@
 # Keywords for Google Trends extraction
-# One keyword per line
-# 30 cuisine-level keywords with 'pasta' as anchor for cross-batch normalization
-# Derived from recipe ingredients, dish types, cuisine categories
-
-pizza
-pasta
-sushi
-tacos
-curry
-salad
-burger
-steak
-chicken
-rice
+recipe
+recipes

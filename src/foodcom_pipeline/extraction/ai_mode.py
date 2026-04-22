@@ -39,68 +39,125 @@ _STOPWORDS: frozenset[str] = frozenset(
     }
 )
 
-
 # ---------------------------------------------------------------------------
 # Public: SerpAPI fetch
 # ---------------------------------------------------------------------------
 
+def build_ai_query(seed: str) -> str:
+    return (
+        f"{seed}. "
+        "Generate a list of 20 high-volume search terms and trending dishes. "
+        "Each item must be distilled to its core dish name, meaning the primary keyword used to identify broad search intent. "
+        "Remove descriptive or branded adjectives such as 'viral', 'marry me', 'one-pot', 'sheet-pan', 'crispy', 'creamy', or similar stylistic modifiers unless they are essential to the dish identity. "
+        "Do not include explanations, categories, numbering, or extra commentary. "
+        "Only output dish names, separated by commas. "
+        "Examples: Tortellini, Garlic Chicken, Korean Beef Bowl, Feta Pasta, Birria Tacos."
+    )
 
-def fetch_ai_mode_blocks(seeds: list[str], api_key: str) -> pd.DataFrame:
-    """
-    Calls the SerpAPI ``google_ai_mode`` engine for each seed query and
-    returns a flattened DataFrame of text blocks.
 
-    Columns: seed_query, block_index, title (nullable), body, fetched_date.
-
-    Each SerpAPI call is wrapped individually so a single failure does not
-    abort the rest.  Failed queries are logged and skipped.
-    """
-    from serpapi import GoogleSearch  # deferred: not available in all envs
+def fetch_ai_mode_blocks(seeds, api_key) -> pd.DataFrame:
+    import serpapi
 
     fetched_date = date.today()
     rows: list[dict] = []
 
-    for seed in seeds:
-        try:
-            results = GoogleSearch(
-                {"engine": "google_ai_mode", "q": seed, "api_key": api_key}
-            ).get_dict()
+    try:
+        client = serpapi.Client(api_key=api_key)
+    except Exception as e:
+        raise RuntimeError("Failed to initialize SerpAPI client") from e
 
-            # SerpAPI may nest text_blocks under an "ai_mode" key or at the top level
+    for seed in seeds:
+        prompted_query = build_ai_query(seed)
+
+        try:
+            results = client.search(
+                {
+                    "engine": "google_ai_mode",
+                    "q": prompted_query,
+                }
+            )
+
             ai_section = results.get("ai_mode", results)
+
             text_blocks = ai_section.get("text_blocks", [])
+            if not text_blocks and isinstance(ai_section.get("text_blocks"), dict):
+                text_blocks = [ai_section["text_blocks"]]
+
+            # fallback shapes in case AI Mode returns text elsewhere
+            if not text_blocks:
+                fallback_text = (
+                    ai_section.get("text")
+                    or ai_section.get("answer")
+                    or ai_section.get("snippet")
+                    or results.get("text")
+                    or results.get("answer")
+                    or results.get("snippet")
+                    or ""
+                )
+
+                if fallback_text:
+                    text_blocks = [{"title": None, "text": fallback_text}]
 
             if not text_blocks:
-                logger.warning("No text_blocks returned for query %r", seed)
+                logger.warning(
+                    "No AI Mode text content returned for seed %r (prompt=%r)",
+                    seed,
+                    prompted_query,
+                )
 
             for idx, block in enumerate(text_blocks):
+                if not isinstance(block, dict):
+                    block = {"title": None, "text": str(block)}
+
                 title = block.get("title") or None
                 body = (
                     block.get("snippet")
                     or block.get("body")
                     or block.get("text")
+                    or block.get("answer")
                     or ""
                 )
+
                 rows.append(
                     {
                         "seed_query": seed,
+                        "prompted_query": prompted_query,
                         "block_index": idx,
                         "title": title,
-                        "body": str(body),
+                        "body": str(body).strip(),
                         "fetched_date": fetched_date,
                     }
                 )
 
         except Exception as exc:
-            logger.error("SerpAPI call failed for query %r: %s", seed, exc)
+            logger.error(
+                "SerpAPI call failed for seed %r (prompt=%r): %s",
+                seed,
+                prompted_query,
+                exc,
+            )
 
     if not rows:
         return pd.DataFrame(
-            columns=["seed_query", "block_index", "title", "body", "fetched_date"]
+            columns=[
+                "seed_query",
+                "prompted_query",
+                "block_index",
+                "title",
+                "body",
+                "fetched_date",
+            ]
         )
 
     return pd.DataFrame(rows)[
-        ["seed_query", "block_index", "title", "body", "fetched_date"]
+        [
+            "seed_query",
+            "prompted_query",
+            "block_index",
+            "title",
+            "body",
+            "fetched_date",
+        ]
     ]
 
 
@@ -111,44 +168,105 @@ def fetch_ai_mode_blocks(seeds: list[str], api_key: str) -> pd.DataFrame:
 
 def score_terms(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Counts food/cuisine token frequency across all text blocks, then applies
-    z-score normalisation within the full corpus.
+    Scores dish phrases rather than single-word tokens.
 
-    Tokenisation: lowercase, split on non-alphanumeric, drop stopwords and
-    tokens shorter than 3 characters.
+    Assumes AI Mode output has been prompt-engineered to return dish names
+    separated by commas, line breaks, semicolons, or bullets.
 
     Columns: term, raw_frequency, normalised_score, fetched_date.
     """
     fetched_date = date.today()
 
-    combined_text = " ".join(
-        (raw_df["title"].fillna("") + " " + raw_df["body"].fillna("")).tolist()
-    ).lower()
+    if raw_df.empty:
+        return pd.DataFrame(
+            columns=["term", "raw_frequency", "normalised_score", "fetched_date"]
+        )
 
-    tokens = re.split(r"[^a-z0-9]+", combined_text)
-    filtered = [t for t in tokens if len(t) >= 3 and t not in _STOPWORDS]
+    def _clean_term(term: str) -> str:
+        term = str(term).strip().lower()
 
-    counts = Counter(filtered)
+        # remove numbering / bullets at start
+        term = re.sub(r"^\s*(?:\d+[\.\)]\s*|[-•*]\s*)", "", term)
+
+        # normalize punctuation / whitespace
+        term = re.sub(r"[“”\"']", "", term)
+        term = re.sub(r"\s+", " ", term).strip(" ,;:-")
+
+        return term
+
+    def _is_valid_term(term: str) -> bool:
+        if not term:
+            return False
+
+        # reject very short fragments
+        if len(term) < 3:
+            return False
+
+        # reject generic query/category phrases
+        generic_phrases = {
+            "dinner ideas",
+            "easy weeknight meals",
+            "easy meals",
+            "quick meals",
+            "quick dinner ideas",
+            "dinner recipes",
+            "meal ideas",
+            "recipe ideas",
+            "high volume search terms",
+            "trending dishes",
+            "dish names",
+        }
+        if term in generic_phrases:
+            return False
+
+        # reject fragments with too few alphabetic chars
+        if len(re.sub(r"[^a-z]", "", term)) < 3:
+            return False
+
+        # reject phrases that are almost entirely stopwords
+        words = term.split()
+        content_words = [w for w in words if w not in _STOPWORDS]
+        if len(content_words) == 0:
+            return False
+
+        return True
+
+    phrases: list[str] = []
+
+    for _, row in raw_df.iterrows():
+
+        # split on common list separators from AI output
+        candidates = re.split(r",|\n|;|\||•", str(row.get("body", "")))
+
+        for candidate in candidates:
+            cleaned = _clean_term(candidate)
+            if _is_valid_term(cleaned):
+                phrases.append(cleaned)
+
+    counts = Counter(phrases)
+
     if not counts:
         return pd.DataFrame(
             columns=["term", "raw_frequency", "normalised_score", "fetched_date"]
         )
 
     df = pd.DataFrame(
-        [{"term": t, "raw_frequency": c} for t, c in counts.items()]
+        [{"term": term, "raw_frequency": freq} for term, freq in counts.items()]
     )
 
     mean = df["raw_frequency"].mean()
     std = df["raw_frequency"].std()
+
     if pd.isna(std) or std == 0.0:
         df["normalised_score"] = 0.0
     else:
         df["normalised_score"] = ((df["raw_frequency"] - mean) / std).round(6)
 
     df["fetched_date"] = fetched_date
+
     return (
         df[["term", "raw_frequency", "normalised_score", "fetched_date"]]
-        .sort_values("raw_frequency", ascending=False)
+        .sort_values(["raw_frequency", "term"], ascending=[False, True])
         .reset_index(drop=True)
     )
 

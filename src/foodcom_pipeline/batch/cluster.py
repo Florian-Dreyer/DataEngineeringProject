@@ -40,7 +40,7 @@ import logging
 import numpy as np
 import pandas as pd
 from foodcom_pipeline.batch.features import load_user_stats
-from foodcom_pipeline.batch.extract import STAGING_DIR
+from foodcom_pipeline.batch.extract import STAGING_DIR, atomic_parquet
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
@@ -97,9 +97,10 @@ def run_clustering(**context) -> None:
             'No users in user_stats — skipping K-Means and writing empty cluster output.'
         )
         STAGING_DIR.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(
-            columns=['user_id', 'cluster_id', 'cluster_label'],
-        ).to_parquet(CLUSTER_STAGING, index=False)
+        atomic_parquet(
+            pd.DataFrame(columns=['user_id', 'cluster_id', 'cluster_label']),
+            CLUSTER_STAGING,
+        )
         context['ti'].xcom_push(key='n_clusters', value=0)
         context['ti'].xcom_push(key='n_users_clustered', value=0)
         return
@@ -124,7 +125,7 @@ def run_clustering(**context) -> None:
 
     _produce_cluster_profiles(user_features, interactions, recipes, ingredient_features)
 
-    user_features.to_parquet(CLUSTER_STAGING, index=False)
+    atomic_parquet(user_features, CLUSTER_STAGING)
     logger.info(f'Clustering complete. Staged to {CLUSTER_STAGING}')
 
     context['ti'].xcom_push(key='n_clusters', value=k)

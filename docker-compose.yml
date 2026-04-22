@@ -20,6 +20,8 @@ services:
       - postgres
     environment:
       USDA_API_KEY: ${USDA_API_KEY}
+      SERPAPI_KEY: ${SERPAPI_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
       FOODCOM_USDA_FORCE_REFRESH: ${FOODCOM_USDA_FORCE_REFRESH:-false}
       # Airflow metadata DB (kept in Postgres for simplicity)
       AIRFLOW__CORE__EXECUTOR: LocalExecutor

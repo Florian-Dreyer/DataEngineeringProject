@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir \
     numpy \
     scipy \
     scikit-learn \
-    pytrends \
+    serpapi \
     google-generativeai \
     requests \
     sqlalchemy \

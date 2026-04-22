@@ -26,7 +26,8 @@ from foodcom_pipeline.batch.clean import run_clean
 from foodcom_pipeline.batch.sentiment import run_sentiment
 from foodcom_pipeline.batch.aggregate_user_stats import run_aggregate_user_stats
 from foodcom_pipeline.batch.cluster import run_clustering
-from foodcom_pipeline.batch.load import run_load
+from foodcom_pipeline.batch.load import run_load, load_trends
+from foodcom_pipeline.batch.tag_recipes import run_tag_recipes
 
 # ─────────────────────────────────────────────────────────────────────────
 # DAG Definition
@@ -44,7 +45,7 @@ default_args = {
 dag = DAG(
     'foodcom_batch_pipeline',
     default_args=default_args,
-    description='Food.com batch pipeline: extract → clean → sentiment → cluster → load',
+    description='Food.com batch pipeline: extract → clean → sentiment → cluster → load (trends/AI mode run async)',
     schedule_interval='@daily',
     catchup=False,
     tags=['foodcom', 'batch', 'production'],
@@ -132,6 +133,18 @@ task_load = PythonOperator(
     dag=dag,
 )
 
+task_load_trends = PythonOperator(
+    task_id='load_trends',
+    python_callable=load_trends,
+    dag=dag,
+)
+
+task_tag_recipes = PythonOperator(
+    task_id='tag_recipes',
+    python_callable=run_tag_recipes,
+    dag=dag,
+)
+
 # ─────────────────────────────────────────────────────────────────────────
 # Task Dependencies
 # ─────────────────────────────────────────────────────────────────────────
@@ -144,19 +157,24 @@ task_ensure_source_data >> [
     task_extract_google_trends,
 ]
 
-# AI Mode depends on recipes (food context) and trends (term scoring baseline)
+# Trends + AI Mode branch: runs fully async alongside the main pipeline
 [task_extract_recipes, task_extract_google_trends] >> task_extract_ai_mode
 
-# Clean phase: waits for all extract work; recipes and trends feed clean
-# transitively through ai_mode so only the remaining three are listed directly
+# load_trends runs after both extracts so all 5 tables are populated together
+[task_extract_google_trends, task_extract_ai_mode] >> task_load_trends
+
+# Clean phase: depends only on the core extracts; unblocked by trends/AI mode
 [
+    task_extract_recipes,
     task_extract_interactions,
     task_extract_usda_nutrients,
-    task_extract_ai_mode,
 ] >> task_clean
 
-# Sentiment & aggregation depend on clean
-task_clean >> [task_sentiment, task_aggregate_user_stats]
+# Tagging runs in parallel with sentiment after clean
+task_clean >> [task_sentiment, task_tag_recipes]
+
+# Aggregation reads sentiment output, so it must run after sentiment
+task_sentiment >> task_aggregate_user_stats
 
 # Clustering depends on aggregation
 task_aggregate_user_stats >> task_cluster

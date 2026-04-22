@@ -38,7 +38,15 @@ from foodcom_pipeline.batch.clean import (
     load_cleaned_recipes,
 )
 from foodcom_pipeline.batch.cluster import load_user_clusters
-from foodcom_pipeline.batch.extract import STAGING_DIR, USDA_NUTRIENTS_STAGING
+from foodcom_pipeline.batch.extract import (
+    STAGING_DIR,
+    TRENDS_RAW_STAGING,
+    TRENDS_NORMALISED_STAGING,
+    AI_MODE_RAW_STAGING,
+    AI_MODE_TERM_SCORES_STAGING,
+    MARKET_SIGNALS_STAGING,
+    USDA_NUTRIENTS_STAGING,
+)
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 from sqlalchemy import create_engine, text
 
@@ -744,27 +752,47 @@ def _log_row_counts(engine) -> None:
 # ---------------------------------------------------------------------------
 
 _TRENDS_METADATA_PATH = STAGING_DIR / 'trends_metadata.parquet'
-_TRENDS_STALENESS_DAYS = 7
+_AI_MODE_METADATA_PATH = STAGING_DIR / 'ai_mode_metadata.parquet'
+_STALENESS_DAYS = 7
+
+
+def _days_since(last_fetched) -> int:
+    if hasattr(last_fetched, 'date'):
+        last_fetched = last_fetched.date()
+    elif isinstance(last_fetched, str):
+        last_fetched = date.fromisoformat(last_fetched)
+    return (date.today() - last_fetched).days
 
 
 def is_trends_stale(seed_query: str) -> bool:
     """Returns True if trends data for *seed_query* is missing or older than 7 days."""
     if not _TRENDS_METADATA_PATH.is_file():
         return True
-
     df = pd.read_parquet(_TRENDS_METADATA_PATH)
     match = df[df['seed_query'] == seed_query]
     if match.empty:
         return True
+    return _days_since(match.iloc[0]['last_fetched_date']) > _STALENESS_DAYS
 
-    last_fetched = match.iloc[0]['last_fetched_date']
-    # Normalise to a plain date regardless of how it was stored
-    if hasattr(last_fetched, 'date'):
-        last_fetched = last_fetched.date()
-    elif isinstance(last_fetched, str):
-        last_fetched = date.fromisoformat(last_fetched)
 
-    return (date.today() - last_fetched).days > _TRENDS_STALENESS_DAYS
+def is_ai_mode_stale() -> bool:
+    """Returns True if AI Mode data is missing, older than 7 days, or absent from the DB."""
+    # Check metadata file first
+    if not _AI_MODE_METADATA_PATH.is_file():
+        return True
+    meta = pd.read_parquet(_AI_MODE_METADATA_PATH)
+    if meta.empty or _days_since(meta.iloc[0]['last_fetched_date']) > _STALENESS_DAYS:
+        return True
+    # Confirm data actually landed in the DB
+    try:
+        engine = create_engine(POSTGRES_CONN)
+        with engine.connect() as conn:
+            count = conn.execute(text("SELECT COUNT(*) FROM ai_mode_raw")).scalar()
+        if not count:
+            return True
+    except Exception:
+        return True
+    return False
 
 
 def save_trends_metadata(seed_query: str, fetched_date: date) -> None:
@@ -783,3 +811,131 @@ def save_trends_metadata(seed_query: str, fetched_date: date) -> None:
     _TRENDS_METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(_TRENDS_METADATA_PATH, index=False)
     logger.info('trends_metadata updated: %s → %s', seed_query, fetched_date)
+
+
+def save_ai_mode_metadata(fetched_date: date) -> None:
+    """Records the date of the last successful AI Mode fetch."""
+    df = pd.DataFrame([{'last_fetched_date': fetched_date}])
+    _AI_MODE_METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_AI_MODE_METADATA_PATH, index=False)
+    logger.info('ai_mode_metadata updated: %s', fetched_date)
+
+
+# ---------------------------------------------------------------------------
+# Trends + AI Mode load — pushes all signal staging files into Postgres
+# ---------------------------------------------------------------------------
+
+
+def load_trends(**context) -> None:
+    """
+    Loads all Google Trends and AI Mode staging parquet files into Postgres.
+    Creates tables on first run; subsequent runs upsert.
+
+    Tables:
+      google_trends_raw         — raw related-query scores per seed
+      google_trends_normalised  — z-score normalised related-query scores
+      ai_mode_raw               — raw text blocks from Google AI Mode
+      ai_mode_term_scores       — term frequency + normalised scores
+      market_signals            — merged AI Mode + Trends combined score
+    """
+    engine = create_engine(POSTGRES_CONN)
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS google_trends_raw (
+                seed_query    TEXT    NOT NULL,
+                related_query TEXT    NOT NULL,
+                query_type    TEXT    NOT NULL,
+                fetched_date  DATE    NOT NULL,
+                raw_value     INTEGER NOT NULL,
+                PRIMARY KEY (seed_query, related_query, query_type, fetched_date)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS google_trends_normalised (
+                seed_query       TEXT             NOT NULL,
+                related_query    TEXT             NOT NULL,
+                query_type       TEXT             NOT NULL,
+                fetched_date     DATE             NOT NULL,
+                raw_value        INTEGER          NOT NULL,
+                normalised_score DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (seed_query, related_query, query_type, fetched_date)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ai_mode_raw (
+                seed_query   TEXT    NOT NULL,
+                block_index  INTEGER NOT NULL,
+                title        TEXT,
+                body         TEXT    NOT NULL,
+                fetched_date DATE    NOT NULL,
+                PRIMARY KEY (seed_query, block_index, fetched_date)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ai_mode_term_scores (
+                term             TEXT             NOT NULL,
+                raw_frequency    INTEGER          NOT NULL,
+                normalised_score DOUBLE PRECISION NOT NULL,
+                fetched_date     DATE             NOT NULL,
+                PRIMARY KEY (term, fetched_date)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS market_signals (
+                term           TEXT             NOT NULL,
+                ai_mode_score  DOUBLE PRECISION,
+                trends_score   DOUBLE PRECISION,
+                combined_score DOUBLE PRECISION,
+                fetched_date   DATE             NOT NULL,
+                PRIMARY KEY (term, fetched_date)
+            )
+        """))
+
+    _load_staging_table(
+        engine, TRENDS_RAW_STAGING, 'google_trends_raw',
+        cols='seed_query, related_query, query_type, fetched_date, raw_value',
+        conflict='(seed_query, related_query, query_type, fetched_date)',
+        update='raw_value = EXCLUDED.raw_value',
+    )
+    _load_staging_table(
+        engine, TRENDS_NORMALISED_STAGING, 'google_trends_normalised',
+        cols='seed_query, related_query, query_type, fetched_date, raw_value, normalised_score',
+        conflict='(seed_query, related_query, query_type, fetched_date)',
+        update='raw_value = EXCLUDED.raw_value, normalised_score = EXCLUDED.normalised_score',
+    )
+    _load_staging_table(
+        engine, AI_MODE_RAW_STAGING, 'ai_mode_raw',
+        cols='seed_query, block_index, title, body, fetched_date',
+        conflict='(seed_query, block_index, fetched_date)',
+        update='title = EXCLUDED.title, body = EXCLUDED.body',
+    )
+    _load_staging_table(
+        engine, AI_MODE_TERM_SCORES_STAGING, 'ai_mode_term_scores',
+        cols='term, raw_frequency, normalised_score, fetched_date',
+        conflict='(term, fetched_date)',
+        update='raw_frequency = EXCLUDED.raw_frequency, normalised_score = EXCLUDED.normalised_score',
+    )
+    _load_staging_table(
+        engine, MARKET_SIGNALS_STAGING, 'market_signals',
+        cols='term, ai_mode_score, trends_score, combined_score, fetched_date',
+        conflict='(term, fetched_date)',
+        update='ai_mode_score = EXCLUDED.ai_mode_score, trends_score = EXCLUDED.trends_score, combined_score = EXCLUDED.combined_score',
+    )
+
+
+def _load_staging_table(engine, path, table: str, cols: str, conflict: str, update: str) -> None:
+    """Reads a staging parquet file and bulk-upserts it into *table*."""
+    if not path.is_file():
+        logger.warning('Staging file missing for %s — skipping.', table)
+        return
+    df = pd.read_parquet(path)
+    named = ', '.join(f':{c.strip()}' for c in cols.split(','))
+    sql = f"""
+        INSERT INTO {table} ({cols})
+        VALUES ({named})
+        ON CONFLICT {conflict}
+        DO UPDATE SET {update}
+    """
+    _bulk_upsert(engine, df, sql)
+    logger.info('Loaded %d rows into %s', len(df), table)

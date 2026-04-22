@@ -17,6 +17,7 @@ Cleaning steps are divided into two categories:
 
 import ast
 import logging
+import os
 import pickle
 import re
 import sys
@@ -30,6 +31,7 @@ from foodcom_pipeline.batch.extract import (
     RECIPES_STAGING,
     STAGING_DIR,
     USDA_NUTRIENTS_STAGING,
+    atomic_parquet,
     _load_ingr_map,
 )
 
@@ -62,6 +64,18 @@ MAX_RECIPE_NAME_LENGTH = 200
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _atomic_parquet(df: pd.DataFrame, dest) -> None:
+    """Write df to a .tmp file then rename, avoiding EDEADLK on macOS bind mounts."""
+    tmp = str(dest) + '.tmp'
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, dest)
+
+
+# ---------------------------------------------------------------------------
 # Entry point called by Airflow
 # ---------------------------------------------------------------------------
 
@@ -75,6 +89,13 @@ def run_clean(**context) -> None:
 
     recipes_df = pd.read_parquet(RECIPES_STAGING)
     interactions_df = pd.read_parquet(INTERACTIONS_STAGING)
+
+    if interactions_df.empty and INTERACTIONS_CLEAN.exists():
+        logger.info(
+            'Interactions staging is empty (no new data since last run) and '
+            'clean file already exists — skipping interactions clean to preserve existing output.'
+        )
+        interactions_df = None
 
     ingr_map: dict[str, str] | None = None
     if INGR_MAP_PKL.exists():
@@ -99,8 +120,8 @@ def run_clean(**context) -> None:
     interactions_clean = clean_interactions(interactions_df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    recipes_clean.to_parquet(RECIPES_CLEAN, index=False)
-    interactions_clean.to_parquet(INTERACTIONS_CLEAN, index=False)
+    _atomic_parquet(recipes_clean, RECIPES_CLEAN)
+    _atomic_parquet(interactions_clean, INTERACTIONS_CLEAN)
 
     logger.info('Clean step complete.')
     logger.info(f'  Recipes    : {len(recipes_df):,} → {len(recipes_clean):,} rows')

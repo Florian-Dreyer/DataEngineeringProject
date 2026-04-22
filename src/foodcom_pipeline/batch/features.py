@@ -57,7 +57,7 @@ from pathlib import Path
 
 import pandas as pd
 from foodcom_pipeline.batch.clean import load_cleaned_recipes
-from foodcom_pipeline.batch.extract import STAGING_DIR
+from foodcom_pipeline.batch.extract import STAGING_DIR, atomic_parquet
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 
 logger = logging.getLogger(__name__)
@@ -137,9 +137,9 @@ def run_features(**context) -> None:
     ingredient_features = _compute_ingredient_features(interactions, recipes)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    user_stats.to_parquet(USER_STATS_STAGING, index=False)
-    recipe_ratings.to_parquet(RECIPE_SENTIMENT_STAGING, index=False)
-    ingredient_features.to_parquet(INGREDIENT_FEATURES_STAGING, index=False)
+    atomic_parquet(user_stats, USER_STATS_STAGING)
+    atomic_parquet(recipe_ratings, RECIPE_SENTIMENT_STAGING)
+    atomic_parquet(ingredient_features, INGREDIENT_FEATURES_STAGING)
 
     n_candidates = int(ingredient_features['is_substitution_candidate'].sum())
     logger.info(

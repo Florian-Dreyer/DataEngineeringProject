@@ -19,12 +19,24 @@ from pathlib import Path
 import pickle
 import sys
 import types
-from typing import Any
+from typing import Any, Union
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 
 logger = logging.getLogger(__name__)
+
+
+def atomic_parquet(df: pd.DataFrame, dest: Union[Path, str]) -> None:
+    """Write df to a .tmp file then atomically rename to dest.
+
+    Avoids EDEADLK (errno 35) on macOS Docker bind mounts when concurrent
+    tasks read from the same staging directory during a write.
+    """
+    tmp = str(dest) + '.tmp'
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, dest)
+
 
 # ---------------------------------------------------------------------------
 # Config — in production these come from Airflow Variables or environment vars
@@ -328,7 +340,7 @@ def extract_recipes(**context) -> None:
     _validate_recipes(df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(RECIPES_STAGING, index=False)
+    atomic_parquet(df, RECIPES_STAGING)
 
     logger.info(f'Recipes staged to {RECIPES_STAGING}')
 
@@ -396,21 +408,13 @@ def extract_interactions(**context) -> None:
         logger.info(f'Initial load: processing all {total_rows} interactions')
 
     if df.empty:
+        # Watermark filtered everything — warehouse is already up to date.
+        # Keep the existing staging file so downstream tasks (clean, sentiment)
+        # continue to work with the data from the last successful run.
         logger.info(
-            'No new interactions after watermark — staging empty parquet so paths '
-            'exist for downstream (e.g. clean when check_has_new_data is forced).'
+            'No new interactions after watermark filter — warehouse is current. '
+            'Preserving existing interactions staging file for downstream tasks.'
         )
-        STAGING_DIR.mkdir(parents=True, exist_ok=True)
-        empty = pd.DataFrame(
-            {
-                'user_id': pd.Series(dtype='int64'),
-                'recipe_id': pd.Series(dtype='int64'),
-                'date': pd.Series(dtype='datetime64[ns]'),
-                'rating': pd.Series(dtype='int8'),
-                'review': pd.Series(dtype='object'),
-            }
-        )
-        empty.to_parquet(INTERACTIONS_STAGING, index=False)
         context['ti'].xcom_push(key='interactions_record_count', value=0)
         context['ti'].xcom_push(key='has_new_data', value=False)
         return
@@ -419,7 +423,7 @@ def extract_interactions(**context) -> None:
     _validate_interactions(df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(INTERACTIONS_STAGING, index=False)
+    atomic_parquet(df, INTERACTIONS_STAGING)
 
     logger.info(f'Interactions staged to {INTERACTIONS_STAGING}')
 
@@ -792,7 +796,7 @@ def extract_usda_nutrients(**context) -> None:
                  **_empty_usda_nutrient_row())
             for ing in canonical_ingredients
         ]
-        pd.DataFrame(empty_rows).to_parquet(USDA_NUTRIENTS_STAGING, index=False)
+        atomic_parquet(pd.DataFrame(empty_rows), USDA_NUTRIENTS_STAGING)
         context['ti'].xcom_push(key='usda_coverage_rate', value=0.0)
         context['ti'].xcom_push(key='usda_rows', value=len(canonical_ingredients))
         context['ti'].xcom_push(key='usda_extract_skipped', value=True)
@@ -821,7 +825,7 @@ def extract_usda_nutrients(**context) -> None:
             logger.info(f'USDA local lookup progress: {i}/{len(canonical_ingredients)}')
 
     usda_df = pd.DataFrame(rows)
-    usda_df.to_parquet(USDA_NUTRIENTS_STAGING, index=False)
+    atomic_parquet(usda_df, USDA_NUTRIENTS_STAGING)
 
     coverage = int(usda_df['calories_per_100g'].notna().sum())
     coverage_rate = coverage / max(1, len(usda_df))
@@ -850,24 +854,27 @@ def extract_ai_mode(**context) -> None:
       ai_mode_term_scores.parquet  — term frequencies + normalised scores
       market_signals.parquet       — merged AI Mode + Trends scores per term
 
-    SERPAPI_KEY must be set as an Airflow Variable; raises clearly if missing.
+    SERPAPI_KEY must be set as an environment variable.
     """
-    from airflow.models import Variable
+    from foodcom_pipeline.batch.load import is_ai_mode_stale, save_ai_mode_metadata
     from foodcom_pipeline.extraction.ai_mode import (
         fetch_ai_mode_blocks,
         score_terms,
         merge_with_trends,
     )
 
-    try:
-        api_key = Variable.get('SERPAPI_KEY')
-    except KeyError:
-        raise RuntimeError('SERPAPI_KEY Airflow Variable not set')
+    if not is_ai_mode_stale():
+        logger.info('AI Mode data is fresh, skipping fetch.')
+        return
+
+    api_key = os.environ.get('SERPAPI_KEY')
+    if not api_key:
+        raise RuntimeError('SERPAPI_KEY environment variable not set')
 
     raw_df = fetch_ai_mode_blocks(_AI_MODE_SEEDS, api_key)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    raw_df.to_parquet(AI_MODE_RAW_STAGING, index=False)
+    atomic_parquet(raw_df, AI_MODE_RAW_STAGING)
     logger.info('AI Mode raw blocks staged: %d rows → %s', len(raw_df), AI_MODE_RAW_STAGING)
 
     if raw_df.empty:
@@ -875,17 +882,19 @@ def extract_ai_mode(**context) -> None:
         return
 
     term_scores = score_terms(raw_df)
-    term_scores.to_parquet(AI_MODE_TERM_SCORES_STAGING, index=False)
+    atomic_parquet(term_scores, AI_MODE_TERM_SCORES_STAGING)
     logger.info(
         'AI Mode term scores staged: %d terms → %s',
         len(term_scores), AI_MODE_TERM_SCORES_STAGING,
     )
 
     market_signals = merge_with_trends(term_scores, TRENDS_NORMALISED_STAGING)
-    market_signals.to_parquet(MARKET_SIGNALS_STAGING, index=False)
+    atomic_parquet(market_signals, MARKET_SIGNALS_STAGING)
     logger.info(
         'Market signals staged: %d terms → %s', len(market_signals), MARKET_SIGNALS_STAGING
     )
+
+    save_ai_mode_metadata(date.today())
 
 
 def extract_google_trends(**context) -> None:
@@ -914,8 +923,8 @@ def extract_google_trends(**context) -> None:
     normalised_df = batch_normalise(raw_df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    raw_df.to_parquet(TRENDS_RAW_STAGING, index=False)
-    normalised_df.to_parquet(TRENDS_NORMALISED_STAGING, index=False)
+    atomic_parquet(raw_df, TRENDS_RAW_STAGING)
+    atomic_parquet(normalised_df, TRENDS_NORMALISED_STAGING)
     logger.info('Trends staged: %d rows → %s', len(raw_df), STAGING_DIR)
 
     for seed in raw_df['seed_query'].unique():

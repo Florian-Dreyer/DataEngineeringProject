@@ -20,7 +20,7 @@ import logging
 import numpy as np
 import pandas as pd
 from foodcom_pipeline.batch.clean import load_cleaned_interactions
-from foodcom_pipeline.batch.extract import STAGING_DIR
+from foodcom_pipeline.batch.extract import STAGING_DIR, atomic_parquet
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ def run_sentiment(**context) -> None:
     df = _score_vader(df, scoreable)
     df = _compute_rating_sentiment_gap(df)
 
-    df.to_parquet(SENTIMENT_STAGING, index=False)
+    atomic_parquet(df, SENTIMENT_STAGING)
     logger.info(f'Sentiment step complete. Staged to {SENTIMENT_STAGING}')
 
     scored = df['sentiment_score'].notna().sum()
