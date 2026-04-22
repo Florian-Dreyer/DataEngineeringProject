@@ -117,17 +117,20 @@ def run_clean(**context) -> None:
             logger.warning(f'Could not load {USDA_NUTRIENTS_STAGING}: {e}')
 
     recipes_clean = clean_recipes(recipes_df, ingr_map=ingr_map, usda_nutrients=usda_nutrients)
-    interactions_clean = clean_interactions(interactions_df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
     _atomic_parquet(recipes_clean, RECIPES_CLEAN)
-    _atomic_parquet(interactions_clean, INTERACTIONS_CLEAN)
+
+    if interactions_df is not None:
+        interactions_clean = clean_interactions(interactions_df)
+        _atomic_parquet(interactions_clean, INTERACTIONS_CLEAN)
+    else:
+        interactions_clean = pd.read_parquet(INTERACTIONS_CLEAN)
+        logger.info('Interactions clean preserved from previous run (%d rows).', len(interactions_clean))
 
     logger.info('Clean step complete.')
     logger.info(f'  Recipes    : {len(recipes_df):,} → {len(recipes_clean):,} rows')
-    logger.info(
-        f'  Interactions: {len(interactions_df):,} → {len(interactions_clean):,} rows'
-    )
+    logger.info(f'  Interactions: {len(interactions_clean):,} rows')
 
     context['ti'].xcom_push(key='recipes_clean_count', value=len(recipes_clean))
     context['ti'].xcom_push(
