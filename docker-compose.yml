@@ -15,6 +15,7 @@ services:
       context: .
       dockerfile: docker/airflow/Dockerfile
     image: foodcom-airflow:2.9.3-local
+    hostname: airflow
     depends_on:
       - postgres
     environment:

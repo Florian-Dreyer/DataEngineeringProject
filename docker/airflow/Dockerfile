@@ -8,10 +8,17 @@ RUN pip install --no-cache-dir \
     numpy \
     scipy \
     scikit-learn \
+    pytrends \
+    google-generativeai \
     requests \
     sqlalchemy \
     psycopg2-binary \
+    kafka-python \
+    nltk \
+    vaderSentiment \
+    xgboost \
+    python-dotenv \
+    tqdm \
     transformers \
-    torch \
-    vaderSentiment
+    torch
 
