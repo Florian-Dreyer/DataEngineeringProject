@@ -47,14 +47,19 @@ Output columns — ingredient_features.parquet (one row per canonical_ingredient
   avg_rating                : mean recipe avg_rating across those recipes
   avg_sentiment             : mean recipe avg_sentiment across those recipes
   is_substitution_candidate : True when avg_rating < threshold and recipe_count >= min_count
-  trend_index               : Google Trends index (null until extract_google_trends is added)
+  trend_index               : reserved nullable column for compatibility
 """
 
 import logging
+import ast
+import json
+import os
 
 import pandas as pd
+import requests
 from foodcom_pipeline.batch.clean import load_cleaned_recipes
 from foodcom_pipeline.batch.extract import STAGING_DIR
+from foodcom_pipeline.batch.ingredient_clusters import load_ingredient_clusters
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 
 logger = logging.getLogger(__name__)
@@ -66,6 +71,7 @@ logger = logging.getLogger(__name__)
 USER_STATS_STAGING = STAGING_DIR / 'user_stats.parquet'
 RECIPE_SENTIMENT_STAGING = STAGING_DIR / 'recipe_sentiment_ratings.parquet'
 INGREDIENT_FEATURES_STAGING = STAGING_DIR / 'ingredient_features.parquet'
+SUBSTITUTION_ENGINE_STAGING = STAGING_DIR / 'substitution_engine.parquet'
 
 # Ingredient categories for user taste segmentation feature vector.
 # Keyword matching on already-normalised canonical ingredient strings.
@@ -104,6 +110,11 @@ BAYESIAN_PSEUDO_COUNT = 10
 SUBSTITUTION_RATING_THRESHOLD = 3.5  # avg_rating below this → candidate
 SUBSTITUTION_MIN_RECIPE_COUNT = 5    # ingredient must appear in at least this many recipes
 
+# Ollama compatibility gate config.
+OLLAMA_BASE_URL = os.getenv('FOODCOM_OLLAMA_BASE_URL', 'http://host.docker.internal:11434')
+OLLAMA_MODEL = os.getenv('FOODCOM_OLLAMA_MODEL', 'llama3.1:8b')
+OLLAMA_TIMEOUT_SECONDS = float(os.getenv('FOODCOM_OLLAMA_TIMEOUT_SECONDS', '8'))
+
 
 # ---------------------------------------------------------------------------
 # Entry point called by Airflow
@@ -132,11 +143,18 @@ def run_features(**context) -> None:
 
     recipe_ratings = _compute_recipe_sentiment_ratings(interactions)
     ingredient_features = _compute_ingredient_features(interactions, recipes)
+    ingredient_clusters = load_ingredient_clusters()
+    substitution_engine = _compute_substitution_engine(
+        ingredient_features,
+        recipes,
+        ingredient_clusters=ingredient_clusters,
+    )
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
     user_stats.to_parquet(USER_STATS_STAGING, index=False)
     recipe_ratings.to_parquet(RECIPE_SENTIMENT_STAGING, index=False)
     ingredient_features.to_parquet(INGREDIENT_FEATURES_STAGING, index=False)
+    substitution_engine.to_parquet(SUBSTITUTION_ENGINE_STAGING, index=False)
 
     n_candidates = int(ingredient_features['is_substitution_candidate'].sum())
     logger.info(
@@ -150,6 +168,7 @@ def run_features(**context) -> None:
     context['ti'].xcom_push(key='n_users', value=len(user_stats))
     context['ti'].xcom_push(key='n_recipe_ratings', value=len(recipe_ratings))
     context['ti'].xcom_push(key='n_substitution_candidates', value=n_candidates)
+    context['ti'].xcom_push(key='n_substitution_pairs', value=len(substitution_engine))
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +444,7 @@ def _compute_ingredient_features(
     Computes per-canonical-ingredient aggregate features and flags substitution
     candidates (ingredients appearing in low-rated recipes).
 
-    trend_index is left null until extract_google_trends is wired in.
+    trend_index is retained as a nullable reserved field for compatibility.
     """
     if 'ingredients_canonical_list' not in recipes.columns:
         logger.warning(
@@ -482,7 +501,7 @@ def _compute_ingredient_features(
         & (ingr_features['recipe_count'] >= SUBSTITUTION_MIN_RECIPE_COUNT)
     )
 
-    # Placeholder for Google Trends integration
+    # Reserved nullable field (Google Trends no longer used in substitution logic).
     ingr_features['trend_index'] = None
 
     n_candidates = int(ingr_features['is_substitution_candidate'].sum())
@@ -493,6 +512,470 @@ def _compute_ingredient_features(
         f'recipe_count >= {SUBSTITUTION_MIN_RECIPE_COUNT}).'
     )
     return ingr_features
+
+
+def _compute_ingredient_nutrition_profiles(recipes: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes average nutrient profile per canonical ingredient by exploding
+    recipe ingredient lists and averaging recipe-level nutrient columns.
+    """
+    required_cols = [
+        'id',
+        'ingredients_canonical_list',
+        'protein',
+        'saturated_fat',
+        'sugar',
+        'sodium',
+        'calories',
+    ]
+    if not set(required_cols).issubset(recipes.columns):
+        return pd.DataFrame(
+            columns=[
+                'canonical_ingredient',
+                'protein',
+                'saturated_fat',
+                'sugar',
+                'sodium',
+                'calories',
+            ]
+        )
+
+    exploded = (
+        recipes[required_cols]
+        .rename(columns={'id': 'recipe_id'})
+        .explode('ingredients_canonical_list')
+        .rename(columns={'ingredients_canonical_list': 'canonical_ingredient'})
+        .dropna(subset=['canonical_ingredient'])
+    )
+
+    nutrient_profiles = (
+        exploded.groupby('canonical_ingredient')
+        .agg(
+            protein=('protein', 'mean'),
+            saturated_fat=('saturated_fat', 'mean'),
+            sugar=('sugar', 'mean'),
+            sodium=('sodium', 'mean'),
+            calories=('calories', 'mean'),
+        )
+        .reset_index()
+    )
+    return nutrient_profiles.round(4)
+
+
+def _compute_substitution_engine(
+    ingredient_features: pd.DataFrame,
+    recipes: pd.DataFrame,
+    *,
+    ingredient_clusters: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Generates ingredient substitution recommendations.
+
+    Logic aligned with the report:
+      - Start from low-performing substitution candidates
+      - Rank alternatives with stronger rating/sentiment and trend momentum
+      - Attach nutrition deltas (protein up, sugar/sodium/sat-fat down preferred)
+    """
+    required_cols = {
+        'canonical_ingredient',
+        'recipe_count',
+        'avg_rating',
+        'avg_sentiment',
+        'is_substitution_candidate',
+    }
+    if ingredient_features.empty or not required_cols.issubset(ingredient_features.columns):
+        return pd.DataFrame(
+            columns=[
+                'candidate_ingredient',
+                'substitute_ingredient',
+                'recommendation_score',
+                'rating_delta',
+                'sentiment_delta',
+                'trend_score',
+                'protein_delta',
+                'saturated_fat_delta',
+                'sugar_delta',
+                'sodium_delta',
+                'calories_delta',
+                'health_delta',
+            ]
+        )
+
+    if (
+        ingredient_clusters is None
+        or ingredient_clusters.empty
+        or 'canonical_ingredient' not in ingredient_clusters.columns
+        or 'ingredient_cluster_id' not in ingredient_clusters.columns
+    ):
+        logger.warning(
+            'Ingredient clusters are missing/empty; no substitution pairs will be produced.'
+        )
+        return pd.DataFrame(
+            columns=[
+                'candidate_ingredient',
+                'substitute_ingredient',
+                'recommendation_score',
+                'rating_delta',
+                'sentiment_delta',
+                'trend_score',
+                'protein_delta',
+                'saturated_fat_delta',
+                'sugar_delta',
+                'sodium_delta',
+                'calories_delta',
+                'health_delta',
+            ]
+        )
+
+    base = ingredient_features.copy()
+    cluster_map = ingredient_clusters[
+        ['canonical_ingredient', 'ingredient_cluster_id']
+    ].drop_duplicates('canonical_ingredient')
+    base = base.merge(cluster_map, on='canonical_ingredient', how='inner')
+    if base.empty:
+        logger.warning(
+            'No overlap between ingredient features and nutrient cluster map.'
+        )
+        return pd.DataFrame(
+            columns=[
+                'candidate_ingredient',
+                'substitute_ingredient',
+                'recommendation_score',
+                'rating_delta',
+                'sentiment_delta',
+                'trend_score',
+                'protein_delta',
+                'saturated_fat_delta',
+                'sugar_delta',
+                'sodium_delta',
+                'calories_delta',
+                'health_delta',
+            ]
+        )
+
+    nutrient_profiles = _compute_ingredient_nutrition_profiles(recipes)
+    base = base.merge(nutrient_profiles, on='canonical_ingredient', how='left')
+
+    candidates = base[base['is_substitution_candidate']].copy()
+    if candidates.empty:
+        return pd.DataFrame(
+            columns=[
+                'candidate_ingredient',
+                'substitute_ingredient',
+                'recommendation_score',
+                'rating_delta',
+                'sentiment_delta',
+                'trend_score',
+                'protein_delta',
+                'saturated_fat_delta',
+                'sugar_delta',
+                'sodium_delta',
+                'calories_delta',
+                'health_delta',
+            ]
+        )
+
+    pool = base[base['recipe_count'] >= SUBSTITUTION_MIN_RECIPE_COUNT].copy()
+    if pool.empty:
+        return pd.DataFrame(
+            columns=[
+                'candidate_ingredient',
+                'substitute_ingredient',
+                'recommendation_score',
+                'rating_delta',
+                'sentiment_delta',
+                'trend_score',
+                'protein_delta',
+                'saturated_fat_delta',
+                'sugar_delta',
+                'sodium_delta',
+                'calories_delta',
+                'health_delta',
+            ]
+        )
+    pool = pool.reset_index(drop=True)
+
+    rows: list[dict] = []
+    ollama_cache: dict[tuple[str, str], bool] = {}
+    ingredient_recipe_map = _build_ingredient_recipe_map(recipes)
+    ingredient_context_map = _build_ingredient_context_map(recipes)
+
+    for _, cand in candidates.iterrows():
+        candidate_ing = str(cand['canonical_ingredient'])
+        candidate_cluster_id = cand['ingredient_cluster_id']
+
+        # First-layer compatibility gate: candidates can only swap within the
+        # same nutrient-derived ingredient cluster.
+        alts = pool[
+            (pool['canonical_ingredient'] != cand['canonical_ingredient'])
+            & (pool['ingredient_cluster_id'] == candidate_cluster_id)
+        ].copy()
+        logger.info(
+            "Cluster hard filter for candidate '%s' (cluster_id=%s): %s alternatives pass.",
+            candidate_ing,
+            candidate_cluster_id,
+            len(alts),
+        )
+
+        # FOR NOW: Ollama compatibility gate is disabled to allow immediate scoring
+        # on all alternatives that pass the same-cluster hard filter.
+        # alts = alts[
+        #     alts['canonical_ingredient'].astype(str).apply(
+        #         lambda ing: _ollama_substitution_compatible(
+        #             candidate_ing,
+        #             str(ing),
+        #             ollama_cache,
+        #         )
+        #     )
+        # ]
+        if alts.empty:
+            continue
+
+        candidate_recipe_ids = ingredient_recipe_map.get(candidate_ing, set())
+        candidate_context = ingredient_context_map.get(candidate_ing, {'is_baking': False})
+        alts['rating_delta'] = alts['avg_rating'] - cand['avg_rating']
+        alts['sentiment_delta'] = alts['avg_sentiment'] - cand['avg_sentiment']
+        alts['protein_delta'] = alts['protein'] - cand['protein']
+        alts['saturated_fat_delta'] = alts['saturated_fat'] - cand['saturated_fat']
+        alts['sugar_delta'] = alts['sugar'] - cand['sugar']
+        alts['sodium_delta'] = alts['sodium'] - cand['sodium']
+        alts['calories_delta'] = alts['calories'] - cand['calories']
+        alts['cooccurrence_score'] = alts['canonical_ingredient'].astype(str).apply(
+            lambda alt_ing: _ingredient_cooccurrence_score(
+                candidate_recipe_ids,
+                ingredient_recipe_map.get(str(alt_ing), set()),
+            )
+        )
+        alts['context_penalty'] = alts['canonical_ingredient'].astype(str).apply(
+            lambda alt_ing: _context_penalty(
+                candidate_context,
+                ingredient_context_map.get(str(alt_ing), {'is_baking': False}),
+            )
+        )
+
+        alts['health_delta'] = (
+            0.4 * alts['protein_delta'].fillna(0.0)
+            - 0.25 * alts['saturated_fat_delta'].fillna(0.0)
+            - 0.2 * alts['sugar_delta'].fillna(0.0)
+            - 0.15 * alts['sodium_delta'].fillna(0.0)
+        )
+
+        alts['recommendation_score'] = (
+            0.5 * alts['rating_delta'].fillna(0.0)
+            + 0.2 * alts['sentiment_delta'].fillna(0.0)
+            + 0.2 * alts['cooccurrence_score'].fillna(0.0)
+            + 0.1 * alts['health_delta'].fillna(0.0)
+            - alts['context_penalty'].fillna(0.0)
+        )
+
+        # Keep only alternatives that produce a net positive recommendation score.
+        alts = alts[alts['recommendation_score'] > 0.0]
+        if alts.empty:
+            continue
+
+        for _, row in alts.iterrows():
+            rows.append(
+                {
+                    'candidate_ingredient': cand['canonical_ingredient'],
+                    'substitute_ingredient': row['canonical_ingredient'],
+                    'recommendation_score': round(float(row['recommendation_score']), 4),
+                    'rating_delta': round(float(row['rating_delta']), 4),
+                    'sentiment_delta': round(float(row['sentiment_delta']), 4),
+                    # Preserved for backward compatibility with existing DB schema/UI queries.
+                    'trend_score': None,
+                    'protein_delta': round(float(row['protein_delta']), 4)
+                    if pd.notna(row['protein_delta'])
+                    else None,
+                    'saturated_fat_delta': round(float(row['saturated_fat_delta']), 4)
+                    if pd.notna(row['saturated_fat_delta'])
+                    else None,
+                    'sugar_delta': round(float(row['sugar_delta']), 4)
+                    if pd.notna(row['sugar_delta'])
+                    else None,
+                    'sodium_delta': round(float(row['sodium_delta']), 4)
+                    if pd.notna(row['sodium_delta'])
+                    else None,
+                    'calories_delta': round(float(row['calories_delta']), 4)
+                    if pd.notna(row['calories_delta'])
+                    else None,
+                    'health_delta': round(float(row['health_delta']), 4),
+                }
+            )
+
+    recommendations = pd.DataFrame(rows)
+    if recommendations.empty:
+        return pd.DataFrame(
+            columns=[
+                'candidate_ingredient',
+                'substitute_ingredient',
+                'recommendation_score',
+                'rating_delta',
+                'sentiment_delta',
+                'trend_score',
+                'protein_delta',
+                'saturated_fat_delta',
+                'sugar_delta',
+                'sodium_delta',
+                'calories_delta',
+                'health_delta',
+            ]
+        )
+
+    recommendations = recommendations.drop_duplicates(
+        subset=['candidate_ingredient', 'substitute_ingredient']
+    ).sort_values(
+        ['candidate_ingredient', 'recommendation_score'],
+        ascending=[True, False],
+    ).reset_index(drop=True)
+
+    logger.info(
+        f'Substitution engine recommendations generated: {len(recommendations):,} '
+        f'pairs across {recommendations["candidate_ingredient"].nunique():,} candidates.'
+    )
+    return recommendations
+
+
+def _ollama_substitution_compatible(
+    candidate_ingredient: str,
+    alt_ingredient: str,
+    cache: dict[tuple[str, str], bool],
+) -> bool:
+    """
+    Uses a local Ollama model to decide if alt_ingredient is a plausible substitute
+    for candidate_ingredient in general cooking contexts.
+    """
+    key = (candidate_ingredient.strip().lower(), alt_ingredient.strip().lower())
+    if key in cache:
+        return cache[key]
+
+    prompt = (
+        'Decide substitution compatibility for cooking ingredients. '
+        'Respond as strict JSON only: {"compatible": true|false}. '
+        f'Candidate ingredient: "{candidate_ingredient}". '
+        f'Alternative ingredient: "{alt_ingredient}". '
+        'Return true only if the alternative is generally a plausible substitute '
+        'for the candidate (not merely commonly co-used).'
+    )
+    payload = {
+        'model': OLLAMA_MODEL,
+        'prompt': prompt,
+        'stream': False,
+        'format': 'json',
+    }
+
+    compatible = False
+    try:
+        resp = requests.post(
+            f'{OLLAMA_BASE_URL.rstrip("/")}/api/generate',
+            json=payload,
+            timeout=OLLAMA_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get('response', '{}')
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        compatible = bool(parsed.get('compatible', False))
+    except Exception as e:
+        logger.warning(
+            'Ollama compatibility gate failed for pair (%s -> %s): %s',
+            candidate_ingredient,
+            alt_ingredient,
+            e,
+        )
+        compatible = False
+
+    cache[key] = compatible
+    return compatible
+
+
+def _safe_to_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip().lower() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        txt = value.strip()
+        if not txt:
+            return []
+        if txt.startswith('[') and txt.endswith(']'):
+            try:
+                parsed = ast.literal_eval(txt)
+                if isinstance(parsed, list):
+                    return [str(v).strip().lower() for v in parsed if str(v).strip()]
+            except Exception:
+                pass
+        if '|' in txt:
+            return [v.strip().lower() for v in txt.split('|') if v.strip()]
+        return [txt.lower()]
+    if hasattr(value, '__iter__'):
+        return [str(v).strip().lower() for v in value if str(v).strip()]
+    return []
+
+
+def _build_ingredient_recipe_map(recipes: pd.DataFrame) -> dict[str, set[int]]:
+    if recipes.empty or 'id' not in recipes.columns or 'ingredients_canonical_list' not in recipes.columns:
+        return {}
+    exploded = (
+        recipes[['id', 'ingredients_canonical_list']]
+        .rename(columns={'id': 'recipe_id'})
+        .explode('ingredients_canonical_list')
+        .dropna(subset=['ingredients_canonical_list'])
+    )
+    exploded['ingredients_canonical_list'] = exploded['ingredients_canonical_list'].astype(str).str.lower()
+    out: dict[str, set[int]] = {}
+    for ing, grp in exploded.groupby('ingredients_canonical_list'):
+        out[str(ing)] = set(grp['recipe_id'].astype(int).tolist())
+    return out
+
+
+def _build_ingredient_context_map(recipes: pd.DataFrame) -> dict[str, dict[str, bool]]:
+    if recipes.empty or 'id' not in recipes.columns or 'ingredients_canonical_list' not in recipes.columns:
+        return {}
+    tags_col = 'tags' if 'tags' in recipes.columns else None
+    if tags_col is None:
+        return {}
+
+    ctx = recipes[['id', 'ingredients_canonical_list', tags_col]].rename(columns={'id': 'recipe_id'}).copy()
+    ctx['tags_list'] = ctx[tags_col].apply(_safe_to_list)
+    ctx['is_baking'] = ctx['tags_list'].apply(
+        lambda tags: any(
+            any(k in tag for k in ['bake', 'baking', 'cookie', 'cake', 'dessert', 'bread', 'pastry'])
+            for tag in tags
+        )
+    )
+    exploded = ctx[['recipe_id', 'ingredients_canonical_list', 'is_baking']].explode('ingredients_canonical_list')
+    exploded = exploded.dropna(subset=['ingredients_canonical_list'])
+    exploded['ingredients_canonical_list'] = exploded['ingredients_canonical_list'].astype(str).str.lower()
+
+    out: dict[str, dict[str, bool]] = {}
+    for ing, grp in exploded.groupby('ingredients_canonical_list'):
+        baking_rate = float(grp['is_baking'].mean()) if len(grp) else 0.0
+        out[str(ing)] = {'is_baking': baking_rate >= 0.5}
+    return out
+
+
+def _ingredient_cooccurrence_score(candidate_recipe_ids: set[int], alt_recipe_ids: set[int]) -> float:
+    if not candidate_recipe_ids or not alt_recipe_ids:
+        return 0.0
+    inter = len(candidate_recipe_ids.intersection(alt_recipe_ids))
+    union = len(candidate_recipe_ids.union(alt_recipe_ids))
+    if union == 0:
+        return 0.0
+    return inter / union
+
+
+def _context_penalty(
+    candidate_context: dict[str, bool],
+    alt_context: dict[str, bool],
+) -> float:
+    """
+    Penalize substitutes that violate dominant recipe context.
+    Example: baking-heavy candidate should map to baking-compatible substitutes.
+    """
+    penalty = 0.0
+    if candidate_context.get('is_baking', False):
+        if not alt_context.get('is_baking', False):
+            penalty += 0.15
+    return penalty
 
 
 # ---------------------------------------------------------------------------
@@ -510,3 +993,7 @@ def load_recipe_sentiment_ratings() -> pd.DataFrame:
 
 def load_ingredient_features() -> pd.DataFrame:
     return pd.read_parquet(INGREDIENT_FEATURES_STAGING)
+
+
+def load_substitution_engine() -> pd.DataFrame:
+    return pd.read_parquet(SUBSTITUTION_ENGINE_STAGING)

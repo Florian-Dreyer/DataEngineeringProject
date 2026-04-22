@@ -39,6 +39,11 @@ from foodcom_pipeline.batch.clean import (
 )
 from foodcom_pipeline.batch.cluster import load_user_clusters
 from foodcom_pipeline.batch.extract import USDA_NUTRIENTS_STAGING
+from foodcom_pipeline.batch.features import (
+    load_recipe_sentiment_ratings,
+    load_substitution_engine,
+)
+from foodcom_pipeline.batch.ingredient_clusters import load_ingredient_clusters
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 from sqlalchemy import create_engine, text
 
@@ -65,6 +70,7 @@ _DIM_RECIPE_NON_PK_COLUMNS: tuple[tuple[str, str], ...] = (
     ('avg_rating', 'DOUBLE PRECISION'),
     ('review_count', 'INTEGER'),
     ('sentiment_rating', 'DOUBLE PRECISION'),
+    ('weighted_review_count', 'DOUBLE PRECISION'),
     ('avg_cook_minutes', 'DOUBLE PRECISION'),
     ('top_ingredients', 'TEXT'),
     ('tags', 'TEXT'),
@@ -131,8 +137,11 @@ def run_load(**context) -> None:
 
     interactions = load_sentiment_interactions()
     recipes = load_cleaned_recipes()
+    recipe_sentiment_ratings = load_recipe_sentiment_ratings()
     user_stats = load_user_stats()
     user_clusters = load_user_clusters()
+    ingredient_clusters = load_ingredient_clusters()
+    substitution_recommendations = load_substitution_engine()
 
     # Merge cluster labels into user stats
     users = user_stats.merge(
@@ -143,10 +152,12 @@ def run_load(**context) -> None:
 
     # Build dimension tables first, then facts
     date_map = _load_dim_date(engine, interactions)
-    _load_dim_recipe(engine, recipes, interactions)
+    _load_dim_recipe(engine, recipes, interactions, recipe_sentiment_ratings)
     _load_dim_canonical_ingredient_nutrients(engine)
+    _load_dim_canonical_ingredient_cluster(engine, ingredient_clusters)
     _load_dim_user(engine, users)
     _load_fact_interactions(engine, interactions, date_map)
+    _load_fact_substitution_recommendations(engine, substitution_recommendations)
 
     _log_row_counts(engine)
 
@@ -155,7 +166,13 @@ def run_load(**context) -> None:
     # Push summary to XCom
     with engine.connect() as conn:
         n_facts = conn.execute(text('SELECT COUNT(*) FROM fact_interactions')).scalar()
+        n_sub_facts = conn.execute(
+            text('SELECT COUNT(*) FROM fact_substitution_recommendations')
+        ).scalar()
     context['ti'].xcom_push(key='fact_interactions_total', value=int(n_facts))
+    context['ti'].xcom_push(
+        key='fact_substitution_recommendations_total', value=int(n_sub_facts)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +201,7 @@ def _ensure_schema(engine) -> None:
         avg_rating       FLOAT,
         review_count     INTEGER,
         sentiment_rating FLOAT,
+        weighted_review_count FLOAT,
         avg_cook_minutes FLOAT,
         top_ingredients  TEXT,    -- pipe-separated top 10 ingredients
         tags             TEXT,
@@ -208,6 +226,13 @@ def _ensure_schema(engine) -> None:
         sugar_g_per_100g          DOUBLE PRECISION,
         sodium_g_per_100g         DOUBLE PRECISION,
         carbs_g_per_100g          DOUBLE PRECISION
+    );
+
+    CREATE TABLE IF NOT EXISTS dim_canonical_ingredient_cluster (
+        canonical_ingredient     TEXT PRIMARY KEY,
+        ingredient_cluster_id    INTEGER,
+        nutrient_feature_count   INTEGER,
+        updated_at               TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS dim_user (
@@ -238,6 +263,23 @@ def _ensure_schema(engine) -> None:
         source                VARCHAR(10) DEFAULT 'batch'
     );
 
+    CREATE TABLE IF NOT EXISTS fact_substitution_recommendations (
+        candidate_ingredient     TEXT NOT NULL,
+        substitute_ingredient    TEXT NOT NULL,
+        recommendation_score     DOUBLE PRECISION,
+        rating_delta             DOUBLE PRECISION,
+        sentiment_delta          DOUBLE PRECISION,
+        trend_score              DOUBLE PRECISION,
+        protein_delta            DOUBLE PRECISION,
+        saturated_fat_delta      DOUBLE PRECISION,
+        sugar_delta              DOUBLE PRECISION,
+        sodium_delta             DOUBLE PRECISION,
+        calories_delta           DOUBLE PRECISION,
+        health_delta             DOUBLE PRECISION,
+        updated_at               TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+        PRIMARY KEY (candidate_ingredient, substitute_ingredient)
+    );
+
     CREATE TABLE IF NOT EXISTS recent_interactions (
         interaction_id        BIGINT PRIMARY KEY,
         user_id               BIGINT,
@@ -256,6 +298,24 @@ def _ensure_schema(engine) -> None:
         UNION ALL
         SELECT * FROM recent_interactions
         WHERE interaction_id NOT IN (SELECT interaction_id FROM fact_interactions);
+
+    CREATE OR REPLACE VIEW serving_substitution_recommendations AS
+        SELECT
+            candidate_ingredient,
+            substitute_ingredient,
+            recommendation_score,
+            rating_delta,
+            sentiment_delta,
+            trend_score,
+            protein_delta,
+            saturated_fat_delta,
+            sugar_delta,
+            sodium_delta,
+            calories_delta,
+            health_delta,
+            updated_at
+        FROM fact_substitution_recommendations
+        ORDER BY recommendation_score DESC NULLS LAST;
     """
 
     with engine.begin() as conn:
@@ -310,7 +370,12 @@ def _load_dim_date(engine, interactions: pd.DataFrame) -> dict[date, int]:
 # ---------------------------------------------------------------------------
 
 
-def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) -> None:
+def _load_dim_recipe(
+    engine,
+    recipes: pd.DataFrame,
+    interactions: pd.DataFrame,
+    recipe_sentiment_ratings: pd.DataFrame,
+) -> None:
     """
     Upserts recipe dimension records.
     Computes avg_rating and review_count from interactions so these
@@ -330,31 +395,15 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
         .round({'avg_rating': 4})
     )
 
-    # Compute sentiment_rating per recipe using inverse-frequency weighting + Bayesian shrinkage:
-    # sentiment_rating = (Σ(w_i * r_i) + m*C) / (Σw_i + m)
-    # where w_i = 1 / global_count[rating_i], r_i = sentiment_score, C = global mean sentiment_score.
-    sentiment_df = interactions[['recipe_id', 'rating', 'sentiment_score']].copy()
-    sentiment_df = sentiment_df.dropna(subset=['sentiment_score', 'rating'])
-    if not sentiment_df.empty:
-        rating_counts = sentiment_df['rating'].value_counts().to_dict()
-        sentiment_df['w'] = sentiment_df['rating'].map(
-            lambda r: 1.0 / float(rating_counts.get(r, 1))
+    # Keep warehouse sentiment fields aligned with feature engineering outputs.
+    if recipe_sentiment_ratings is None or recipe_sentiment_ratings.empty:
+        recipe_sent = pd.DataFrame(
+            columns=['recipe_id', 'sentiment_rating', 'weighted_review_count']
         )
-        C = float(sentiment_df['sentiment_score'].mean())
-        m = SENTIMENT_SHRINKAGE_M
-
-        recipe_sent = (
-            sentiment_df.assign(wr=sentiment_df['w'] * sentiment_df['sentiment_score'])
-            .groupby('recipe_id')
-            .agg(weighted_sum=('wr', 'sum'), weight_sum=('w', 'sum'))
-            .reset_index()
-        )
-        recipe_sent['sentiment_rating'] = (
-            (recipe_sent['weighted_sum'] + m * C) / (recipe_sent['weight_sum'] + m)
-        ).round(4)
-        recipe_sent = recipe_sent[['recipe_id', 'sentiment_rating']]
     else:
-        recipe_sent = pd.DataFrame(columns=['recipe_id', 'sentiment_rating'])
+        recipe_sent = recipe_sentiment_ratings[
+            ['recipe_id', 'sentiment_rating', 'weighted_review_count']
+        ].copy()
 
     # Join with recipe metadata without creating duplicate recipe_id columns.
     recipe_agg = recipe_agg.rename(columns={'recipe_id': 'id'})
@@ -375,6 +424,9 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
     dim['recipe_id'] = pd.to_numeric(dim['recipe_id'], errors='coerce').astype('Int64')
     dim['review_count'] = pd.to_numeric(dim['review_count'], errors='coerce').astype(
         'Int64'
+    )
+    dim['weighted_review_count'] = pd.to_numeric(
+        dim['weighted_review_count'], errors='coerce'
     )
     dim['ingredient_count'] = pd.to_numeric(
         dim['ingredient_count'], errors='coerce'
@@ -433,6 +485,7 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
             'avg_rating',
             'review_count',
             'sentiment_rating',
+            'weighted_review_count',
             'avg_cook_minutes',
             'top_ingredients',
             'tags',
@@ -451,18 +504,19 @@ def _load_dim_recipe(engine, recipes: pd.DataFrame, interactions: pd.DataFrame) 
     upsert_sql = """
         INSERT INTO dim_recipe (
             recipe_id, name, avg_rating, review_count, sentiment_rating,
-            avg_cook_minutes, top_ingredients, tags, ingredient_count,
+            weighted_review_count, avg_cook_minutes, top_ingredients, tags, ingredient_count,
             calories, protein, fat, sugar, sodium, carbs, saturated_fat, balance_score
         )
         VALUES (
             :recipe_id, :name, :avg_rating, :review_count, :sentiment_rating,
-            :avg_cook_minutes, :top_ingredients, :tags, :ingredient_count,
+            :weighted_review_count, :avg_cook_minutes, :top_ingredients, :tags, :ingredient_count,
             :calories, :protein, :fat, :sugar, :sodium, :carbs, :saturated_fat, :balance_score
         )
         ON CONFLICT (recipe_id) DO UPDATE SET
             avg_rating       = EXCLUDED.avg_rating,
             review_count     = EXCLUDED.review_count,
             sentiment_rating = EXCLUDED.sentiment_rating,
+            weighted_review_count = EXCLUDED.weighted_review_count,
             avg_cook_minutes = EXCLUDED.avg_cook_minutes,
             top_ingredients  = EXCLUDED.top_ingredients,
             tags             = EXCLUDED.tags,
@@ -551,6 +605,73 @@ def _load_dim_canonical_ingredient_nutrients(engine) -> None:
     _bulk_upsert(engine, df, upsert_sql)
     logger.info(
         'dim_canonical_ingredient_nutrients: upserted %s canonical ingredients.',
+        f'{len(df):,}',
+    )
+
+
+# ---------------------------------------------------------------------------
+# dim_canonical_ingredient_cluster
+# ---------------------------------------------------------------------------
+
+
+def _load_dim_canonical_ingredient_cluster(
+    engine, ingredient_clusters: pd.DataFrame
+) -> None:
+    """
+    Upserts canonical ingredient cluster assignments from staging parquet.
+    """
+    if ingredient_clusters is None or ingredient_clusters.empty:
+        logger.warning(
+            'No ingredient cluster data found in staging; '
+            'skipping dim_canonical_ingredient_cluster load.'
+        )
+        return
+
+    expected = [
+        'canonical_ingredient',
+        'ingredient_cluster_id',
+        'nutrient_feature_count',
+    ]
+    missing = set(expected) - set(ingredient_clusters.columns)
+    if missing:
+        raise ValueError(
+            'Ingredient clusters are missing expected columns: '
+            f'{sorted(missing)}'
+        )
+
+    df = ingredient_clusters[expected].drop_duplicates(
+        subset=['canonical_ingredient'], keep='first'
+    )
+    df['ingredient_cluster_id'] = pd.to_numeric(
+        df['ingredient_cluster_id'], errors='coerce'
+    ).astype('Int64')
+    df['nutrient_feature_count'] = pd.to_numeric(
+        df['nutrient_feature_count'], errors='coerce'
+    ).astype('Int64')
+    df = df.dropna(subset=['canonical_ingredient', 'ingredient_cluster_id'])
+    if df.empty:
+        logger.warning(
+            'Ingredient cluster staging had no valid rows after coercion; '
+            'skipping dim_canonical_ingredient_cluster load.'
+        )
+        return
+
+    upsert_sql = """
+        INSERT INTO dim_canonical_ingredient_cluster (
+            canonical_ingredient, ingredient_cluster_id, nutrient_feature_count, updated_at
+        )
+        VALUES (
+            :canonical_ingredient, :ingredient_cluster_id, :nutrient_feature_count, NOW()
+        )
+        ON CONFLICT (canonical_ingredient) DO UPDATE SET
+            ingredient_cluster_id = EXCLUDED.ingredient_cluster_id,
+            nutrient_feature_count = EXCLUDED.nutrient_feature_count,
+            updated_at = NOW()
+    """
+
+    _bulk_upsert(engine, df, upsert_sql)
+    logger.info(
+        'dim_canonical_ingredient_cluster: upserted %s canonical ingredients.',
         f'{len(df):,}',
     )
 
@@ -685,6 +806,77 @@ def _load_fact_interactions(engine, interactions: pd.DataFrame, date_map: dict) 
 # ---------------------------------------------------------------------------
 
 
+def _load_fact_substitution_recommendations(
+    engine, substitution_recommendations: pd.DataFrame
+) -> None:
+    """
+    Upserts substitution recommendation pairs generated by the feature step.
+    This makes the substitution engine queryable directly from PostgreSQL.
+    """
+    if substitution_recommendations is None or substitution_recommendations.empty:
+        logger.warning(
+            'No substitution recommendations found in staging; '
+            'skipping fact_substitution_recommendations load.'
+        )
+        return
+
+    expected_cols = [
+        'candidate_ingredient',
+        'substitute_ingredient',
+        'recommendation_score',
+        'rating_delta',
+        'sentiment_delta',
+        'trend_score',
+        'protein_delta',
+        'saturated_fat_delta',
+        'sugar_delta',
+        'sodium_delta',
+        'calories_delta',
+        'health_delta',
+    ]
+    missing = set(expected_cols) - set(substitution_recommendations.columns)
+    if missing:
+        raise ValueError(
+            'Substitution recommendations are missing expected columns: '
+            f'{sorted(missing)}'
+        )
+
+    df = substitution_recommendations[expected_cols].copy()
+
+    upsert_sql = """
+        INSERT INTO fact_substitution_recommendations (
+            candidate_ingredient, substitute_ingredient,
+            recommendation_score, rating_delta, sentiment_delta, trend_score,
+            protein_delta, saturated_fat_delta, sugar_delta, sodium_delta,
+            calories_delta, health_delta, updated_at
+        )
+        VALUES (
+            :candidate_ingredient, :substitute_ingredient,
+            :recommendation_score, :rating_delta, :sentiment_delta, :trend_score,
+            :protein_delta, :saturated_fat_delta, :sugar_delta, :sodium_delta,
+            :calories_delta, :health_delta, NOW()
+        )
+        ON CONFLICT (candidate_ingredient, substitute_ingredient) DO UPDATE SET
+            recommendation_score = EXCLUDED.recommendation_score,
+            rating_delta = EXCLUDED.rating_delta,
+            sentiment_delta = EXCLUDED.sentiment_delta,
+            trend_score = EXCLUDED.trend_score,
+            protein_delta = EXCLUDED.protein_delta,
+            saturated_fat_delta = EXCLUDED.saturated_fat_delta,
+            sugar_delta = EXCLUDED.sugar_delta,
+            sodium_delta = EXCLUDED.sodium_delta,
+            calories_delta = EXCLUDED.calories_delta,
+            health_delta = EXCLUDED.health_delta,
+            updated_at = NOW()
+    """
+
+    _bulk_upsert(engine, df, upsert_sql)
+    logger.info(
+        'fact_substitution_recommendations: upserted %s recommendation pairs.',
+        f'{len(df):,}',
+    )
+
+
 def _hash_interaction(user_id: int, recipe_id: int, full_date) -> int:
     """
     Generates a deterministic 64-bit integer ID from (user_id, recipe_id, date).
@@ -723,8 +915,10 @@ def _log_row_counts(engine) -> None:
         'dim_date',
         'dim_recipe',
         'dim_canonical_ingredient_nutrients',
+        'dim_canonical_ingredient_cluster',
         'dim_user',
         'fact_interactions',
+        'fact_substitution_recommendations',
         'recent_interactions',
     ]
     logger.info('Star schema row counts after load:')

@@ -3,6 +3,7 @@
 import ast
 import os
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pandas as pd
 import streamlit as st
@@ -186,6 +187,11 @@ def _to_star_rating(sentiment_like: float | None) -> float | None:
     return max(0.0, min(5.0, value))
 
 
+def _buy_link_for_ingredient(ingredient: str) -> str:
+    query = quote_plus(ingredient.strip())
+    return f"https://www.amazon.com/s?k={query}&i=grocery"
+
+
 def _recompute_bayesian_sentiment(
     base_sentiment_rating: float | None,
     weighted_review_count: float | None,
@@ -214,6 +220,47 @@ def _recompute_bayesian_sentiment(
 
 def render() -> None:
     st.header("🔄 Smart Substitutions")
+    st.markdown(
+        """
+        <style>
+        .subs-hero {
+            background: linear-gradient(135deg, #f0fdf4 0%, #ecfeff 100%);
+            border: 1px solid #bbf7d0;
+            border-radius: 14px;
+            padding: 14px 16px;
+            margin-bottom: 12px;
+        }
+        .subs-hero-title {
+            font-size: 1.05rem;
+            font-weight: 700;
+            color: #14532d;
+            margin-bottom: 2px;
+        }
+        .subs-hero-sub {
+            color: #334155;
+            font-size: 0.92rem;
+            margin: 0;
+        }
+        .subs-section-title {
+            font-weight: 700;
+            color: #0f172a;
+            margin-bottom: 6px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="subs-hero">
+          <div class="subs-hero-title">Smarter ingredient swaps, faster decisions</div>
+          <p class="subs-hero-sub">
+            Compare each substitute by expected quality lift, nutrition impact, and quick buy options.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     subs = _load_substitution_pairs()
     recipes = _load_recipes_for_picker()
@@ -268,9 +315,9 @@ def render() -> None:
 
     recs = recs.sort_values("recommendation_score", ascending=False).reset_index(drop=True)
 
-    st.caption(
-        "Recommendations prioritize underperforming ingredients and rank substitutes by "
-        "rating lift, sentiment lift, culinary compatibility, and nutrition delta."
+    st.info(
+        "Recommendations prioritize underperforming ingredients and rank substitutes by rating lift, "
+        "sentiment lift, culinary compatibility, and nutrition delta."
     )
 
     swap_key = f"_subs_swaps_{int(selected_recipe_id)}"
@@ -323,8 +370,6 @@ def render() -> None:
         f"weighted review depth={base_weight:.2f}."
     )
 
-    st.divider()
-
     rendered_candidates: set[str] = set()
     for _, row in recs.iterrows():
         candidate = row["candidate_ingredient"]
@@ -332,40 +377,64 @@ def render() -> None:
             continue
         rendered_candidates.add(candidate)
 
-        candidate_rows = recs[recs["candidate_ingredient"] == candidate].head(3)
+        candidate_rows = recs[recs["candidate_ingredient"] == candidate]
         st.markdown(f"### Replace `{candidate}`")
         for _, cand_row in candidate_rows.iterrows():
             sub = cand_row["substitute_ingredient"]
-            card_left, card_right = st.columns([3, 1])
-            with card_left:
-                st.markdown(
-                    f"**Suggested substitute:** `{sub}`  \n"
-                    f"Score: `{cand_row['recommendation_score']:.3f}`"
-                )
-                st.caption(
-                    "Quality delta: "
-                    f"rating {_format_delta(cand_row.get('rating_delta'), True)}, "
-                    f"sentiment {_format_delta(cand_row.get('sentiment_delta'), True)}"
-                )
-                st.caption(
-                    "Nutrition delta: "
-                    f"protein {_format_delta(cand_row.get('protein_delta'), True)}, "
-                    f"sat fat {_format_delta(cand_row.get('saturated_fat_delta'), False)}, "
-                    f"sugar {_format_delta(cand_row.get('sugar_delta'), False)}, "
-                    f"sodium {_format_delta(cand_row.get('sodium_delta'), False)}"
-                )
-                st.caption("Sponsored placement hook: reserve this space for promoted substitute cards.")
-            with card_right:
-                is_active = active_swaps.get(candidate) == sub
-                if st.button(
-                    "Applied" if is_active else "Apply swap",
-                    key=f"swap_{selected_recipe_id}_{candidate}_{sub}",
-                    type="primary" if is_active else "secondary",
-                ):
-                    if is_active:
-                        active_swaps.pop(candidate, None)
-                    else:
-                        active_swaps[candidate] = sub
-                    st.session_state[swap_key] = active_swaps
-                    st.rerun()
+            with st.container(border=True):
+                head_left, head_right = st.columns([4, 1])
+                with head_left:
+                    st.markdown(
+                        f"**Suggested substitute:** `{sub}`  \n"
+                        f"Recommendation score: `{cand_row['recommendation_score']:.3f}`"
+                    )
+                with head_right:
+                    is_active = active_swaps.get(candidate) == sub
+                    if st.button(
+                        "Applied ✅" if is_active else "Apply swap",
+                        key=f"swap_{selected_recipe_id}_{candidate}_{sub}",
+                        type="primary" if is_active else "secondary",
+                        use_container_width=True,
+                    ):
+                        if is_active:
+                            active_swaps.pop(candidate, None)
+                        else:
+                            active_swaps[candidate] = sub
+                        st.session_state[swap_key] = active_swaps
+                        st.rerun()
+
+                stat_a, stat_b, stat_c = st.columns(3)
+                stat_a.metric("Rating delta", _format_delta(cand_row.get("rating_delta"), True))
+                stat_b.metric("Sentiment delta", _format_delta(cand_row.get("sentiment_delta"), True))
+                stat_c.metric("Health delta", _format_delta(cand_row.get("health_delta"), True))
+
+                n1, n2, n3, n4 = st.columns(4)
+                n1.metric("Protein", _format_delta(cand_row.get("protein_delta"), True))
+                n2.metric("Sat fat", _format_delta(cand_row.get("saturated_fat_delta"), False))
+                n3.metric("Sugar", _format_delta(cand_row.get("sugar_delta"), False))
+                n4.metric("Sodium", _format_delta(cand_row.get("sodium_delta"), False))
+
+                st.markdown('<div class="subs-section-title">Sponsored picks</div>', unsafe_allow_html=True)
+                promo_cols = st.columns(2)
+                with promo_cols[0]:
+                    with st.container(border=True):
+                        st.markdown(f"#### 🛒 Buy `{sub}`")
+                        st.caption("Fast checkout for this recommended substitute.")
+                        st.link_button(
+                            "Shop substitute",
+                            _buy_link_for_ingredient(sub),
+                            use_container_width=True,
+                            help="Opens an external page to buy this substitute ingredient.",
+                        )
+                with promo_cols[1]:
+                    with st.container(border=True):
+                        st.markdown(f"#### 🔍 Explore `{candidate}`")
+                        st.caption("Compare brands and alternatives for the original ingredient.")
+                        st.link_button(
+                            "View alternatives",
+                            _buy_link_for_ingredient(candidate),
+                            use_container_width=True,
+                            help="Opens an external page to buy the original ingredient.",
+                        )
+            st.markdown("")
         st.divider()

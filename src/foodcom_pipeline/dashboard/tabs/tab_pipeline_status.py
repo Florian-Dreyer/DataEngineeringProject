@@ -50,6 +50,7 @@ PIPELINE_STAGES: list[dict] = [
     {"stage": "Sentiment", "task": "run_vader_sentiment",    "file": "interactions_sentiment.parquet", "label": "Sentiment-scored interactions"},
     {"stage": "Features",  "task": "features",               "file": "user_stats.parquet",             "label": "Users with features"},
     {"stage": "Features",  "task": "features",               "file": "ingredient_features.parquet",    "label": "Ingredient features"},
+    {"stage": "Features",  "task": "features",               "file": "substitution_engine.parquet",    "label": "Substitution pairs"},
     {"stage": "Cluster",   "task": "run_kmeans_clustering",  "file": "user_clusters.parquet",          "label": "Clustered users"},
 ]
 
