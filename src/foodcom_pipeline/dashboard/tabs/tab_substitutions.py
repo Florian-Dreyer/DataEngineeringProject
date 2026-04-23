@@ -311,8 +311,14 @@ def _format_delta(value: float | None, higher_is_better: bool) -> str:
         return "—"
     val = float(value)
     sign = "+" if val >= 0 else ""
-    emoji = "✅" if (val >= 0 if higher_is_better else val <= 0) else "⚠️"
-    return f"{emoji} {sign}{val:.3f}"
+    if val == 0:
+        emoji = "⚪"
+    elif val > 0:
+        emoji = "🟢" if higher_is_better else "🔴"
+    else:
+        emoji = "🔴" if higher_is_better else "🟢"
+    arrow = "↑" if val > 0 else "↓" if val < 0 else "→"
+    return f"{emoji} {arrow} {sign}{abs(val):.3f}"
 
 
 def _to_star_rating(sentiment_like: float | None) -> float | None:
@@ -394,7 +400,39 @@ def _format_metric_value(value: float | None, suffix: str = "") -> str:
 def _format_base_adjusted(base: float | None, adjusted: float | None) -> str:
     if base is None or adjusted is None:
         return "—"
-    return f"{base:.2f} -> {adjusted:.2f}"
+    return f"{base:.2f} → {adjusted:.2f}"
+
+
+def _recommendation_stars(score: float | None) -> str:
+    """Convert recommendation score to star rating (1-5)."""
+    if score is None or pd.isna(score):
+        return "⭐ Not rated"
+    score_val = float(score)
+    if score_val >= 0.8:
+        return "⭐⭐⭐⭐⭐ Highly Recommended"
+    elif score_val >= 0.6:
+        return "⭐⭐⭐⭐ Very Good"
+    elif score_val >= 0.4:
+        return "⭐⭐⭐ Good"
+    elif score_val >= 0.2:
+        return "⭐⭐ Fair"
+    else:
+        return "⭐ Consider Others"
+
+
+def _recommendation_reason(delta_rating: float | None, delta_sentiment: float | None, delta_health: float | None) -> str:
+    """Generate brief reason for recommendation."""
+    reasons = []
+    if delta_rating is not None and delta_rating > 0.1:
+        reasons.append("Better rating")
+    if delta_sentiment is not None and delta_sentiment > 0.05:
+        reasons.append("Better sentiment")
+    if delta_health is not None and delta_health > 0.1:
+        reasons.append("Healthier")
+    reasons.append("Culinary compatible")
+    # if not reasons:
+    #     return "Culinary compatible"
+    return " • ".join(reasons)
 
 
 def _buy_link_for_ingredient(ingredient: str) -> str:
@@ -461,10 +499,6 @@ def _render_swap_workspace(
     global_sentiment_mean: float,
     selected_recipe_id: int,
 ) -> None:
-    st.info(
-        "Recommendations prioritize underperforming ingredients and rank substitutes by rating lift, "
-        "sentiment lift, culinary compatibility, and nutrition delta."
-    )
 
     swap_key = f"_subs_swaps_{int(selected_recipe_id)}"
     if swap_key not in st.session_state:
@@ -546,99 +580,114 @@ def _render_swap_workspace(
         base_health + delta_totals["health"] if base_health is not None else None
     )
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Base Bayesian Sentiment", f"{base_rating:.3f}" if base_rating is not None else "—")
-    c2.metric(
-        "Estimated Rating Delta",
-        f"+{rating_uplift:.2f}" if rating_uplift > 0 else f"{rating_uplift:.2f}",
-    )
-    c3.metric(
-        "Adjusted Bayesian Sentiment",
-        f"{adjusted_sentiment_bayes:.3f}" if adjusted_sentiment_bayes is not None else "—",
-    )
-    c4, c5 = st.columns(2)
-    c4.metric("Base Star-Equivalent", f"{base_stars:.2f}★" if base_stars is not None else "—")
-    c5.metric(
-        "Adjusted Star-Equivalent",
-        f"{adjusted_stars:.2f}★" if adjusted_stars is not None else "—",
-    )
-    rating_note = ""
-    if base_rating is not None and base_rating_source in ("avg_rating", "display_rating"):
-        rating_note = (
-            " Base sentiment uses average rating mapped to the sentiment scale when "
-            "`sentiment_rating` is missing."
+    if not active_swaps:
+        st.info("👉 Select an ingredient below and apply swaps to see the impact on your recipe.")
+    else:
+        st.success(f"✅ {len(active_swaps)} swap(s) applied. See estimated changes below.")
+
+    with st.expander("⭐ Rating Impact", expanded=True):
+        swap_impact_col1, swap_impact_col2 = st.columns(2)
+        with swap_impact_col1:
+            st.metric(
+                "Current Rating",
+                f"{base_stars:.1f}★" if base_stars is not None else "—",
+                delta=f"+{rating_uplift:.2f}" if rating_uplift > 0 else (f"{rating_uplift:.2f}" if rating_uplift != 0 else "No change"),
+                delta_color="normal",
+            )
+        with swap_impact_col2:
+            st.metric(
+                "With Your Swaps",
+                f"{adjusted_stars:.1f}★" if adjusted_stars is not None else "—",
+                help="Estimated rating after applying all selected swaps.",
+            )
+
+    with st.expander("📈 Sentiment Impact", expanded=True):
+        sentiment_col1, sentiment_col2 = st.columns(2)
+        with sentiment_col1:
+            st.metric(
+                "Current Sentiment (Bayesian)",
+                f"{base_rating:.3f}" if base_rating is not None else "—",
+                delta=(
+                    f"+{delta_totals['sentiment']:.3f}"
+                    if delta_totals["sentiment"] > 0
+                    else (
+                        f"{delta_totals['sentiment']:.3f}"
+                        if delta_totals["sentiment"] != 0
+                        else "No change"
+                    )
+                ),
+                delta_color="normal",
+            )
+        with sentiment_col2:
+            st.metric(
+                "With Your Swaps (Bayesian)",
+                f"{adjusted_sentiment_bayes:.3f}" if adjusted_sentiment_bayes is not None else "—",
+                help="Estimated Bayesian sentiment after applying all selected swaps.",
+            )
+
+        st.caption(
+            f"Bayesian smoothing combines the recipe's current sentiment with global sentiment to avoid "
+            f"overreacting when review counts are low. It then adds the swap sentiment effects as synthetic "
+            f"evidence and recomputes a more stable estimate. "
+            f"Parameters: m={_BAYESIAN_PSEUDO_COUNT:.0f} (prior strength), "
+            f"global mean={global_sentiment_mean:.3f}, review depth={base_weight:.1f}."
         )
-    st.caption(
-        f"Bayesian recompute uses m={_BAYESIAN_PSEUDO_COUNT:.0f}, "
-        f"global sentiment mean C={global_sentiment_mean:.3f}, "
-        f"weighted review depth={base_weight:.2f}.{rating_note}"
-    )
 
-    st.markdown("### Nutrition and Health (Base vs Adjusted)")
-    n1, n2, n3 = st.columns(3)
-    n1.metric(
-        "Protein (base → adjusted)",
-        _format_base_adjusted(base_protein, adjusted_protein),
-        delta=(
-            f"{delta_totals['protein']:+.2f}"
-            if base_protein is not None
-            else None
-        ),
-    )
-    n2.metric(
-        "Saturated fat (base → adjusted)",
-        _format_base_adjusted(base_saturated_fat, adjusted_saturated_fat),
-        delta=(
-            f"{delta_totals['saturated_fat']:+.2f}"
-            if base_saturated_fat is not None
-            else None
-        ),
-        delta_color="inverse",
-    )
-    n3.metric(
-        "Sugar (base → adjusted)",
-        _format_base_adjusted(base_sugar, adjusted_sugar),
-        delta=(
-            f"{delta_totals['sugar']:+.2f}"
-            if base_sugar is not None
-            else None
-        ),
-        delta_color="inverse",
-    )
+    with st.expander("🥗 Nutrition Impact", expanded=True):
+        st.markdown("**Macronutrients**")
+        n1, n2, n3 = st.columns(3)
+        n1.metric(
+            "Protein",
+            _format_base_adjusted(base_protein, adjusted_protein),
+            delta=(
+                f"{delta_totals['protein']:+.2f}g"
+                if base_protein is not None
+                else None
+            ),
+        )
+        n2.metric(
+            "Saturated Fat",
+            _format_base_adjusted(base_saturated_fat, adjusted_saturated_fat),
+            delta=(
+                f"{delta_totals['saturated_fat']:+.2f}g"
+                if base_saturated_fat is not None
+                else None
+            ),
+            delta_color="inverse",
+        )
+        n3.metric(
+            "Calories",
+            _format_base_adjusted(base_calories, adjusted_calories),
+            delta=(
+                f"{delta_totals['calories']:+.0f}kcal"
+                if base_calories is not None
+                else None
+            ),
+            delta_color="inverse",
+        )
 
-    n4, n5, n6 = st.columns(3)
-    n4.metric(
-        "Sodium (base → adjusted)",
-        _format_base_adjusted(base_sodium, adjusted_sodium),
-        delta=(
-            f"{delta_totals['sodium']:+.2f}"
-            if base_sodium is not None
-            else None
-        ),
-        delta_color="inverse",
-    )
-    n5.metric(
-        "Calories (base → adjusted)",
-        _format_base_adjusted(base_calories, adjusted_calories),
-        delta=(
-            f"{delta_totals['calories']:+.2f}"
-            if base_calories is not None
-            else None
-        ),
-        delta_color="inverse",
-    )
-    n6.metric(
-        "Health score (base → adjusted)",
-        _format_base_adjusted(base_health, adjusted_health),
-        delta=(
-            f"{delta_totals['health']:+.2f}"
-            if base_health is not None
-            else None
-        ),
-    )
-    st.caption(
-        "Adjusted values = base recipe nutrition from `dim_recipe` + sum of applied substitution deltas."
-    )
+        st.markdown("**Sugars & Sodium**")
+        n4, n5 = st.columns(2)
+        n4.metric(
+            "Sugar",
+            _format_base_adjusted(base_sugar, adjusted_sugar),
+            delta=(
+                f"{delta_totals['sugar']:+.2f}g"
+                if base_sugar is not None
+                else None
+            ),
+            delta_color="inverse",
+        )
+        n5.metric(
+            "Sodium",
+            _format_base_adjusted(base_sodium, adjusted_sodium),
+            delta=(
+                f"{delta_totals['sodium']:+.0f}mg"
+                if base_sodium is not None
+                else None
+            ),
+            delta_color="inverse",
+        )
 
     available_candidates = sorted(recs["candidate_ingredient"].dropna().astype(str).unique().tolist())
     st.markdown("### Ingredients in this recipe")
@@ -678,7 +727,7 @@ def _render_swap_workspace(
         st.session_state[selected_candidate_key] = available_candidates[0]
 
     selected_candidate = st.selectbox(
-        "Pick ingredient",
+        "🧂 Pick an ingredient to improve",
         options=available_candidates,
         index=available_candidates.index(st.session_state[selected_candidate_key]),
         key=f"pick_ing_{selected_recipe_id}",
@@ -691,21 +740,32 @@ def _render_swap_workspace(
         .reset_index(drop=True)
     )
     st.divider()
-    st.markdown(f"### Substitutes for `{selected_candidate}`")
+    st.markdown(f"### 🔄 Suggested swaps for `{selected_candidate.title()}`")
+    if candidate_rows.empty:
+        st.warning(f"No swaps available for {selected_candidate}.")
+    else:
+        st.caption(f"{len(candidate_rows)} option(s) ranked by quality, nutrition & compatibility")
 
-    for _, cand_row in candidate_rows.iterrows():
+    for rank, (_, cand_row) in enumerate(candidate_rows.iterrows(), 1):
         sub = cand_row["substitute_ingredient"]
+        is_active = active_swaps.get(selected_candidate) == sub
+        
         with st.container(border=True):
-            head_left, head_right = st.columns([4, 1])
+            head_left, head_mid, head_right = st.columns([3, 2, 1])
             with head_left:
-                st.markdown(
-                    f"**Suggested substitute:** `{sub}`  \n"
-                    f"Recommendation score: `{cand_row['recommendation_score']:.3f}`"
+                st.markdown(f"**#{rank}. {sub.title()}**")
+                rec_stars = _recommendation_stars(cand_row.get("recommendation_score"))
+                st.caption(rec_stars)
+            with head_mid:
+                reason = _recommendation_reason(
+                    cand_row.get("rating_delta"),
+                    cand_row.get("sentiment_delta"),
+                    cand_row.get("health_delta"),
                 )
+                st.caption(f"💡 {reason}")
             with head_right:
-                is_active = active_swaps.get(selected_candidate) == sub
                 st.button(
-                    "Applied ✅" if is_active else "Apply swap",
+                    "✅ Swap" if is_active else "Apply",
                     key=f"swap_{selected_recipe_id}_{selected_candidate}_{sub}",
                     type="primary" if is_active else "secondary",
                     use_container_width=True,
@@ -713,65 +773,54 @@ def _render_swap_workspace(
                     args=(swap_key, selected_candidate, None if is_active else sub),
                 )
 
-            stat_a, stat_b, stat_c = st.columns(3)
-            stat_a.metric("Rating delta", _format_delta(cand_row.get("rating_delta"), True))
-            stat_b.metric("Sentiment delta", _format_delta(cand_row.get("sentiment_delta"), True))
-            stat_c.metric("Health delta", _format_delta(cand_row.get("health_delta"), True))
+            st.markdown("**Quality Impact**")
+            col_quality_1, col_quality_2, col_quality_3 = st.columns(3)
+            col_quality_1.metric(
+                "Rating",
+                _format_delta(cand_row.get("rating_delta"), True),
+                help="Expected change in recipe rating"
+            )
+            col_quality_2.metric(
+                "Sentiment",
+                _format_delta(cand_row.get("sentiment_delta"), True),
+                help="Expected change in sentiment"
+            )
+            col_quality_3.metric(
+                "Health score",
+                _format_delta(cand_row.get("health_delta"), True),
+                help="Overall nutrition improvement"
+            )
 
-            n1, n2, n3, n4 = st.columns(4)
-            n1.metric("Protein", _format_delta(cand_row.get("protein_delta"), True))
-            n2.metric("Sat fat", _format_delta(cand_row.get("saturated_fat_delta"), False))
-            n3.metric("Sugar", _format_delta(cand_row.get("sugar_delta"), False))
-            n4.metric("Sodium", _format_delta(cand_row.get("sodium_delta"), False))
+            st.markdown("**Nutrition Changes**")
+            nut_1, nut_2, nut_3, nut_4 = st.columns(4)
+            nut_1.metric("Protein", _format_delta(cand_row.get("protein_delta"), True))
+            nut_2.metric("Sat Fat", _format_delta(cand_row.get("saturated_fat_delta"), False))
+            nut_3.metric("Sugar", _format_delta(cand_row.get("sugar_delta"), False))
+            nut_4.metric("Sodium", _format_delta(cand_row.get("sodium_delta"), False))
 
-            st.markdown('<div class="subs-section-title">Sponsored picks</div>', unsafe_allow_html=True)
-            promo_cols = st.columns(2)
-            with promo_cols[0]:
-                with st.container(border=True):
-                    st.markdown(f"#### 🛒 Buy `{sub}`")
-                    st.caption("Fast checkout for this recommended substitute.")
+            with st.expander("🛒 Buy options"):
+                promo_cols = st.columns(2)
+                with promo_cols[0]:
+                    st.markdown(f"**Get {sub.title()}**")
                     st.link_button(
-                        "Shop substitute",
+                        "🛒 Shop on Amazon",
                         _buy_link_for_ingredient(sub),
                         use_container_width=True,
-                        help="Opens an external page to buy this substitute ingredient.",
                     )
-            with promo_cols[1]:
-                with st.container(border=True):
-                    st.markdown(f"#### 🔍 Explore `{selected_candidate}`")
-                    st.caption("Compare brands and alternatives for the original ingredient.")
+                with promo_cols[1]:
+                    st.markdown(f"**Compare with {selected_candidate.title()}**")
                     st.link_button(
-                        "View alternatives",
+                        "🔍 View alternatives",
                         _buy_link_for_ingredient(selected_candidate),
                         use_container_width=True,
-                        help="Opens an external page to buy the original ingredient.",
                     )
         st.markdown("")
 
 
 def render() -> None:
-    st.header("🔄 Smart Substitutions")
     st.markdown(
         """
         <style>
-        .subs-hero {
-            background: linear-gradient(135deg, #f0fdf4 0%, #ecfeff 100%);
-            border: 1px solid #bbf7d0;
-            border-radius: 14px;
-            padding: 14px 16px;
-            margin-bottom: 12px;
-        }
-        .subs-hero-title {
-            font-size: 1.05rem;
-            font-weight: 700;
-            color: #14532d;
-            margin-bottom: 2px;
-        }
-        .subs-hero-sub {
-            color: #334155;
-            font-size: 0.92rem;
-            margin: 0;
-        }
         .subs-section-title {
             font-weight: 700;
             color: #0f172a;
@@ -801,21 +850,50 @@ def render() -> None:
             background: #dcfce7;
             border-color: #86efac;
         }
+        .subs-ing-pill-swappable {
+            color: #1e40af;
+            background: #dbeafe;
+            border-color: #93c5fd;
+        }
+        .subs-separator {
+            color: #94a3b8;
+            font-weight: 600;
+            margin: 0 2px;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
     st.markdown(
-        """
-        <div class="subs-hero">
-          <div class="subs-hero-title">Smarter ingredient swaps, faster decisions</div>
-          <p class="subs-hero-sub">
-            Compare each substitute by expected quality lift, nutrition impact, and quick buy options.
-          </p>
-        </div>
-        """,
+                '<div style="background:linear-gradient(135deg,#10b981,#059669);border-radius:10px;'
+                'padding:24px 28px;margin-bottom:12px;">'
+                '<h1 style="color:white;margin:0;font-size:26px;">🔄 Smart Substitutions</h1>'
+                '<p style="color:#d1fae5;margin:6px 0 0;">Missing an ingredient? Want healthier ingredient suggestions?<br>'
+                'Find better ingredient swaps — '
+                'compare rating lift, sentiment impact, and nutrition changes in one view.</p>'
+                '</div>',
         unsafe_allow_html=True,
     )
+
+    with st.expander("❓ How it works"):
+        st.markdown(
+            """
+            1. **Pick a recipe** — Start by selecting a dish you want to improve.
+            2. **Choose an ingredient** — Select any ingredient you'd like to swap out.
+            3. **Compare swaps** — View recommended substitutes ranked by:
+               - *Quality*: Expected rating and sentiment improvement
+               - *Nutrition*: Changes in protein, fat, sugar, sodium
+               - *Compatibility*: How well the substitute matches the original flavor
+            4. **Apply swaps** — Select the swaps you want and see real-time nutrition impact.
+            5. **Check results** — View the estimated recipe improvement at the top.
+            
+            **Pro tips:**
+            - Swappable ingredients are highlighted in purple above.
+            - Swapped ingredients turn green so you can track your changes.
+            - Each swap card shows 1-5 stars for recommendation confidence.
+            - Your active swaps update the recipe metrics in real-time.
+            """
+        )
 
     subs = _load_substitution_pairs()
     global_sentiment_mean = _load_global_sentiment_mean()
@@ -861,11 +939,16 @@ def render() -> None:
     picker_exhausted = bool(st.session_state.get(_RECIPE_PICKER_EXHAUSTED_KEY, False))
     #st.caption(f"Recipe picker loaded {picker_total} recipes with substitutions.")
 
-    option_map = {
-        f"{row['recipe_id']} — {row['name']}": row["recipe_id"]
-        for _, row in recipes_with_subs.iterrows()
-        if pd.notna(row.get("recipe_id")) and str(row.get("name", "")).strip()
-    }
+    option_map = {}
+    for _, row in recipes_with_subs.iterrows():
+        if pd.notna(row.get("recipe_id")) and str(row.get("name", "")).strip():
+            recipe_name = str(row.get("name", "")).strip()
+            display_rating = _recipe_star_equivalent(row)
+            if display_rating is not None:
+                label = f"{recipe_name} ⭐ {display_rating:.1f}"
+            else:
+                label = recipe_name
+            option_map[label] = row["recipe_id"]
     if not option_map:
         st.warning("Recipe picker could not be populated from current data.")
         return
