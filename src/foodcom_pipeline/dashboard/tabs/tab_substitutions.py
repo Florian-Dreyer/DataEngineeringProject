@@ -42,6 +42,16 @@ def _resolve_staging_dir() -> Path:
 
 STAGING_DIR = _resolve_staging_dir()
 _BAYESIAN_PSEUDO_COUNT = 10.0
+_RECIPE_PICKER_INITIAL_OPTIONS = 120
+_RECIPE_PICKER_BATCH_SIZE = 250
+_RECIPE_PICKER_MAX_INITIAL_BATCHES = 4
+
+_RECIPE_PICKER_STATE_KEY = "_subs_recipe_picker_rows"
+_RECIPE_PICKER_OFFSET_KEY = "_subs_recipe_picker_next_offset"
+_RECIPE_PICKER_EXHAUSTED_KEY = "_subs_recipe_picker_exhausted"
+_RECIPE_PICKER_CANDIDATE_COUNT_KEY = "_subs_recipe_picker_candidate_count"
+_RECIPE_PICKER_LAST_SELECTION_KEY = "_subs_recipe_picker_last_selection"
+_RECIPE_PICKER_LOAD_MORE_SENTINEL = "Load more recipes..."
 
 _PG_USER = os.getenv("POSTGRES_USER", "user")
 _PG_PASS = os.getenv("POSTGRES_PASSWORD", "password")
@@ -94,7 +104,7 @@ def _load_substitution_pairs() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def _load_recipes_for_picker() -> pd.DataFrame:
+def _load_recipes_for_picker(limit: int = 3000, offset: int = 0) -> pd.DataFrame:
     try:
         import psycopg2
 
@@ -116,8 +126,11 @@ def _load_recipes_for_picker() -> pd.DataFrame:
                     calories
                 FROM dim_recipe
                 ORDER BY COALESCE(sentiment_rating, avg_rating) DESC NULLS LAST
+                LIMIT %s
+                OFFSET %s
                 """,
                 conn,
+                params=(int(limit), int(offset)),
             )
         finally:
             conn.close()
@@ -154,7 +167,97 @@ def _load_recipes_for_picker() -> pd.DataFrame:
         recipes = recipes.drop(columns=["sentiment_rating_new"], errors="ignore")
         recipes = recipes.drop(columns=["weighted_review_count_new"], errors="ignore")
 
-    return recipes.head(3000)
+    recipes = recipes.sort_values(
+        by=["sentiment_rating", "avg_rating"],
+        ascending=False,
+        na_position="last",
+    )
+    return recipes.iloc[offset : offset + limit]
+
+
+def _fetch_recipes_with_substitutions_batch(
+    candidate_set: set[str],
+    offset: int,
+    batch_size: int,
+) -> tuple[pd.DataFrame, bool]:
+    recipes_batch = _load_recipes_for_picker(limit=batch_size, offset=offset)
+    if recipes_batch.empty:
+        return recipes_batch, True
+
+    recipes_batch = recipes_batch.copy()
+    recipes_batch["ingredient_list"] = recipes_batch["top_ingredients"].apply(_to_ingredients_list)
+    recipes_batch["display_rating"] = recipes_batch["sentiment_rating"].fillna(recipes_batch["avg_rating"])
+    recipes_batch["has_substitutions"] = recipes_batch["ingredient_list"].apply(
+        lambda ing_list: any(ing in candidate_set for ing in ing_list)
+    )
+    recipes_with_subs = recipes_batch[recipes_batch["has_substitutions"]].copy()
+    exhausted = len(recipes_batch) < batch_size
+    return recipes_with_subs, exhausted
+
+
+def _prime_recipe_picker(candidate_set: set[str]) -> None:
+    accumulated_batches: list[pd.DataFrame] = []
+    offset = 0
+    exhausted = False
+
+    for _ in range(_RECIPE_PICKER_MAX_INITIAL_BATCHES):
+        batch, exhausted = _fetch_recipes_with_substitutions_batch(
+            candidate_set=candidate_set,
+            offset=offset,
+            batch_size=_RECIPE_PICKER_BATCH_SIZE,
+        )
+        if not batch.empty:
+            accumulated_batches.append(batch)
+        offset += _RECIPE_PICKER_BATCH_SIZE
+        total_options = sum(len(df) for df in accumulated_batches)
+        if total_options >= _RECIPE_PICKER_INITIAL_OPTIONS or exhausted:
+            break
+
+    if accumulated_batches:
+        picker_df = pd.concat(accumulated_batches, ignore_index=True)
+        picker_df = picker_df.drop_duplicates(subset=["recipe_id"], keep="first")
+    else:
+        picker_df = pd.DataFrame()
+
+    st.session_state[_RECIPE_PICKER_STATE_KEY] = picker_df
+    st.session_state[_RECIPE_PICKER_OFFSET_KEY] = offset
+    st.session_state[_RECIPE_PICKER_EXHAUSTED_KEY] = exhausted
+
+
+def _append_recipe_picker_batch(candidate_set: set[str]) -> None:
+    if st.session_state.get(_RECIPE_PICKER_EXHAUSTED_KEY, False):
+        return
+
+    offset = int(st.session_state.get(_RECIPE_PICKER_OFFSET_KEY, 0))
+    current = st.session_state.get(_RECIPE_PICKER_STATE_KEY)
+    if not isinstance(current, pd.DataFrame):
+        current = pd.DataFrame()
+
+    next_batch, exhausted = _fetch_recipes_with_substitutions_batch(
+        candidate_set=candidate_set,
+        offset=offset,
+        batch_size=_RECIPE_PICKER_BATCH_SIZE,
+    )
+    st.session_state[_RECIPE_PICKER_OFFSET_KEY] = offset + _RECIPE_PICKER_BATCH_SIZE
+    st.session_state[_RECIPE_PICKER_EXHAUSTED_KEY] = exhausted
+
+    if next_batch.empty:
+        st.session_state[_RECIPE_PICKER_STATE_KEY] = current
+        return
+
+    combined = pd.concat([current, next_batch], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["recipe_id"], keep="first")
+    st.session_state[_RECIPE_PICKER_STATE_KEY] = combined
+
+
+def _trigger_rerun() -> None:
+    rerun_fn = getattr(st, "rerun", None)
+    if callable(rerun_fn):
+        rerun_fn()
+        return
+    experimental_rerun_fn = getattr(st, "experimental_rerun", None)
+    if callable(experimental_rerun_fn):
+        experimental_rerun_fn()
 
 
 @st.cache_data(ttl=300)
@@ -652,7 +755,6 @@ def render() -> None:
     )
 
     subs = _load_substitution_pairs()
-    recipes = _load_recipes_for_picker()
     global_sentiment_mean = _load_global_sentiment_mean()
 
     if subs.empty:
@@ -661,25 +763,40 @@ def render() -> None:
             "`fact_substitution_recommendations` (or generate `substitution_engine.parquet`)."
         )
         return
-    if recipes.empty:
-        st.warning("No recipe data available to map substitutions.")
-        return
-
-    recipes = recipes.copy()
-    recipes["ingredient_list"] = recipes["top_ingredients"].apply(_to_ingredients_list)
-    recipes["display_rating"] = recipes["sentiment_rating"].fillna(recipes["avg_rating"])
     candidate_set = set(subs["candidate_ingredient"])
-    recipes["has_substitutions"] = recipes["ingredient_list"].apply(
-        lambda ing_list: any(ing in candidate_set for ing in ing_list)
-    )
+    current_candidate_count = int(st.session_state.get(_RECIPE_PICKER_CANDIDATE_COUNT_KEY, -1))
+    if current_candidate_count != len(candidate_set):
+        st.session_state.pop(_RECIPE_PICKER_STATE_KEY, None)
+        st.session_state.pop(_RECIPE_PICKER_OFFSET_KEY, None)
+        st.session_state.pop(_RECIPE_PICKER_EXHAUSTED_KEY, None)
+        st.session_state[_RECIPE_PICKER_CANDIDATE_COUNT_KEY] = len(candidate_set)
 
-    recipes_with_subs = recipes[recipes["has_substitutions"]].copy()
+    if _RECIPE_PICKER_STATE_KEY not in st.session_state:
+        _prime_recipe_picker(candidate_set)
+
+    recipes_with_subs = st.session_state.get(_RECIPE_PICKER_STATE_KEY)
+    if not isinstance(recipes_with_subs, pd.DataFrame):
+        recipes_with_subs = pd.DataFrame()
+
+    if recipes_with_subs.empty:
+        for _ in range(3):
+            if bool(st.session_state.get(_RECIPE_PICKER_EXHAUSTED_KEY, False)):
+                break
+            _append_recipe_picker_batch(candidate_set)
+            recipes_with_subs = st.session_state.get(_RECIPE_PICKER_STATE_KEY, recipes_with_subs)
+            if isinstance(recipes_with_subs, pd.DataFrame) and not recipes_with_subs.empty:
+                break
+
     if recipes_with_subs.empty:
         st.info(
-            "No recipes currently map to substitution candidates. "
-            "Try rerunning features/load or selecting a broader recipe pool."
+            "No recipes currently map to substitution candidates with available data. "
+            "Try rerunning features/load for broader coverage."
         )
         return
+
+    picker_total = len(recipes_with_subs)
+    picker_exhausted = bool(st.session_state.get(_RECIPE_PICKER_EXHAUSTED_KEY, False))
+    #st.caption(f"Recipe picker loaded {picker_total} recipes with substitutions.")
 
     option_map = {
         f"{row['recipe_id']} — {row['name']}": row["recipe_id"]
@@ -690,7 +807,32 @@ def render() -> None:
         st.warning("Recipe picker could not be populated from current data.")
         return
 
-    selected_label = st.selectbox("Select recipe", options=list(option_map.keys()))
+    recipe_options = list(option_map.keys())
+    if not picker_exhausted:
+        recipe_options.append(_RECIPE_PICKER_LOAD_MORE_SENTINEL)
+
+    previous_label = st.session_state.get(_RECIPE_PICKER_LAST_SELECTION_KEY)
+    if previous_label not in option_map and option_map:
+        previous_label = next(iter(option_map))
+
+    default_index = 0
+    if previous_label in recipe_options:
+        default_index = recipe_options.index(previous_label)
+
+    selected_label = st.selectbox(
+        "Select recipe",
+        options=recipe_options,
+        index=default_index,
+    )
+
+    if selected_label == _RECIPE_PICKER_LOAD_MORE_SENTINEL:
+        _append_recipe_picker_batch(candidate_set)
+        fallback_label = previous_label if previous_label in option_map else next(iter(option_map))
+        st.session_state[_RECIPE_PICKER_LAST_SELECTION_KEY] = fallback_label
+        _trigger_rerun()
+        return
+
+    st.session_state[_RECIPE_PICKER_LAST_SELECTION_KEY] = selected_label
     selected_recipe_id = option_map[selected_label]
     recipe_row = recipes_with_subs.set_index("recipe_id").loc[selected_recipe_id]
     recipe_ingredients = set(recipe_row["ingredient_list"])
