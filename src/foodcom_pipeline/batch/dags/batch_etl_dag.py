@@ -161,8 +161,7 @@ with DAG(
         task_id='extract_interactions',
         python_callable=extract_interactions,
         doc_md=(
-            'Incremental extract of RAW_interactions.csv. '
-            'Filters to rows newer than MAX(full_date) via dim_date join. '
+            'Full extract of RAW_interactions.csv on every run (no warehouse watermark). '
             'Pushes `has_new_data` flag to XCom.'
         ),
     )
