@@ -6,12 +6,14 @@ RUN pip install --no-cache-dir \
     kaggle \
     pandas \
     numpy \
+    pytrends \
     scipy \
     scikit-learn \
     requests \
     sqlalchemy \
     psycopg2-binary \
     transformers \
+    sentence-transformers \
     torch \
     vaderSentiment
 

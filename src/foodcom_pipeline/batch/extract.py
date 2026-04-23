@@ -2,7 +2,8 @@
 extract.py
 ----------
 Handles extraction of RAW_recipes.csv and RAW_interactions.csv.
-Both extractions are designed to run as independent Airflow tasks in parallel.
+Recipes and interactions are staged as independent Airflow tasks in parallel;
+interactions are always a full read of the CSV (no incremental watermark).
 
 Data is staged as parquet files rather than passed via XCom, since DataFrames
 can be too large for Airflow's XCom storage (backed by the metadata DB).
@@ -14,7 +15,7 @@ import os
 import re
 import subprocess
 import zipfile
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 import pickle
 import sys
@@ -22,7 +23,6 @@ import types
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import create_engine, text
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +32,6 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.getenv('FOODCOM_DATA_DIR', '/opt/airflow/data'))
 STAGING_DIR = Path(os.getenv('FOODCOM_STAGING_DIR', '/opt/airflow/staging'))
-POSTGRES_CONN = os.getenv(
-    'FOODCOM_POSTGRES_CONN', 'postgresql://user:password@postgres:5432/foodcom'
-)
 
 RECIPES_CSV = DATA_DIR / 'RAW_recipes.csv'
 INTERACTIONS_CSV = DATA_DIR / 'RAW_interactions.csv'
@@ -68,45 +65,6 @@ KAGGLE_DATASET = os.getenv(
 ENABLE_KAGGLE_DOWNLOAD = (
     os.getenv('FOODCOM_ENABLE_KAGGLE_DOWNLOAD', 'true').lower() == 'true'
 )
-
-
-# ---------------------------------------------------------------------------
-# Watermark helper
-# ---------------------------------------------------------------------------
-
-
-def get_last_processed_date(engine) -> datetime | None:
-    """
-    Returns the latest interaction date already loaded into fact_interactions,
-    or None if the table is empty (first run).
-    """
-    # Star schema stores dates in dim_date and references them via date_id.
-    # On first run, tables may not exist yet; treat that as "no watermark".
-    try:
-        with engine.connect() as conn:
-            value = conn.execute(
-                text(
-                    """
-                    SELECT MAX(d.full_date) AS last_processed_date
-                    FROM fact_interactions f
-                    JOIN dim_date d
-                      ON d.date_id = f.date_id
-                    """
-                )
-            ).scalar()
-    except Exception as e:
-        logger.info(
-            'Could not read watermark from warehouse (first run or schema missing). '
-            f'Proceeding with full extract. Error: {e}'
-        )
-        return None
-
-    if value is None:
-        logger.info('fact_interactions is empty — this is a full initial load.')
-    else:
-        logger.info(f'Watermark: last processed date = {value}')
-
-    return value
 
 
 # ---------------------------------------------------------------------------
@@ -346,16 +304,12 @@ def _validate_recipes(df: pd.DataFrame) -> None:
 
 def extract_interactions(**context) -> None:
     """
-    Extracts RAW_interactions.csv, filtering to only rows not yet processed
-    (based on the watermark in fact_interactions).
+    Extracts the full RAW_interactions.csv on every run (no warehouse watermark).
 
-    On first run (empty warehouse), extracts everything except the held-out
-    streaming simulation set, which is identified by a separate flag column
-    or a pre-split file.
+    Downstream sentiment, features, and dim_recipe aggregates always see the
+    complete interaction history so avg_rating, review_count, and sentiment_rating
+    stay populated from a full recompute over the staged file.
     """
-    engine = create_engine(POSTGRES_CONN)
-    last_processed_date = get_last_processed_date(engine)
-
     logger.info(f'Reading interactions from {INTERACTIONS_CSV}')
 
     df = pd.read_csv(
@@ -365,21 +319,11 @@ def extract_interactions(**context) -> None:
         parse_dates=['date'],
     )
 
-    total_rows = len(df)
-
-    # Apply watermark filter — only process new records
-    if last_processed_date is not None:
-        df = df[df['date'] > pd.Timestamp(last_processed_date)]
-        logger.info(
-            f'Watermark filter applied: {total_rows} total → {len(df)} new interactions'
-        )
-    else:
-        logger.info(f'Initial load: processing all {total_rows} interactions')
+    logger.info(f'Full interactions extract: {len(df):,} rows')
 
     if df.empty:
-        logger.info(
-            'No new interactions after watermark — staging empty parquet so paths '
-            'exist for downstream (e.g. clean when check_has_new_data is forced).'
+        logger.warning(
+            'RAW_interactions.csv produced zero rows — staging empty parquet for downstream.'
         )
         STAGING_DIR.mkdir(parents=True, exist_ok=True)
         empty = pd.DataFrame(

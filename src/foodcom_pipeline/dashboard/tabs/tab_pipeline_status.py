@@ -50,6 +50,7 @@ PIPELINE_STAGES: list[dict] = [
     {"stage": "Sentiment", "task": "run_vader_sentiment",    "file": "interactions_sentiment.parquet", "label": "Sentiment-scored interactions"},
     {"stage": "Features",  "task": "features",               "file": "user_stats.parquet",             "label": "Users with features"},
     {"stage": "Features",  "task": "features",               "file": "ingredient_features.parquet",    "label": "Ingredient features"},
+    {"stage": "Features",  "task": "features",               "file": "substitution_engine.parquet",    "label": "Substitution pairs"},
     {"stage": "Cluster",   "task": "run_kmeans_clustering",  "file": "user_clusters.parquet",          "label": "Clustered users"},
 ]
 
@@ -170,9 +171,9 @@ def _load_substitution_stats() -> dict | None:
     path = STAGING_DIR / "ingredient_features.parquet"
     if not path.exists():
         return None
-    df = pd.read_parquet(path, columns=["is_substitution_candidate"])
+    df = pd.read_parquet(path)
     total = len(df)
-    candidates = int(df["is_substitution_candidate"].sum())
+    candidates = total
     return {"total_ingredients": total, "candidates": candidates,
             "rate": candidates / total if total > 0 else 0.0}
 

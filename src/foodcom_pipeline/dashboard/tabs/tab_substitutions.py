@@ -1,11 +1,26 @@
 """Smart Substitutions tab — substitution engine recommendations and swap impact."""
 
 import ast
+import html
 import os
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import pandas as pd
 import streamlit as st
+
+
+def _get_fragment_decorator():
+    decorator = getattr(st, "fragment", None)
+    if decorator is not None:
+        return decorator
+    decorator = getattr(st, "experimental_fragment", None)
+    if decorator is not None:
+        return decorator
+    return lambda fn: fn
+
+
+_fragment = _get_fragment_decorator()
 
 
 def _resolve_staging_dir() -> Path:
@@ -27,6 +42,16 @@ def _resolve_staging_dir() -> Path:
 
 STAGING_DIR = _resolve_staging_dir()
 _BAYESIAN_PSEUDO_COUNT = 10.0
+_RECIPE_PICKER_INITIAL_OPTIONS = 120
+_RECIPE_PICKER_BATCH_SIZE = 250
+_RECIPE_PICKER_MAX_INITIAL_BATCHES = 4
+
+_RECIPE_PICKER_STATE_KEY = "_subs_recipe_picker_rows"
+_RECIPE_PICKER_OFFSET_KEY = "_subs_recipe_picker_next_offset"
+_RECIPE_PICKER_EXHAUSTED_KEY = "_subs_recipe_picker_exhausted"
+_RECIPE_PICKER_CANDIDATE_COUNT_KEY = "_subs_recipe_picker_candidate_count"
+_RECIPE_PICKER_LAST_SELECTION_KEY = "_subs_recipe_picker_last_selection"
+_RECIPE_PICKER_LOAD_MORE_SENTINEL = "Load more recipes..."
 
 _PG_USER = os.getenv("POSTGRES_USER", "user")
 _PG_PASS = os.getenv("POSTGRES_PASSWORD", "password")
@@ -49,6 +74,7 @@ def _load_substitution_pairs() -> pd.DataFrame:
                 SELECT
                     candidate_ingredient,
                     substitute_ingredient,
+                    substitute_similarity,
                     recommendation_score,
                     rating_delta,
                     sentiment_delta,
@@ -78,7 +104,7 @@ def _load_substitution_pairs() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def _load_recipes_for_picker() -> pd.DataFrame:
+def _load_recipes_for_picker(limit: int = 3000, offset: int = 0) -> pd.DataFrame:
     try:
         import psycopg2
 
@@ -86,11 +112,25 @@ def _load_recipes_for_picker() -> pd.DataFrame:
         try:
             df = pd.read_sql(
                 """
-                SELECT recipe_id, name, sentiment_rating, avg_rating, top_ingredients, weighted_review_count
+                SELECT
+                    recipe_id,
+                    name,
+                    sentiment_rating,
+                    avg_rating,
+                    top_ingredients,
+                    weighted_review_count,
+                    protein,
+                    saturated_fat,
+                    sugar,
+                    sodium,
+                    calories
                 FROM dim_recipe
-                ORDER BY COALESCE(sentiment_rating, avg_rating) DESC NULLS LAST
+                
+                LIMIT %s
+                OFFSET %s
                 """,
                 conn,
+                params=(int(limit), int(offset)),
             )
         finally:
             conn.close()
@@ -109,6 +149,11 @@ def _load_recipes_for_picker() -> pd.DataFrame:
     recipes["avg_rating"] = None
     recipes["sentiment_rating"] = None
     recipes["weighted_review_count"] = None
+    recipes["protein"] = None
+    recipes["saturated_fat"] = None
+    recipes["sugar"] = None
+    recipes["sodium"] = None
+    recipes["calories"] = None
 
     if sentiment_path.exists():
         sentiment = pd.read_parquet(
@@ -122,7 +167,100 @@ def _load_recipes_for_picker() -> pd.DataFrame:
         recipes = recipes.drop(columns=["sentiment_rating_new"], errors="ignore")
         recipes = recipes.drop(columns=["weighted_review_count_new"], errors="ignore")
 
-    return recipes.head(3000)
+    recipes = recipes.sort_values(
+        by=["sentiment_rating", "avg_rating"],
+        ascending=False,
+        na_position="last",
+    )
+    return recipes.iloc[offset : offset + limit]
+
+
+def _fetch_recipes_with_substitutions_batch(
+    candidate_set: set[str],
+    offset: int,
+    batch_size: int,
+) -> tuple[pd.DataFrame, bool]:
+    recipes_batch = _load_recipes_for_picker(limit=batch_size, offset=offset)
+    if recipes_batch.empty:
+        return recipes_batch, True
+
+    recipes_batch = recipes_batch.copy()
+    recipes_batch["ingredient_list"] = recipes_batch["top_ingredients"].apply(_to_ingredients_list)
+    for col in ("sentiment_rating", "avg_rating", "weighted_review_count"):
+        if col in recipes_batch.columns:
+            recipes_batch[col] = pd.to_numeric(recipes_batch[col], errors="coerce")
+    recipes_batch["display_rating"] = recipes_batch["sentiment_rating"].fillna(recipes_batch["avg_rating"])
+    recipes_batch["has_substitutions"] = recipes_batch["ingredient_list"].apply(
+        lambda ing_list: any(ing in candidate_set for ing in ing_list)
+    )
+    recipes_with_subs = recipes_batch[recipes_batch["has_substitutions"]].copy()
+    exhausted = len(recipes_batch) < batch_size
+    return recipes_with_subs, exhausted
+
+
+def _prime_recipe_picker(candidate_set: set[str]) -> None:
+    accumulated_batches: list[pd.DataFrame] = []
+    offset = 0
+    exhausted = False
+
+    for _ in range(_RECIPE_PICKER_MAX_INITIAL_BATCHES):
+        batch, exhausted = _fetch_recipes_with_substitutions_batch(
+            candidate_set=candidate_set,
+            offset=offset,
+            batch_size=_RECIPE_PICKER_BATCH_SIZE,
+        )
+        if not batch.empty:
+            accumulated_batches.append(batch)
+        offset += _RECIPE_PICKER_BATCH_SIZE
+        total_options = sum(len(df) for df in accumulated_batches)
+        if total_options >= _RECIPE_PICKER_INITIAL_OPTIONS or exhausted:
+            break
+
+    if accumulated_batches:
+        picker_df = pd.concat(accumulated_batches, ignore_index=True)
+        picker_df = picker_df.drop_duplicates(subset=["recipe_id"], keep="first")
+    else:
+        picker_df = pd.DataFrame()
+
+    st.session_state[_RECIPE_PICKER_STATE_KEY] = picker_df
+    st.session_state[_RECIPE_PICKER_OFFSET_KEY] = offset
+    st.session_state[_RECIPE_PICKER_EXHAUSTED_KEY] = exhausted
+
+
+def _append_recipe_picker_batch(candidate_set: set[str]) -> None:
+    if st.session_state.get(_RECIPE_PICKER_EXHAUSTED_KEY, False):
+        return
+
+    offset = int(st.session_state.get(_RECIPE_PICKER_OFFSET_KEY, 0))
+    current = st.session_state.get(_RECIPE_PICKER_STATE_KEY)
+    if not isinstance(current, pd.DataFrame):
+        current = pd.DataFrame()
+
+    next_batch, exhausted = _fetch_recipes_with_substitutions_batch(
+        candidate_set=candidate_set,
+        offset=offset,
+        batch_size=_RECIPE_PICKER_BATCH_SIZE,
+    )
+    st.session_state[_RECIPE_PICKER_OFFSET_KEY] = offset + _RECIPE_PICKER_BATCH_SIZE
+    st.session_state[_RECIPE_PICKER_EXHAUSTED_KEY] = exhausted
+
+    if next_batch.empty:
+        st.session_state[_RECIPE_PICKER_STATE_KEY] = current
+        return
+
+    combined = pd.concat([current, next_batch], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["recipe_id"], keep="first")
+    st.session_state[_RECIPE_PICKER_STATE_KEY] = combined
+
+
+def _trigger_rerun() -> None:
+    rerun_fn = getattr(st, "rerun", None)
+    if callable(rerun_fn):
+        rerun_fn()
+        return
+    experimental_rerun_fn = getattr(st, "experimental_rerun", None)
+    if callable(experimental_rerun_fn):
+        experimental_rerun_fn()
 
 
 @st.cache_data(ttl=300)
@@ -173,8 +311,14 @@ def _format_delta(value: float | None, higher_is_better: bool) -> str:
         return "—"
     val = float(value)
     sign = "+" if val >= 0 else ""
-    emoji = "✅" if (val >= 0 if higher_is_better else val <= 0) else "⚠️"
-    return f"{emoji} {sign}{val:.3f}"
+    if val == 0:
+        emoji = "⚪"
+    elif val > 0:
+        emoji = "🟢" if higher_is_better else "🔴"
+    else:
+        emoji = "🔴" if higher_is_better else "🟢"
+    arrow = "↑" if val > 0 else "↓" if val < 0 else "→"
+    return f"{emoji} {arrow} {sign}{abs(val):.3f}"
 
 
 def _to_star_rating(sentiment_like: float | None) -> float | None:
@@ -184,6 +328,142 @@ def _to_star_rating(sentiment_like: float | None) -> float | None:
     if -1.0 <= value <= 1.0:
         return max(1.0, min(5.0, 2.0 * value + 3.0))
     return max(0.0, min(5.0, value))
+
+
+def _safe_float(value) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _avg_rating_to_sentiment(avg: float) -> float:
+    """Map typical 1–5 star mean into ~[-1, 1] to align with interaction sentiment scale."""
+    return max(-1.0, min(1.0, (float(avg) - 3.0) / 2.0))
+
+
+def _recipe_sentiment_score_for_bayesian(recipe_row: pd.Series) -> tuple[float | None, str]:
+    """
+    Returns (score_on_minus1_to_1, source) for Bayesian sentiment metrics.
+    Prefers sentiment_rating; falls back to avg_rating / display_rating with scale detection.
+    """
+    s = _safe_float(recipe_row.get("sentiment_rating"))
+    if s is not None:
+        if -1.0 <= s <= 1.0:
+            return s, "sentiment_rating"
+        if 0.0 <= s <= 5.0:
+            return _avg_rating_to_sentiment(s), "sentiment_rating"
+        return max(-1.0, min(1.0, s)), "sentiment_rating"
+
+    avg = _safe_float(recipe_row.get("avg_rating"))
+    if avg is not None:
+        return _avg_rating_to_sentiment(avg), "avg_rating"
+
+    dr = _safe_float(recipe_row.get("display_rating"))
+    if dr is None:
+        return None, ""
+    if -1.0 <= dr <= 1.0:
+        return dr, "display_rating"
+    if 0.0 <= dr <= 5.0:
+        return _avg_rating_to_sentiment(dr), "display_rating"
+    return max(-1.0, min(1.0, dr)), "display_rating"
+
+
+def _recipe_star_equivalent(recipe_row: pd.Series) -> float | None:
+    """Star display: from sentiment [-1,1] if available, else average rating on 0–5."""
+    s = _safe_float(recipe_row.get("sentiment_rating"))
+    if s is not None and -1.0 <= s <= 1.0:
+        return _to_star_rating(s)
+    if s is not None and 0.0 <= s <= 5.0:
+        return max(0.0, min(5.0, s))
+
+    avg = _safe_float(recipe_row.get("avg_rating"))
+    if avg is not None:
+        return max(0.0, min(5.0, avg))
+
+    dr = _safe_float(recipe_row.get("display_rating"))
+    if dr is None:
+        return None
+    if -1.0 <= dr <= 1.0:
+        return _to_star_rating(dr)
+    return max(0.0, min(5.0, dr))
+
+
+def _format_metric_value(value: float | None, suffix: str = "") -> str:
+    if value is None:
+        return "—"
+    return f"{value:.2f}{suffix}"
+
+
+def _format_base_adjusted(base: float | None, adjusted: float | None) -> str:
+    if base is None or adjusted is None:
+        return "—"
+    return f"{base:.2f} → {adjusted:.2f}"
+
+
+def _recommendation_stars(score: float | None) -> str:
+    """Convert recommendation score to star rating (1-5)."""
+    if score is None or pd.isna(score):
+        return "⭐ Not rated"
+    score_val = float(score)
+    if score_val >= 0.8:
+        return "⭐⭐⭐⭐⭐ Highly Recommended"
+    elif score_val >= 0.6:
+        return "⭐⭐⭐⭐ Very Good"
+    elif score_val >= 0.4:
+        return "⭐⭐⭐ Good"
+    elif score_val >= 0.2:
+        return "⭐⭐ Fair"
+    else:
+        return "⭐ Consider Others"
+
+
+def _recommendation_reason(delta_rating: float | None, delta_sentiment: float | None, delta_health: float | None) -> str:
+    """Generate brief reason for recommendation."""
+    reasons = []
+    if delta_rating is not None and delta_rating > 0.1:
+        reasons.append("Better rating")
+    if delta_sentiment is not None and delta_sentiment > 0.05:
+        reasons.append("Better sentiment")
+    if delta_health is not None and delta_health > 0.1:
+        reasons.append("Healthier")
+    reasons.append("Culinary compatible")
+    # if not reasons:
+    #     return "Culinary compatible"
+    return " • ".join(reasons)
+
+
+def _buy_link_for_ingredient(ingredient: str) -> str:
+    query = quote_plus(ingredient.strip())
+    return f"https://www.amazon.com/s?k={query}&i=grocery"
+
+
+def _update_swap_map(
+    active_swaps: dict[str, str],
+    candidate_ingredient: str,
+    substitute_ingredient: str | None,
+) -> dict[str, str]:
+    updated_swaps = dict(active_swaps)
+    if substitute_ingredient is None:
+        updated_swaps.pop(candidate_ingredient, None)
+    else:
+        updated_swaps[candidate_ingredient] = substitute_ingredient
+    return updated_swaps
+
+
+def _set_recipe_swap(
+    swap_key: str,
+    candidate_ingredient: str,
+    substitute_ingredient: str | None,
+) -> None:
+    active_swaps = dict(st.session_state.get(swap_key, {}))
+    st.session_state[swap_key] = _update_swap_map(
+        active_swaps,
+        candidate_ingredient,
+        substitute_ingredient,
+    )
 
 
 def _recompute_bayesian_sentiment(
@@ -212,11 +492,410 @@ def _recompute_bayesian_sentiment(
     return (weighted_sum + synthetic_sum + m * c) / (w + synthetic_n + m)
 
 
+@_fragment
+def _render_swap_workspace(
+    recs: pd.DataFrame,
+    recipe_row: pd.Series,
+    global_sentiment_mean: float,
+    selected_recipe_id: int,
+) -> None:
+
+    swap_key = f"_subs_swaps_{int(selected_recipe_id)}"
+    if swap_key not in st.session_state:
+        st.session_state[swap_key] = {}
+    active_swaps: dict = st.session_state[swap_key]
+
+    if isinstance(recipe_row, pd.DataFrame):
+        recipe_row = recipe_row.iloc[0]
+
+    base_rating, base_rating_source = _recipe_sentiment_score_for_bayesian(recipe_row)
+    base_stars = _recipe_star_equivalent(recipe_row)
+    base_weight = recipe_row.get("weighted_review_count")
+    base_weight = float(base_weight) if pd.notna(base_weight) else 0.0
+    if active_swaps:
+        active_df = pd.DataFrame(
+            {
+                "candidate_ingredient": list(active_swaps.keys()),
+                "substitute_ingredient": list(active_swaps.values()),
+            }
+        )
+        selected_rows = recs.merge(
+            active_df,
+            on=["candidate_ingredient", "substitute_ingredient"],
+            how="inner",
+        )
+    else:
+        selected_rows = recs.iloc[0:0]
+
+    rating_uplift = float(selected_rows["rating_delta"].sum()) if not selected_rows.empty else 0.0
+    swap_sentiment_deltas = (
+        selected_rows["sentiment_delta"].astype(float).tolist() if not selected_rows.empty else []
+    )
+    adjusted_sentiment_bayes = _recompute_bayesian_sentiment(
+        base_sentiment_rating=base_rating,
+        weighted_review_count=base_weight,
+        global_mean=global_sentiment_mean,
+        swap_sentiment_deltas=swap_sentiment_deltas,
+    )
+    adjusted_stars = _to_star_rating(adjusted_sentiment_bayes)
+    delta_totals = {
+        "rating": float(selected_rows["rating_delta"].sum()) if not selected_rows.empty else 0.0,
+        "sentiment": float(selected_rows["sentiment_delta"].sum()) if not selected_rows.empty else 0.0,
+        "protein": float(selected_rows["protein_delta"].sum()) if not selected_rows.empty else 0.0,
+        "saturated_fat": float(selected_rows["saturated_fat_delta"].sum()) if not selected_rows.empty else 0.0,
+        "sugar": float(selected_rows["sugar_delta"].sum()) if not selected_rows.empty else 0.0,
+        "sodium": float(selected_rows["sodium_delta"].sum()) if not selected_rows.empty else 0.0,
+        "calories": float(selected_rows["calories_delta"].sum()) if not selected_rows.empty else 0.0,
+        "health": float(selected_rows["health_delta"].sum()) if not selected_rows.empty else 0.0,
+    }
+
+    base_protein = _safe_float(recipe_row.get("protein"))
+    base_saturated_fat = _safe_float(recipe_row.get("saturated_fat"))
+    base_sugar = _safe_float(recipe_row.get("sugar"))
+    base_sodium = _safe_float(recipe_row.get("sodium"))
+    base_calories = _safe_float(recipe_row.get("calories"))
+    base_health = (
+        0.4 * base_protein
+        - 0.25 * base_saturated_fat
+        - 0.2 * base_sugar
+        - 0.15 * base_sodium
+        if None not in (base_protein, base_saturated_fat, base_sugar, base_sodium)
+        else None
+    )
+
+    adjusted_protein = (
+        base_protein + delta_totals["protein"] if base_protein is not None else None
+    )
+    adjusted_saturated_fat = (
+        base_saturated_fat + delta_totals["saturated_fat"]
+        if base_saturated_fat is not None
+        else None
+    )
+    adjusted_sugar = base_sugar + delta_totals["sugar"] if base_sugar is not None else None
+    adjusted_sodium = base_sodium + delta_totals["sodium"] if base_sodium is not None else None
+    adjusted_calories = (
+        base_calories + delta_totals["calories"] if base_calories is not None else None
+    )
+    adjusted_health = (
+        base_health + delta_totals["health"] if base_health is not None else None
+    )
+
+    if not active_swaps:
+        st.info("👉 Select an ingredient below and apply swaps to see the impact on your recipe.")
+    else:
+        st.success(f"✅ {len(active_swaps)} swap(s) applied. See estimated changes below.")
+
+    with st.expander("⭐ Rating Impact", expanded=True):
+        swap_impact_col1, swap_impact_col2 = st.columns(2)
+        with swap_impact_col1:
+            st.metric(
+                "Current Rating",
+                f"{base_stars:.1f}★" if base_stars is not None else "—",
+                delta=f"+{rating_uplift:.2f}" if rating_uplift > 0 else (f"{rating_uplift:.2f}" if rating_uplift != 0 else "No change"),
+                delta_color="normal",
+            )
+        with swap_impact_col2:
+            st.metric(
+                "With Your Swaps",
+                f"{adjusted_stars:.1f}★" if adjusted_stars is not None else "—",
+                help="Estimated rating after applying all selected swaps.",
+            )
+
+    with st.expander("📈 Sentiment Impact", expanded=True):
+        sentiment_col1, sentiment_col2 = st.columns(2)
+        with sentiment_col1:
+            st.metric(
+                "Current Sentiment (Bayesian)",
+                f"{base_rating:.3f}" if base_rating is not None else "—",
+                delta=(
+                    f"+{delta_totals['sentiment']:.3f}"
+                    if delta_totals["sentiment"] > 0
+                    else (
+                        f"{delta_totals['sentiment']:.3f}"
+                        if delta_totals["sentiment"] != 0
+                        else "No change"
+                    )
+                ),
+                delta_color="normal",
+            )
+        with sentiment_col2:
+            st.metric(
+                "With Your Swaps (Bayesian)",
+                f"{adjusted_sentiment_bayes:.3f}" if adjusted_sentiment_bayes is not None else "—",
+                help="Estimated Bayesian sentiment after applying all selected swaps.",
+            )
+
+        st.caption(
+            f"Bayesian smoothing combines the recipe's current sentiment with global sentiment to avoid "
+            f"overreacting when review counts are low. It then adds the swap sentiment effects as synthetic "
+            f"evidence and recomputes a more stable estimate. "
+            f"Parameters: m={_BAYESIAN_PSEUDO_COUNT:.0f} (prior strength), "
+            f"global mean={global_sentiment_mean:.3f}, review depth={base_weight:.1f}."
+        )
+
+    with st.expander("🥗 Nutrition Impact", expanded=True):
+        st.markdown("**Macronutrients**")
+        n1, n2, n3 = st.columns(3)
+        n1.metric(
+            "Protein",
+            _format_base_adjusted(base_protein, adjusted_protein),
+            delta=(
+                f"{delta_totals['protein']:+.2f}g"
+                if base_protein is not None
+                else None
+            ),
+        )
+        n2.metric(
+            "Saturated Fat",
+            _format_base_adjusted(base_saturated_fat, adjusted_saturated_fat),
+            delta=(
+                f"{delta_totals['saturated_fat']:+.2f}g"
+                if base_saturated_fat is not None
+                else None
+            ),
+            delta_color="inverse",
+        )
+        n3.metric(
+            "Calories",
+            _format_base_adjusted(base_calories, adjusted_calories),
+            delta=(
+                f"{delta_totals['calories']:+.0f}kcal"
+                if base_calories is not None
+                else None
+            ),
+            delta_color="inverse",
+        )
+
+        st.markdown("**Sugars & Sodium**")
+        n4, n5 = st.columns(2)
+        n4.metric(
+            "Sugar",
+            _format_base_adjusted(base_sugar, adjusted_sugar),
+            delta=(
+                f"{delta_totals['sugar']:+.2f}g"
+                if base_sugar is not None
+                else None
+            ),
+            delta_color="inverse",
+        )
+        n5.metric(
+            "Sodium",
+            _format_base_adjusted(base_sodium, adjusted_sodium),
+            delta=(
+                f"{delta_totals['sodium']:+.0f}mg"
+                if base_sodium is not None
+                else None
+            ),
+            delta_color="inverse",
+        )
+
+    available_candidates = sorted(recs["candidate_ingredient"].dropna().astype(str).unique().tolist())
+    st.markdown("### Ingredients in this recipe")
+    ingredient_list = recipe_row.get("ingredient_list")
+    ingredient_list = ingredient_list if isinstance(ingredient_list, list) else []
+    ingredient_pills: list[str] = []
+    for ingredient in ingredient_list:
+        original = str(ingredient).strip().lower()
+        swapped = active_swaps.get(original)
+        if swapped:
+            ingredient_pills.append(
+                (
+                    '<span class="subs-ing-pill subs-ing-pill-swapped">'
+                    f'{html.escape(str(swapped))}'
+                    '</span>'
+                )
+            )
+        else:
+            ingredient_pills.append(
+                (
+                    '<span class="subs-ing-pill subs-ing-pill-original">'
+                    f'{html.escape(original)}'
+                    '</span>'
+                )
+            )
+    if ingredient_pills:
+        st.markdown(
+            f'<div class="subs-ing-list">{"".join(ingredient_pills)}</div>',
+            unsafe_allow_html=True,
+        )
+    st.caption("Select an ingredient to view substitutes.")
+
+    selected_candidate_key = f"_subs_selected_candidate_{int(selected_recipe_id)}"
+    if selected_candidate_key not in st.session_state:
+        st.session_state[selected_candidate_key] = available_candidates[0] if available_candidates else None
+    if st.session_state[selected_candidate_key] not in available_candidates and available_candidates:
+        st.session_state[selected_candidate_key] = available_candidates[0]
+
+    selected_candidate = st.selectbox(
+        "🧂 Pick an ingredient to improve",
+        options=available_candidates,
+        index=available_candidates.index(st.session_state[selected_candidate_key]),
+        key=f"pick_ing_{selected_recipe_id}",
+    )
+    st.session_state[selected_candidate_key] = selected_candidate
+
+    candidate_rows = (
+        recs[recs["candidate_ingredient"] == selected_candidate]
+        .sort_values("recommendation_score", ascending=False)
+        .reset_index(drop=True)
+    )
+    st.divider()
+    st.markdown(f"### 🔄 Suggested swaps for `{selected_candidate.title()}`")
+    if candidate_rows.empty:
+        st.warning(f"No swaps available for {selected_candidate}.")
+    else:
+        st.caption(f"{len(candidate_rows)} option(s) ranked by quality, nutrition & compatibility")
+
+    for rank, (_, cand_row) in enumerate(candidate_rows.iterrows(), 1):
+        sub = cand_row["substitute_ingredient"]
+        is_active = active_swaps.get(selected_candidate) == sub
+        
+        with st.container(border=True):
+            head_left, head_mid, head_right = st.columns([3, 2, 1])
+            with head_left:
+                st.markdown(f"**#{rank}. {sub.title()}**")
+                rec_stars = _recommendation_stars(cand_row.get("recommendation_score"))
+                st.caption(rec_stars)
+            with head_mid:
+                reason = _recommendation_reason(
+                    cand_row.get("rating_delta"),
+                    cand_row.get("sentiment_delta"),
+                    cand_row.get("health_delta"),
+                )
+                st.caption(f"💡 {reason}")
+            with head_right:
+                st.button(
+                    "✅ Swap" if is_active else "Apply",
+                    key=f"swap_{selected_recipe_id}_{selected_candidate}_{sub}",
+                    type="primary" if is_active else "secondary",
+                    use_container_width=True,
+                    on_click=_set_recipe_swap,
+                    args=(swap_key, selected_candidate, None if is_active else sub),
+                )
+
+            st.markdown("**Quality Impact**")
+            col_quality_1, col_quality_2, col_quality_3 = st.columns(3)
+            col_quality_1.metric(
+                "Rating",
+                _format_delta(cand_row.get("rating_delta"), True),
+                help="Expected change in recipe rating"
+            )
+            col_quality_2.metric(
+                "Sentiment",
+                _format_delta(cand_row.get("sentiment_delta"), True),
+                help="Expected change in sentiment"
+            )
+            col_quality_3.metric(
+                "Health score",
+                _format_delta(cand_row.get("health_delta"), True),
+                help="Overall nutrition improvement"
+            )
+
+            st.markdown("**Nutrition Changes**")
+            nut_1, nut_2, nut_3, nut_4 = st.columns(4)
+            nut_1.metric("Protein", _format_delta(cand_row.get("protein_delta"), True))
+            nut_2.metric("Sat Fat", _format_delta(cand_row.get("saturated_fat_delta"), False))
+            nut_3.metric("Sugar", _format_delta(cand_row.get("sugar_delta"), False))
+            nut_4.metric("Sodium", _format_delta(cand_row.get("sodium_delta"), False))
+
+            with st.expander("🛒 Buy options"):
+                promo_cols = st.columns(2)
+                with promo_cols[0]:
+                    st.markdown(f"**Get {sub.title()}**")
+                    st.link_button(
+                        "🛒 Shop on Amazon",
+                        _buy_link_for_ingredient(sub),
+                        use_container_width=True,
+                    )
+                with promo_cols[1]:
+                    st.markdown(f"**Compare with {selected_candidate.title()}**")
+                    st.link_button(
+                        "🔍 View alternatives",
+                        _buy_link_for_ingredient(selected_candidate),
+                        use_container_width=True,
+                    )
+        st.markdown("")
+
+
 def render() -> None:
-    st.header("🔄 Smart Substitutions")
+    st.markdown(
+        """
+        <style>
+        .subs-section-title {
+            font-weight: 700;
+            color: #0f172a;
+            margin-bottom: 6px;
+        }
+        .subs-ing-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 8px 0 10px 0;
+        }
+        .subs-ing-pill {
+            border-radius: 999px;
+            padding: 5px 10px;
+            font-size: 0.84rem;
+            font-weight: 600;
+            border: 1px solid transparent;
+            line-height: 1.2;
+        }
+        .subs-ing-pill-original {
+            color: #6b21a8;
+            background: #f5e8ff;
+            border-color: #d8b4fe;
+        }
+        .subs-ing-pill-swapped {
+            color: #166534;
+            background: #dcfce7;
+            border-color: #86efac;
+        }
+        .subs-ing-pill-swappable {
+            color: #1e40af;
+            background: #dbeafe;
+            border-color: #93c5fd;
+        }
+        .subs-separator {
+            color: #94a3b8;
+            font-weight: 600;
+            margin: 0 2px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+                '<div style="background:linear-gradient(135deg,#10b981,#059669);border-radius:10px;'
+                'padding:24px 28px;margin-bottom:12px;">'
+                '<h1 style="color:white;margin:0;font-size:26px;">🔄 Smart Substitutions</h1>'
+                '<p style="color:#d1fae5;margin:6px 0 0;">Missing an ingredient? Want healthier ingredient suggestions?<br>'
+                'Find better ingredient swaps — '
+                'compare rating lift, sentiment impact, and nutrition changes in one view.</p>'
+                '</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("❓ How it works"):
+        st.markdown(
+            """
+            1. **Pick a recipe** — Start by selecting a dish you want to improve.
+            2. **Choose an ingredient** — Select any ingredient you'd like to swap out.
+            3. **Compare swaps** — View recommended substitutes ranked by:
+               - *Quality*: Expected rating and sentiment improvement
+               - *Nutrition*: Changes in protein, fat, sugar, sodium
+               - *Compatibility*: How well the substitute matches the original flavor
+            4. **Apply swaps** — Select the swaps you want and see real-time nutrition impact.
+            5. **Check results** — View the estimated recipe improvement at the top.
+            
+            **Pro tips:**
+            - Swappable ingredients are highlighted in purple above.
+            - Swapped ingredients turn green so you can track your changes.
+            - Each swap card shows 1-5 stars for recommendation confidence.
+            - Your active swaps update the recipe metrics in real-time.
+            """
+        )
 
     subs = _load_substitution_pairs()
-    recipes = _load_recipes_for_picker()
     global_sentiment_mean = _load_global_sentiment_mean()
 
     if subs.empty:
@@ -225,38 +904,83 @@ def render() -> None:
             "`fact_substitution_recommendations` (or generate `substitution_engine.parquet`)."
         )
         return
-    if recipes.empty:
-        st.warning("No recipe data available to map substitutions.")
-        return
-
-    recipes = recipes.copy()
-    recipes["ingredient_list"] = recipes["top_ingredients"].apply(_to_ingredients_list)
-    recipes["display_rating"] = recipes["sentiment_rating"].fillna(recipes["avg_rating"])
     candidate_set = set(subs["candidate_ingredient"])
-    recipes["has_substitutions"] = recipes["ingredient_list"].apply(
-        lambda ing_list: any(ing in candidate_set for ing in ing_list)
-    )
+    current_candidate_count = int(st.session_state.get(_RECIPE_PICKER_CANDIDATE_COUNT_KEY, -1))
+    if current_candidate_count != len(candidate_set):
+        st.session_state.pop(_RECIPE_PICKER_STATE_KEY, None)
+        st.session_state.pop(_RECIPE_PICKER_OFFSET_KEY, None)
+        st.session_state.pop(_RECIPE_PICKER_EXHAUSTED_KEY, None)
+        st.session_state[_RECIPE_PICKER_CANDIDATE_COUNT_KEY] = len(candidate_set)
 
-    recipes_with_subs = recipes[recipes["has_substitutions"]].copy()
+    if _RECIPE_PICKER_STATE_KEY not in st.session_state:
+        _prime_recipe_picker(candidate_set)
+
+    recipes_with_subs = st.session_state.get(_RECIPE_PICKER_STATE_KEY)
+    if not isinstance(recipes_with_subs, pd.DataFrame):
+        recipes_with_subs = pd.DataFrame()
+
+    if recipes_with_subs.empty:
+        for _ in range(3):
+            if bool(st.session_state.get(_RECIPE_PICKER_EXHAUSTED_KEY, False)):
+                break
+            _append_recipe_picker_batch(candidate_set)
+            recipes_with_subs = st.session_state.get(_RECIPE_PICKER_STATE_KEY, recipes_with_subs)
+            if isinstance(recipes_with_subs, pd.DataFrame) and not recipes_with_subs.empty:
+                break
+
     if recipes_with_subs.empty:
         st.info(
-            "No recipes currently map to substitution candidates. "
-            "Try rerunning features/load or selecting a broader recipe pool."
+            "No recipes currently map to substitution candidates with available data. "
+            "Try rerunning features/load for broader coverage."
         )
         return
 
-    option_map = {
-        f"{row['recipe_id']} — {row['name']}": row["recipe_id"]
-        for _, row in recipes_with_subs.iterrows()
-        if pd.notna(row.get("recipe_id")) and str(row.get("name", "")).strip()
-    }
+    picker_total = len(recipes_with_subs)
+    picker_exhausted = bool(st.session_state.get(_RECIPE_PICKER_EXHAUSTED_KEY, False))
+    #st.caption(f"Recipe picker loaded {picker_total} recipes with substitutions.")
+
+    option_map = {}
+    for _, row in recipes_with_subs.iterrows():
+        if pd.notna(row.get("recipe_id")) and str(row.get("name", "")).strip():
+            recipe_name = str(row.get("name", "")).strip()
+            display_rating = _recipe_star_equivalent(row)
+            if display_rating is not None:
+                label = f"{recipe_name} ⭐ {display_rating:.1f}"
+            else:
+                label = recipe_name
+            option_map[label] = row["recipe_id"]
     if not option_map:
         st.warning("Recipe picker could not be populated from current data.")
         return
 
-    selected_label = st.selectbox("Select recipe", options=list(option_map.keys()))
+    recipe_options = list(option_map.keys())
+    if not picker_exhausted:
+        recipe_options.append(_RECIPE_PICKER_LOAD_MORE_SENTINEL)
+
+    previous_label = st.session_state.get(_RECIPE_PICKER_LAST_SELECTION_KEY)
+    if previous_label not in option_map and option_map:
+        previous_label = next(iter(option_map))
+
+    default_index = 0
+    if previous_label in recipe_options:
+        default_index = recipe_options.index(previous_label)
+
+    selected_label = st.selectbox(
+        "Select recipe",
+        options=recipe_options,
+        index=default_index,
+    )
+
+    if selected_label == _RECIPE_PICKER_LOAD_MORE_SENTINEL:
+        _append_recipe_picker_batch(candidate_set)
+        fallback_label = previous_label if previous_label in option_map else next(iter(option_map))
+        st.session_state[_RECIPE_PICKER_LAST_SELECTION_KEY] = fallback_label
+        _trigger_rerun()
+        return
+
+    st.session_state[_RECIPE_PICKER_LAST_SELECTION_KEY] = selected_label
     selected_recipe_id = option_map[selected_label]
-    recipe_row = recipes_with_subs[recipes_with_subs["recipe_id"] == selected_recipe_id].iloc[0]
+    recipe_row = recipes_with_subs.set_index("recipe_id").loc[selected_recipe_id]
     recipe_ingredients = set(recipe_row["ingredient_list"])
 
     recs = subs[subs["candidate_ingredient"].isin(recipe_ingredients)].copy()
@@ -268,104 +992,9 @@ def render() -> None:
 
     recs = recs.sort_values("recommendation_score", ascending=False).reset_index(drop=True)
 
-    st.caption(
-        "Recommendations prioritize underperforming ingredients and rank substitutes by "
-        "rating lift, sentiment lift, culinary compatibility, and nutrition delta."
+    _render_swap_workspace(
+        recs=recs,
+        recipe_row=recipe_row,
+        global_sentiment_mean=global_sentiment_mean,
+        selected_recipe_id=int(selected_recipe_id),
     )
-
-    swap_key = f"_subs_swaps_{int(selected_recipe_id)}"
-    if swap_key not in st.session_state:
-        st.session_state[swap_key] = {}
-    active_swaps: dict = st.session_state[swap_key]
-
-    base_rating = recipe_row.get("display_rating")
-    base_rating = float(base_rating) if pd.notna(base_rating) else None
-    base_weight = recipe_row.get("weighted_review_count")
-    base_weight = float(base_weight) if pd.notna(base_weight) else 0.0
-    selected_rows = recs[
-        recs.apply(
-            lambda r: active_swaps.get(r["candidate_ingredient"]) == r["substitute_ingredient"],
-            axis=1,
-        )
-    ]
-    rating_uplift = float(selected_rows["rating_delta"].sum()) if not selected_rows.empty else 0.0
-    swap_sentiment_deltas = (
-        selected_rows["sentiment_delta"].astype(float).tolist() if not selected_rows.empty else []
-    )
-    adjusted_sentiment_bayes = _recompute_bayesian_sentiment(
-        base_sentiment_rating=base_rating,
-        weighted_review_count=base_weight,
-        global_mean=global_sentiment_mean,
-        swap_sentiment_deltas=swap_sentiment_deltas,
-    )
-    base_stars = _to_star_rating(base_rating)
-    adjusted_stars = _to_star_rating(adjusted_sentiment_bayes)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Base Bayesian Sentiment", f"{base_rating:.3f}" if base_rating is not None else "—")
-    c2.metric(
-        "Estimated Rating Delta",
-        f"+{rating_uplift:.2f}" if rating_uplift > 0 else f"{rating_uplift:.2f}",
-    )
-    c3.metric(
-        "Adjusted Bayesian Sentiment",
-        f"{adjusted_sentiment_bayes:.3f}" if adjusted_sentiment_bayes is not None else "—",
-    )
-    c4, c5 = st.columns(2)
-    c4.metric("Base Star-Equivalent", f"{base_stars:.2f}★" if base_stars is not None else "—")
-    c5.metric(
-        "Adjusted Star-Equivalent",
-        f"{adjusted_stars:.2f}★" if adjusted_stars is not None else "—",
-    )
-    st.caption(
-        f"Bayesian recompute uses m={_BAYESIAN_PSEUDO_COUNT:.0f}, "
-        f"global sentiment mean C={global_sentiment_mean:.3f}, "
-        f"weighted review depth={base_weight:.2f}."
-    )
-
-    st.divider()
-
-    rendered_candidates: set[str] = set()
-    for _, row in recs.iterrows():
-        candidate = row["candidate_ingredient"]
-        if candidate in rendered_candidates:
-            continue
-        rendered_candidates.add(candidate)
-
-        candidate_rows = recs[recs["candidate_ingredient"] == candidate].head(3)
-        st.markdown(f"### Replace `{candidate}`")
-        for _, cand_row in candidate_rows.iterrows():
-            sub = cand_row["substitute_ingredient"]
-            card_left, card_right = st.columns([3, 1])
-            with card_left:
-                st.markdown(
-                    f"**Suggested substitute:** `{sub}`  \n"
-                    f"Score: `{cand_row['recommendation_score']:.3f}`"
-                )
-                st.caption(
-                    "Quality delta: "
-                    f"rating {_format_delta(cand_row.get('rating_delta'), True)}, "
-                    f"sentiment {_format_delta(cand_row.get('sentiment_delta'), True)}"
-                )
-                st.caption(
-                    "Nutrition delta: "
-                    f"protein {_format_delta(cand_row.get('protein_delta'), True)}, "
-                    f"sat fat {_format_delta(cand_row.get('saturated_fat_delta'), False)}, "
-                    f"sugar {_format_delta(cand_row.get('sugar_delta'), False)}, "
-                    f"sodium {_format_delta(cand_row.get('sodium_delta'), False)}"
-                )
-                st.caption("Sponsored placement hook: reserve this space for promoted substitute cards.")
-            with card_right:
-                is_active = active_swaps.get(candidate) == sub
-                if st.button(
-                    "Applied" if is_active else "Apply swap",
-                    key=f"swap_{selected_recipe_id}_{candidate}_{sub}",
-                    type="primary" if is_active else "secondary",
-                ):
-                    if is_active:
-                        active_swaps.pop(candidate, None)
-                    else:
-                        active_swaps[candidate] = sub
-                    st.session_state[swap_key] = active_swaps
-                    st.rerun()
-        st.divider()
