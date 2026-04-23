@@ -125,7 +125,7 @@ def _load_recipes_for_picker(limit: int = 3000, offset: int = 0) -> pd.DataFrame
                     sodium,
                     calories
                 FROM dim_recipe
-                ORDER BY COALESCE(sentiment_rating, avg_rating) DESC NULLS LAST
+                
                 LIMIT %s
                 OFFSET %s
                 """,
@@ -186,6 +186,9 @@ def _fetch_recipes_with_substitutions_batch(
 
     recipes_batch = recipes_batch.copy()
     recipes_batch["ingredient_list"] = recipes_batch["top_ingredients"].apply(_to_ingredients_list)
+    for col in ("sentiment_rating", "avg_rating", "weighted_review_count"):
+        if col in recipes_batch.columns:
+            recipes_batch[col] = pd.to_numeric(recipes_batch[col], errors="coerce")
     recipes_batch["display_rating"] = recipes_batch["sentiment_rating"].fillna(recipes_batch["avg_rating"])
     recipes_batch["has_substitutions"] = recipes_batch["ingredient_list"].apply(
         lambda ing_list: any(ing in candidate_set for ing in ing_list)
@@ -330,6 +333,58 @@ def _safe_float(value) -> float | None:
         return None
 
 
+def _avg_rating_to_sentiment(avg: float) -> float:
+    """Map typical 1–5 star mean into ~[-1, 1] to align with interaction sentiment scale."""
+    return max(-1.0, min(1.0, (float(avg) - 3.0) / 2.0))
+
+
+def _recipe_sentiment_score_for_bayesian(recipe_row: pd.Series) -> tuple[float | None, str]:
+    """
+    Returns (score_on_minus1_to_1, source) for Bayesian sentiment metrics.
+    Prefers sentiment_rating; falls back to avg_rating / display_rating with scale detection.
+    """
+    s = _safe_float(recipe_row.get("sentiment_rating"))
+    if s is not None:
+        if -1.0 <= s <= 1.0:
+            return s, "sentiment_rating"
+        if 0.0 <= s <= 5.0:
+            return _avg_rating_to_sentiment(s), "sentiment_rating"
+        return max(-1.0, min(1.0, s)), "sentiment_rating"
+
+    avg = _safe_float(recipe_row.get("avg_rating"))
+    if avg is not None:
+        return _avg_rating_to_sentiment(avg), "avg_rating"
+
+    dr = _safe_float(recipe_row.get("display_rating"))
+    if dr is None:
+        return None, ""
+    if -1.0 <= dr <= 1.0:
+        return dr, "display_rating"
+    if 0.0 <= dr <= 5.0:
+        return _avg_rating_to_sentiment(dr), "display_rating"
+    return max(-1.0, min(1.0, dr)), "display_rating"
+
+
+def _recipe_star_equivalent(recipe_row: pd.Series) -> float | None:
+    """Star display: from sentiment [-1,1] if available, else average rating on 0–5."""
+    s = _safe_float(recipe_row.get("sentiment_rating"))
+    if s is not None and -1.0 <= s <= 1.0:
+        return _to_star_rating(s)
+    if s is not None and 0.0 <= s <= 5.0:
+        return max(0.0, min(5.0, s))
+
+    avg = _safe_float(recipe_row.get("avg_rating"))
+    if avg is not None:
+        return max(0.0, min(5.0, avg))
+
+    dr = _safe_float(recipe_row.get("display_rating"))
+    if dr is None:
+        return None
+    if -1.0 <= dr <= 1.0:
+        return _to_star_rating(dr)
+    return max(0.0, min(5.0, dr))
+
+
 def _format_metric_value(value: float | None, suffix: str = "") -> str:
     if value is None:
         return "—"
@@ -416,8 +471,11 @@ def _render_swap_workspace(
         st.session_state[swap_key] = {}
     active_swaps: dict = st.session_state[swap_key]
 
-    base_rating = recipe_row.get("display_rating")
-    base_rating = float(base_rating) if pd.notna(base_rating) else None
+    if isinstance(recipe_row, pd.DataFrame):
+        recipe_row = recipe_row.iloc[0]
+
+    base_rating, base_rating_source = _recipe_sentiment_score_for_bayesian(recipe_row)
+    base_stars = _recipe_star_equivalent(recipe_row)
     base_weight = recipe_row.get("weighted_review_count")
     base_weight = float(base_weight) if pd.notna(base_weight) else 0.0
     if active_swaps:
@@ -445,7 +503,6 @@ def _render_swap_workspace(
         global_mean=global_sentiment_mean,
         swap_sentiment_deltas=swap_sentiment_deltas,
     )
-    base_stars = _to_star_rating(base_rating)
     adjusted_stars = _to_star_rating(adjusted_sentiment_bayes)
     delta_totals = {
         "rating": float(selected_rows["rating_delta"].sum()) if not selected_rows.empty else 0.0,
@@ -505,10 +562,16 @@ def _render_swap_workspace(
         "Adjusted Star-Equivalent",
         f"{adjusted_stars:.2f}★" if adjusted_stars is not None else "—",
     )
+    rating_note = ""
+    if base_rating is not None and base_rating_source in ("avg_rating", "display_rating"):
+        rating_note = (
+            " Base sentiment uses average rating mapped to the sentiment scale when "
+            "`sentiment_rating` is missing."
+        )
     st.caption(
         f"Bayesian recompute uses m={_BAYESIAN_PSEUDO_COUNT:.0f}, "
         f"global sentiment mean C={global_sentiment_mean:.3f}, "
-        f"weighted review depth={base_weight:.2f}."
+        f"weighted review depth={base_weight:.2f}.{rating_note}"
     )
 
     st.markdown("### Nutrition and Health (Base vs Adjusted)")
