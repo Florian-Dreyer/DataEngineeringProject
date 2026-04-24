@@ -764,14 +764,22 @@ def _days_since(last_fetched) -> int:
 
 
 def is_trends_stale(seed_query: str) -> bool:
-    """Returns True if trends data for *seed_query* is missing or older than 7 days."""
-    if not _TRENDS_METADATA_PATH.is_file():
+    """Returns True if google_trends_raw has no rows for *seed_query* or data is older than 7 days."""
+    try:
+        engine = create_engine(POSTGRES_CONN)
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    "SELECT MAX(fetched_date) FROM google_trends_raw "
+                    "WHERE seed_query = :seed"
+                ),
+                {"seed": seed_query},
+            ).scalar()
+        if result is None:
+            return True
+        return _days_since(result) > _STALENESS_DAYS
+    except Exception:
         return True
-    df = pd.read_parquet(_TRENDS_METADATA_PATH)
-    match = df[df['seed_query'] == seed_query]
-    if match.empty:
-        return True
-    return _days_since(match.iloc[0]['last_fetched_date']) > _STALENESS_DAYS
 
 
 def is_ai_mode_stale() -> bool:

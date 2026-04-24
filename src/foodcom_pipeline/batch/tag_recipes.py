@@ -32,6 +32,8 @@ from foodcom_pipeline.batch.extract import (
     TRENDS_NORMALISED_STAGING,
 )
 
+from foodcom_pipeline.utils.recipe_terms import canonicalize_recipe_term
+
 CLEANED_STAGING = STAGING_DIR / "recipes_clean.parquet"
 TAGS_STAGING = STAGING_DIR / "recipe_tags.parquet"
 SIGNAL_TAGS_STAGING = STAGING_DIR / "signal_tags.parquet"
@@ -172,6 +174,50 @@ TAG_DICT = {
     ],
 }
 
+# Tag dimension mapping - categorizes tags into semantic groups
+TAG_DIMENSION_MAP = {
+    # Protein / base
+    "chicken": "protein_base",
+    "beef": "protein_base",
+    "pork": "protein_base",
+    "seafood": "protein_base",
+    "vegetarian": "protein_base",
+    "egg": "protein_base",
+    
+    # Starches / core formats
+    "pasta": "dish_format",
+    "rice": "dish_format",
+    "bread_baked": "dish_format",
+    
+    # Dish formats
+    "soup_stew": "dish_format",
+    "salad": "dish_format",
+    "sandwich_wrap": "dish_format",
+    "casserole_bake": "dish_format",
+    "stir_fry": "dish_format",
+    "tacos_handheld": "dish_format",
+    "bowl": "dish_format",
+    
+    # Occasion / type
+    "breakfast": "occasion",
+    "dessert": "occasion",
+    "baking": "method",
+    
+    # Cuisine / flavor families
+    "italian": "cuisine",
+    "mexican": "cuisine",
+    "korean": "cuisine",
+    "japanese": "cuisine",
+    "thai": "cuisine",
+    "indian": "cuisine",
+    "mediterranean": "cuisine",
+    
+    # Intent / style
+    "healthy": "intent",
+    "comfort_food": "intent",
+    "quick_easy": "intent",
+}
+
 PHRASE_NORMALIZATION_RULES = [
     (r"\bmarry me\b", ""),
     (r"\bviral\b", ""),
@@ -231,22 +277,23 @@ def _get_recipe_text(name: str, ingredients: str) -> str:
 # Stage 1: Regex tagging
 # ─────────────────────────────────────────────────────────────────────────
 
-def tag_recipe_regex(name: str, ingredients: str) -> set[tuple[str, str]]:
+def tag_recipe_regex(name: str, ingredients: str) -> set[tuple[str, str, str]]:
     """
     Apply regex matching to normalized recipe name + ingredients.
-    Returns a set of (tag, matched_term) pairs.
+    Returns a set of (tag, matched_term, tag_dimension) tuples.
     """
     raw_text = _get_recipe_text(name, ingredients)
     normalized_text = _normalize_text(raw_text)
 
-    matched_pairs: set[tuple[str, str]] = set()
+    matched_pairs: set[tuple[str, str, str]] = set()
 
     for tag, patterns in TAG_PATTERNS.items():
         for pattern in patterns:
             match = pattern.search(normalized_text)
             if match:
                 matched_term = _normalize_term(match.group())
-                matched_pairs.add((tag, matched_term))
+                tag_dimension = TAG_DIMENSION_MAP.get(tag, "unknown")
+                matched_pairs.add((tag, matched_term, tag_dimension))
                 break
 
     return matched_pairs
@@ -346,14 +393,17 @@ def run_tag_recipes(**context) -> None:
 
         matched_pairs = tag_recipe_regex(name, ingredients)
 
-        for tag, matched_term in matched_pairs:
+        for tag, matched_term, tag_dimension in matched_pairs:
             tags_list.append(
                 {
                     "recipe_id": recipe_id,
+                    "raw_term": name,
+                    "canonical_term": canonicalize_recipe_term(name),
                     "tag": tag,
+                    "tag_dimension": tag_dimension,
                     "matched_term": matched_term,
-                    "canonical_term": canonical_term,
-                    "source": "regex",
+                    "tagging_method": "regex",
+                    "source": "foodcom",
                 }
             )
             regex_tag_count += 1
@@ -382,7 +432,7 @@ def run_tag_recipes(**context) -> None:
     llm_skipped_count = 0
 
     if len(untagged_recipes) > 0:
-        api_key = os.environ["GEMINI_API_KEY"]
+        api_key = os.environ.get("GEMINI_API_KEY", "")
 
         if not api_key:
             logger.warning("Gemini API key not found (GEMINI_API_KEY env var)")
@@ -425,10 +475,13 @@ def run_tag_recipes(**context) -> None:
                     tags_list.append(
                         {
                             "recipe_id": recipe_id,
+                            "raw_term": name,
+                            "canonical_term": canonicalize_recipe_term(name),
                             "tag": tag,
+                            "tag_dimension": TAG_DIMENSION_MAP.get(tag, "unknown"),
                             "matched_term": fallback_term,
-                            "canonical_term": canonical_term,
-                            "source": "llm",
+                            "tagging_method": "llm",
+                            "source": "foodcom",
                         }
                     )
                     existing_rows.add(dedupe_key)
@@ -436,15 +489,24 @@ def run_tag_recipes(**context) -> None:
 
     logger.info("LLM tagging added %s tags", llm_tag_count)
 
+    _TAG_COLS = [
+        "recipe_id", "raw_term", "canonical_term", "tag",
+        "tag_dimension", "matched_term", "tagging_method", "source",
+    ]
+
     if not tags_list:
         logger.warning("No tags generated")
-        tags_df = pd.DataFrame(
-            columns=["recipe_id", "tag", "matched_term", "canonical_term", "source"]
-        )
+        tags_df = pd.DataFrame(columns=_TAG_COLS)
     else:
         tags_df = pd.DataFrame(tags_list).drop_duplicates(
             subset=["recipe_id", "tag", "matched_term", "canonical_term", "source"]
         )
+
+    # Ensure exact schema: add missing columns as None, enforce column order.
+    for col in _TAG_COLS:
+        if col not in tags_df.columns:
+            tags_df[col] = None
+    tags_df = tags_df[_TAG_COLS]
 
     logger.info("Total tags generated: %s", len(tags_df))
 
@@ -472,32 +534,28 @@ def _write_tags_to_db(tags_df: pd.DataFrame) -> None:
                     """
                     CREATE TABLE IF NOT EXISTS recipe_tags (
                         recipe_id      INTEGER NOT NULL,
+                        raw_term       TEXT,
+                        canonical_term TEXT,
                         tag            TEXT    NOT NULL,
+                        tag_dimension  TEXT,
                         matched_term   TEXT    NOT NULL,
-                        canonical_term TEXT    NOT NULL,
+                        tagging_method TEXT,
                         source         TEXT    NOT NULL
                     )
                     """
                 )
             )
 
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE recipe_tags
-                    ADD COLUMN IF NOT EXISTS matched_term TEXT
-                    """
+            # Add new columns if they don't exist (backward-compat for pre-existing tables)
+            for col, col_type in [
+                ("raw_term", "TEXT"),
+                ("canonical_term", "TEXT"),
+                ("tag_dimension", "TEXT"),
+                ("tagging_method", "TEXT"),
+            ]:
+                conn.execute(
+                    text(f"ALTER TABLE recipe_tags ADD COLUMN IF NOT EXISTS {col} {col_type}")
                 )
-            )
-
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE recipe_tags
-                    ADD COLUMN IF NOT EXISTS canonical_term TEXT
-                    """
-                )
-            )
 
         tags_df = tags_df.drop_duplicates(
             subset=["recipe_id", "tag", "matched_term", "canonical_term", "source"]
@@ -505,8 +563,8 @@ def _write_tags_to_db(tags_df: pd.DataFrame) -> None:
         records = tags_df.to_dict(orient="records")
 
         upsert_sql = """
-            INSERT INTO recipe_tags (recipe_id, tag, matched_term, canonical_term, source)
-            VALUES (:recipe_id, :tag, :matched_term, :canonical_term, :source)
+            INSERT INTO recipe_tags (recipe_id, raw_term, canonical_term, tag, tag_dimension, matched_term, tagging_method, source)
+            VALUES (:recipe_id, :raw_term, :canonical_term, :tag, :tag_dimension, :matched_term, :tagging_method, :source)
             ON CONFLICT DO NOTHING
         """
 
@@ -566,7 +624,7 @@ def tag_signals(**context) -> None:
         term = item["term"]
         canonical_term = _canonicalize_recipe_term(term)
         matched_pairs = tag_recipe_regex(term, "")
-        for tag, matched_term in matched_pairs:
+        for tag, matched_term, _tag_dimension in matched_pairs:
             rows.append({
                 "term": term,
                 "canonical_term": canonical_term,
