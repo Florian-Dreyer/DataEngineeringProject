@@ -27,7 +27,7 @@ from foodcom_pipeline.batch.sentiment import run_sentiment
 from foodcom_pipeline.batch.aggregate_user_stats import run_aggregate_user_stats
 from foodcom_pipeline.batch.cluster import run_clustering
 from foodcom_pipeline.batch.load import run_load, load_trends
-from foodcom_pipeline.batch.tag_recipes import run_tag_recipes, tag_signals
+from foodcom_pipeline.batch.tag_recipes import run_tag_recipes, tag_signals, build_recipe_term_index
 from foodcom_pipeline.batch.dags.tasks.compute_gap import compute_gap_analysis
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -158,6 +158,12 @@ task_compute_gap = PythonOperator(
     dag=dag,
 )
 
+task_build_recipe_term_index = PythonOperator(
+    task_id='build_recipe_term_index',
+    python_callable=build_recipe_term_index,
+    dag=dag,
+)
+
 # ─────────────────────────────────────────────────────────────────────────
 # Task Dependencies
 # ─────────────────────────────────────────────────────────────────────────
@@ -191,6 +197,9 @@ task_clean >> [task_sentiment, task_tag_recipes]
 
 # Gap analysis needs both recipe tags and AI Mode demand signal
 task_tag_recipes >> task_compute_gap
+
+# Term index aggregates tags back to recipe level; runs after tagging
+task_tag_recipes >> task_build_recipe_term_index
 
 # Aggregation reads sentiment output, so it must run after sentiment
 task_sentiment >> task_aggregate_user_stats

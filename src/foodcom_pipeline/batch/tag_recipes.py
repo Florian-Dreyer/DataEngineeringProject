@@ -37,6 +37,7 @@ from foodcom_pipeline.utils.recipe_terms import canonicalize_recipe_term
 CLEANED_STAGING = STAGING_DIR / "recipes_clean.parquet"
 TAGS_STAGING = STAGING_DIR / "recipe_tags.parquet"
 SIGNAL_TAGS_STAGING = STAGING_DIR / "signal_tags.parquet"
+RECIPE_TERM_INDEX_STAGING = STAGING_DIR / "recipe_term_index.parquet"
 
 MAX_LLM_RECIPES = 20
 GEMINI_MODEL = "gemini-3-flash"
@@ -690,3 +691,144 @@ def _write_signal_tags_to_db(signal_df: pd.DataFrame) -> None:
 
     except Exception as exc:
         logger.error("Failed to write signal tags to PostgreSQL: %s", exc, exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Recipe term index: one row per recipe, tags aggregated to recipe level
+# ─────────────────────────────────────────────────────────────────────────
+
+_INDEX_COLS = [
+    "recipe_id",
+    "recipe_name",
+    "raw_term",
+    "canonical_term",
+    "tags",
+    "tag_dimensions",
+    "ingredients_summary",
+]
+
+
+def build_recipe_term_index(**context) -> None:
+    """
+    Aggregate recipe_tags back to one row per recipe and join with cleaned
+    recipe metadata to produce recipe_term_index.parquet.
+
+    Columns: recipe_id, recipe_name, raw_term, canonical_term,
+             tags, tag_dimensions, ingredients_summary
+    """
+    logger.info("Building recipe term index...")
+
+    # ── 1. Load cleaned recipes ───────────────────────────────────────────
+    if not CLEANED_STAGING.exists():
+        logger.warning("Cleaned staging file not found: %s", CLEANED_STAGING)
+        return
+
+    recipes_df = pd.read_parquet(CLEANED_STAGING)
+    logger.info("Loaded %d cleaned recipes", len(recipes_df))
+
+    # ── 2. Load recipe tags (may not exist on first run) ──────────────────
+    if TAGS_STAGING.exists():
+        tags_df = pd.read_parquet(TAGS_STAGING)
+        logger.info("Loaded %d recipe tag rows", len(tags_df))
+    else:
+        logger.warning("recipe_tags.parquet not found — index will have empty tags")
+        tags_df = pd.DataFrame(
+            columns=["recipe_id", "raw_term", "canonical_term", "tag", "tag_dimension"]
+        )
+
+    # ── 3. Aggregate tags per recipe ──────────────────────────────────────
+    if not tags_df.empty:
+        tag_agg = (
+            tags_df
+            .groupby("recipe_id", sort=False)
+            .agg(
+                raw_term=("raw_term", "first"),
+                canonical_term=("canonical_term", "first"),
+                tags=("tag", lambda s: "|".join(sorted(s.dropna().unique()))),
+                tag_dimensions=("tag_dimension", lambda s: "|".join(sorted(s.dropna().unique()))),
+            )
+            .reset_index()
+        )
+    else:
+        tag_agg = pd.DataFrame(
+            columns=["recipe_id", "raw_term", "canonical_term", "tags", "tag_dimensions"]
+        )
+
+    # ── 4. Build ingredients_summary (top 10, pipe-separated) ─────────────
+    ingr_col = (
+        "ingredients_canonical_normalized"
+        if "ingredients_canonical_normalized" in recipes_df.columns
+        else "ingredients_normalized"
+    )
+
+    def _ingredients_summary(value) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        parts = [p.strip() for p in value.split("|") if p.strip()]
+        return "|".join(parts[:10]) if parts else None
+
+    recipe_base = recipes_df[["id", "name"]].copy()
+    if ingr_col in recipes_df.columns:
+        recipe_base["ingredients_summary"] = recipes_df[ingr_col].apply(_ingredients_summary)
+    else:
+        recipe_base["ingredients_summary"] = None
+
+    recipe_base = recipe_base.rename(columns={"id": "recipe_id", "name": "recipe_name"})
+
+    # ── 5. Join: left-join tags onto every recipe ──────────────────────────
+    index_df = recipe_base.merge(tag_agg, on="recipe_id", how="left")
+
+    # For recipes with no tag rows, derive raw_term / canonical_term from name
+    no_raw = index_df["raw_term"].isna()
+    index_df.loc[no_raw, "raw_term"] = index_df.loc[no_raw, "recipe_name"]
+    index_df.loc[no_raw, "canonical_term"] = (
+        index_df.loc[no_raw, "recipe_name"].apply(_canonicalize_recipe_term)
+    )
+
+    # ── 6. Enforce exact schema / column order ─────────────────────────────
+    for col in _INDEX_COLS:
+        if col not in index_df.columns:
+            index_df[col] = None
+    index_df = index_df[_INDEX_COLS]
+
+    # ── 7. Write parquet ───────────────────────────────────────────────────
+    RECIPE_TERM_INDEX_STAGING.parent.mkdir(parents=True, exist_ok=True)
+    atomic_parquet(index_df, RECIPE_TERM_INDEX_STAGING)
+    logger.info(
+        "Recipe term index written to %s (%d rows)", RECIPE_TERM_INDEX_STAGING, len(index_df)
+    )
+
+    # ── 8. Validation output ───────────────────────────────────────────────
+    no_tags_mask = index_df["tags"].isna() | (index_df["tags"] == "")
+    no_tags_count = int(no_tags_mask.sum())
+
+    logger.info("=== recipe_term_index validation ===")
+    logger.info("Row count          : %d", len(index_df))
+    logger.info("Recipes with no tags: %d / %d", no_tags_count, len(index_df))
+
+    sample = index_df.sample(min(10, len(index_df)), random_state=42)
+    logger.info("--- sample 10 rows ---")
+    for _, row in sample.iterrows():
+        logger.info(
+            "  id=%-8s  name=%-40s  canonical=%-30s  tags=%s",
+            row["recipe_id"],
+            str(row["recipe_name"])[:40],
+            str(row["canonical_term"])[:30],
+            row["tags"],
+        )
+
+    top_terms = (
+        index_df["canonical_term"]
+        .dropna()
+        .loc[lambda s: s != ""]
+        .value_counts()
+        .head(20)
+    )
+    logger.info("--- top 20 canonical terms ---")
+    for term, count in top_terms.items():
+        logger.info("  %-40s  %d", term, count)
+    logger.info("=== end validation ===")
+
+    if context.get("ti"):
+        context["ti"].xcom_push(key="recipe_term_index_count", value=len(index_df))
+        context["ti"].xcom_push(key="recipes_without_tags", value=no_tags_count)
