@@ -158,7 +158,7 @@ def _compute_affiliate_columns(df: pd.DataFrame) -> pd.DataFrame:
     cook = df.loc[top1k, "avg_cook_minutes"]
     cook_filled = cook.fillna(cook.median())
     max_cook = cook_filled.max()
-    if max_cook == 0:
+    if pd.isna(max_cook) or max_cook == 0:
         max_cook = 1.0
     prep_norm = (cook_filled / max_cook).clip(lower=0.01)
 
@@ -216,7 +216,7 @@ def load_recipes() -> pd.DataFrame:
             elif "review_count" not in df.columns:
                 df["review_count"] = float("nan")
             df = _compute_affiliate_columns(df)
-            _RECIPE_MEDIAN = df[["protein", "fat", "carbs", "sugar", "sodium"]].median()
+            _RECIPE_MEDIAN = df[["protein", "fat", "carbs", "sugar", "sodium"]].median().fillna(0.0)
             return df
     except Exception:
         pass
