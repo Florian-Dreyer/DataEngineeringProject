@@ -41,16 +41,13 @@ from foodcom_pipeline.batch.dags.tasks.compute_gap import compute_gap_analysis
 # DAG Definition
 # ─────────────────────────────────────────────────────────────────────────
 
-# Pool to serialize access to staging parquet files (prevents file lock deadlocks)
-PARQUET_POOL = 'parquet_pool'
-
 default_args = {
     'owner': 'data-engineering',
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
     'email_on_failure': False,
     'start_date': datetime(2025, 1, 1),
-    'execution_timeout': timedelta(hours=3),
+    'execution_timeout': timedelta(hours=8),
 }
 
 dag = DAG(
@@ -61,35 +58,6 @@ dag = DAG(
     catchup=False,
     tags=['foodcom', 'batch', 'production'],
 )
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Pool Configuration
-# ─────────────────────────────────────────────────────────────────────────
-
-def _ensure_parquet_pool():
-    """Creates the parquet pool if it doesn't exist (for deadlock prevention)."""
-    from airflow.models import Pool
-    from airflow.settings import Session
-
-    session = Session()
-    try:
-        pool = session.query(Pool).filter(Pool.pool == PARQUET_POOL).first()
-        if pool is None:
-            pool = Pool(
-                pool=PARQUET_POOL,
-                slots=1,
-                description='Serializes access to staging parquet files to prevent file lock deadlocks',
-                include_deferred=False,
-            )
-            session.add(pool)
-            session.commit()
-    finally:
-        session.close()
-
-
-# Create pool on DAG load (also run manually: airflow pools set parquet_pool 1 'Parquet serialization')
-_ensure_parquet_pool()
 
 # ─────────────────────────────────────────────────────────────────────────
 # Extract Phase
@@ -104,41 +72,31 @@ task_ensure_source_data = PythonOperator(
 task_extract_recipes = PythonOperator(
     task_id='extract_recipes',
     python_callable=extract_recipes,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_extract_interactions = PythonOperator(
     task_id='extract_interactions',
     python_callable=extract_interactions,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_extract_usda_nutrients = PythonOperator(
     task_id='extract_usda_nutrients',
     python_callable=extract_usda_nutrients,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_extract_google_trends = PythonOperator(
     task_id='extract_google_trends',
     python_callable=extract_google_trends,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_extract_ai_mode = PythonOperator(
     task_id='extract_ai_mode',
     python_callable=extract_ai_mode,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -148,9 +106,7 @@ task_extract_ai_mode = PythonOperator(
 task_clean = PythonOperator(
     task_id='clean',
     python_callable=run_clean,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -160,25 +116,19 @@ task_clean = PythonOperator(
 task_sentiment = PythonOperator(
     task_id='sentiment',
     python_callable=run_sentiment,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_aggregate_user_stats = PythonOperator(
     task_id='aggregate_user_stats',
     python_callable=run_aggregate_user_stats,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_cluster = PythonOperator(
     task_id='cluster',
     python_callable=run_clustering,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -188,73 +138,55 @@ task_cluster = PythonOperator(
 task_load = PythonOperator(
     task_id='load',
     python_callable=run_load,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_load_trends = PythonOperator(
     task_id='load_trends',
     python_callable=load_trends,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_tag_recipes = PythonOperator(
     task_id='tag_recipes',
     python_callable=run_tag_recipes,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_tag_signals = PythonOperator(
     task_id='tag_signals',
     python_callable=tag_signals,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_compute_gap = PythonOperator(
     task_id='compute_gap_analysis',
     python_callable=compute_gap_analysis,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_build_recipe_term_index = PythonOperator(
     task_id='build_recipe_term_index',
     python_callable=build_recipe_term_index,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_build_external_recipe_terms = PythonOperator(
     task_id='build_external_recipe_terms',
     python_callable=build_external_recipe_terms,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_build_recipe_gap_analysis = PythonOperator(
     task_id='build_recipe_gap_analysis',
     python_callable=build_recipe_gap_analysis,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 task_build_recipe_term_clusters = PythonOperator(
     task_id='build_recipe_term_clusters',
     python_callable=build_recipe_term_clusters,
-    pool=PARQUET_POOL,
-    pool_slots=1,
-    dag=dag,
+dag=dag,
 )
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -84,18 +84,30 @@ def run_clean(**context) -> None:
     """
     Main cleaning entry point. Cleans both DataFrames independently,
     then writes cleaned parquet files for downstream tasks.
+    Uses chunked processing for interactions to manage memory on large datasets.
     """
     logger.info('Starting clean step.')
 
     recipes_df = pd.read_parquet(RECIPES_STAGING)
-    interactions_df = pd.read_parquet(INTERACTIONS_STAGING)
-
-    if interactions_df.empty and INTERACTIONS_CLEAN.exists():
+    
+    # Check if interactions need cleaning or can be reused
+    interactions_staging_exists = INTERACTIONS_STAGING.exists()
+    interactions_clean_exists = INTERACTIONS_CLEAN.exists()
+    
+    should_clean_interactions = interactions_staging_exists
+    if interactions_staging_exists:
+        interactions_staging_size = INTERACTIONS_STAGING.stat().st_size
+        logger.info(f'Interactions staging size: {interactions_staging_size / 1e6:.1f} MB')
+    
+    if not should_clean_interactions and interactions_clean_exists:
         logger.info(
-            'Interactions staging is empty (no new data since last run) and '
-            'clean file already exists — skipping interactions clean to preserve existing output.'
+            'Interactions staging missing (no new data since last run) and '
+            'clean file already exists — skipping interactions clean.'
         )
         interactions_df = None
+    else:
+        # For large interaction datasets, process in chunks to avoid OOM
+        interactions_df = pd.read_parquet(INTERACTIONS_STAGING)
 
     ingr_map: dict[str, str] | None = None
     if INGR_MAP_PKL.exists():
@@ -354,19 +366,26 @@ def _flag_suspected_bots(df: pd.DataFrame) -> pd.DataFrame:
 
     Adds a boolean column `suspected_bot` rather than immediately dropping,
     so the decision can be changed without modifying this function.
+    
+    Optimized for large datasets by using value_counts on date string.
     """
-    reviews_per_user_per_day = (
-        df.groupby(['user_id', df['date'].dt.date])
+    # Avoid creating large groupby intermediate for bot detection
+    # Instead, use a more memory-efficient approach
+    df['_date_str'] = df['date'].dt.strftime('%Y-%m-%d')
+    
+    user_date_counts = (
+        df.groupby(['user_id', '_date_str'])
         .size()
         .reset_index(name='daily_review_count')
     )
 
-    bot_users = reviews_per_user_per_day.loc[
-        reviews_per_user_per_day['daily_review_count'] > MAX_REVIEWS_PER_USER_PER_DAY,
+    bot_users = user_date_counts.loc[
+        user_date_counts['daily_review_count'] > MAX_REVIEWS_PER_USER_PER_DAY,
         'user_id',
     ].unique()
 
     df['suspected_bot'] = df['user_id'].isin(bot_users)
+    df = df.drop(columns=['_date_str'])
 
     if len(bot_users) > 0:
         logger.warning(

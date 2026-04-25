@@ -40,8 +40,8 @@ SIGNAL_TAGS_STAGING = STAGING_DIR / "signal_tags.parquet"
 RECIPE_TERM_INDEX_STAGING = STAGING_DIR / "recipe_term_index.parquet"
 EXTERNAL_TERMS_STAGING = STAGING_DIR / "external_recipe_terms.parquet"
 
-MAX_LLM_RECIPES = 20
-GEMINI_MODEL = "gemini-3-flash"
+MAX_LLM_RECIPES = 10
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # ---------------------------------------------------------------------
 # Expanded tag dictionary
@@ -323,10 +323,9 @@ def tag_recipe_llm(name: str, ingredients: str, api_key: str) -> set[str]:
     Use Gemini to assign tags from TAG_DICT to a recipe that regex under-tagged.
     Returns a set of valid tag strings (subset of TAG_DICT keys).
     """
-    import google.generativeai as genai
+    from google import genai
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    client = genai.Client(api_key=api_key)
 
     prompt = _LLM_PROMPT_TEMPLATE.format(
         tags=", ".join(sorted(_VALID_TAGS)),
@@ -335,7 +334,7 @@ def tag_recipe_llm(name: str, ingredients: str, api_key: str) -> set[str]:
     )
 
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         raw = response.text.strip()
     except Exception as exc:
         logger.warning("Gemini call failed for %r: %s", name, exc)

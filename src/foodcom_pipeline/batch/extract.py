@@ -252,12 +252,29 @@ def _download_file_from_kaggle(filename: str) -> None:
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
-        raise RuntimeError(
-            f'Kaggle download failed for {filename}.\n'
-            f'STDOUT: {result.stdout}\nSTDERR: {result.stderr}\n'
-            'Ensure Kaggle CLI is installed and credentials are available '
-            '(~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY).'
-        )
+        # Kaggle CLI exits non-zero for size-mismatch warnings even when the
+        # file was written successfully (e.g. after a dataset update the cached
+        # metadata size differs from the actual download).  Accept the result if
+        # the target file (or its .zip counterpart) is present and non-empty.
+        size_mismatch = 'does not match expected size' in result.stdout
+        file_landed = base_path.exists() and base_path.stat().st_size > 0
+        zip_landed = zip_path.exists() and zip_path.stat().st_size > 0
+        if size_mismatch and (file_landed or zip_landed):
+            logger.warning(
+                'Kaggle CLI reported a file-size mismatch for %s but the file '
+                'was downloaded successfully (%d bytes). Treating as success.\n'
+                'STDOUT: %s',
+                filename,
+                (base_path.stat().st_size if file_landed else zip_path.stat().st_size),
+                result.stdout.strip(),
+            )
+        else:
+            raise RuntimeError(
+                f'Kaggle download failed for {filename}.\n'
+                f'STDOUT: {result.stdout}\nSTDERR: {result.stderr}\n'
+                'Ensure Kaggle CLI is installed and credentials are available '
+                '(~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY).'
+            )
 
 
 def _extract_csv_from_zip_if_needed(csv_path: Path) -> None:
@@ -292,36 +309,54 @@ def _extract_csv_from_zip_if_needed(csv_path: Path) -> None:
     )
     for zip_path in zip_paths:
         logger.info(f'Attempting extraction for {csv_path.name} from {zip_path}.')
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            members = zf.namelist()
-            logger.info(f'ZIP member count for {zip_path.name}: {len(members)}')
+        try:
+            zf_handle = zipfile.ZipFile(zip_path, 'r')
+        except zipfile.BadZipFile:
+            logger.warning(
+                'Corrupted ZIP file %s (bad magic number); deleting and skipping.',
+                zip_path,
+            )
+            zip_path.unlink(missing_ok=True)
+            continue
 
-            # Case 1: exact filename present in archive
-            if csv_path.name in members:
-                zf.extract(csv_path.name, path=DATA_DIR)
-                logger.info(f'Extracted {csv_path.name} from {zip_path}.')
-                return
+        try:
+            with zf_handle as zf:
+                members = zf.namelist()
+                logger.info(f'ZIP member count for {zip_path.name}: {len(members)}')
 
-            # Case 2: archive has nested paths; match by basename
-            basename_matches = [
-                m for m in members if Path(m).name.lower() == csv_path.name.lower()
-            ]
-            if basename_matches:
-                member = basename_matches[0]
-                logger.info(
-                    f'Found basename match for {csv_path.name} in {zip_path.name}: {member}'
-                )
-                zf.extract(member, path=DATA_DIR)
-                extracted_path = DATA_DIR / member
-                extracted_path.parent.mkdir(parents=True, exist_ok=True)
-                extracted_path.replace(csv_path)
-                logger.info(
-                    f'Extracted {member} from {zip_path} and renamed to {csv_path.name}.'
-                )
-                return
+                # Case 1: exact filename present in archive
+                if csv_path.name in members:
+                    zf.extract(csv_path.name, path=DATA_DIR)
+                    logger.info(f'Extracted {csv_path.name} from {zip_path}.')
+                    return
 
-    raise FileNotFoundError(
-        f'Could not find {csv_path.name} inside ZIP archives in {DATA_DIR}.'
+                # Case 2: archive has nested paths; match by basename
+                basename_matches = [
+                    m for m in members if Path(m).name.lower() == csv_path.name.lower()
+                ]
+                if basename_matches:
+                    member = basename_matches[0]
+                    logger.info(
+                        f'Found basename match for {csv_path.name} in {zip_path.name}: {member}'
+                    )
+                    zf.extract(member, path=DATA_DIR)
+                    extracted_path = DATA_DIR / member
+                    extracted_path.parent.mkdir(parents=True, exist_ok=True)
+                    extracted_path.replace(csv_path)
+                    logger.info(
+                        f'Extracted {member} from {zip_path} and renamed to {csv_path.name}.'
+                    )
+                    return
+        except zipfile.BadZipFile:
+            logger.warning(
+                'Corrupted ZIP file %s (bad member header); deleting and skipping.',
+                zip_path,
+            )
+            zip_path.unlink(missing_ok=True)
+
+    logger.info(
+        'No ZIP archive in %s contained %s — will proceed to Kaggle download.',
+        DATA_DIR, csv_path.name,
     )
 
 

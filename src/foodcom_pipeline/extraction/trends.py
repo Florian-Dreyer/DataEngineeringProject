@@ -23,9 +23,8 @@ _SEED_PATTERN = re.compile(r"\brecipes?\b", re.IGNORECASE)
 
 def _search(**params) -> dict:
     """Execute a SerpAPI Google Trends search."""
-    params["api_key"] = os.environ["SERPAPI_KEY"]
-    client = serpapi.Client(**params)
-    return client.get_dict()
+    client = serpapi.Client(api_key=os.environ["SERPAPI_KEY"])
+    return client.search(params).as_dict()
 
 
 def _validate_related_query(query: str) -> bool:

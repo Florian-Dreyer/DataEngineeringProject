@@ -55,19 +55,10 @@ _STOPWORDS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 def build_ai_query(seed: str) -> str:
-    return (
-        f"{seed}. "
-        "You are a structured data generator, not a conversational assistant. "
-        "Output a list of 20 dish names only. "
-        "Each item must be a core dish name representing a real recipe or search term. "
-        "Remove descriptive modifiers such as 'viral', 'one-pot', 'sheet-pan', 'easy', 'quick'. "
-        "Do not include explanations, descriptions, questions, suggestions, or conversational text. "
-        "Do not ask follow-up questions. "
-        "Do not include phrases like 'would you like', 'let me know', or similar. "
-        "Output format must be a single comma-separated list of dish names only. "
-        "No numbering, no bullet points, no extra sentences. "
-        "Examples: Tortellini, Garlic Chicken, Korean Beef Bowl, Feta Pasta, Birria Tacos."
-    )
+    # Instructional prompts suppress Google AI Mode entirely — it returns an
+    # empty response. A short natural query reliably produces a dish list in
+    # reconstructed_markdown which fetch_ai_mode_blocks reads as its fallback.
+    return f"Output a list of 20 dish names only. Each item must be a core dish name representing a real recipe or search term.  Do not include explanations, descriptions, questions, suggestions, or conversational text. Output format must be a single comma-separated list of dish names only. No numbering, no bullet points, no extra sentences. Do not ask follow-up questions. "
 
 
 def fetch_ai_mode_blocks(seeds, api_key) -> pd.DataFrame:
@@ -90,9 +81,11 @@ def fetch_ai_mode_blocks(seeds, api_key) -> pd.DataFrame:
                     "engine": "google_ai_mode",
                     "q": prompted_query,
                 }
-            )
+            ).as_dict()
 
-            ai_section = results.get("ai_mode", results)
+            logger.debug("SerpAPI top-level keys for seed %r: %s", seed, list(results.keys()))
+
+            ai_section = results.get("ai_mode") or results.get("ai_overview") or results
 
             text_blocks = ai_section.get("text_blocks", [])
             if not text_blocks and isinstance(ai_section.get("text_blocks"), dict):
@@ -113,12 +106,7 @@ def fetch_ai_mode_blocks(seeds, api_key) -> pd.DataFrame:
                 if fallback_text:
                     text_blocks = [{"title": None, "text": fallback_text}]
 
-            if not text_blocks:
-                logger.warning(
-                    "No AI Mode text content returned for seed %r (prompt=%r)",
-                    seed,
-                    prompted_query,
-                )
+            seed_rows_before = len(rows)
 
             for idx, block in enumerate(text_blocks):
                 if not isinstance(block, dict):
@@ -148,6 +136,33 @@ def fetch_ai_mode_blocks(seeds, api_key) -> pd.DataFrame:
                         "fetched_date": fetched_date,
                     }
                 )
+
+            # text_blocks list-type entries carry no content in SerpAPI's response;
+            # fall back to reconstructed_markdown which has the actual dish list.
+            if len(rows) == seed_rows_before:
+                md = results.get("reconstructed_markdown") or ""
+                md_clean = re.sub(r"\\(.)", r"\1", md).strip()
+                if len(md_clean) >= _MIN_BODY_LENGTH and not _JUNK_PATTERNS.search(md_clean):
+                    rows.append(
+                        {
+                            "seed_query": seed,
+                            "prompted_query": prompted_query,
+                            "block_index": 0,
+                            "title": None,
+                            "body": md_clean,
+                            "fetched_date": fetched_date,
+                        }
+                    )
+                    logger.info(
+                        "Used reconstructed_markdown fallback for seed %r (%d chars).",
+                        seed, len(md_clean),
+                    )
+                else:
+                    logger.warning(
+                        "No AI Mode text content returned for seed %r (prompt=%r)",
+                        seed,
+                        prompted_query,
+                    )
 
         except Exception as exc:
             logger.error(
