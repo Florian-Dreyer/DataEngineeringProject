@@ -142,12 +142,11 @@ def _compute_affiliate_columns(df: pd.DataFrame) -> pd.DataFrame:
         [bool(v) for v in ((ic >= 7) & (ic <= 11))], dtype=object
     )
 
-    # --- basket_value_est and revenue_proj_monthly (all rows) ---
+    # --- basket_value_est, review_velocity, and revenue_proj_monthly (all rows) ---
     df["basket_value_est"] = df["ingredient_count"].fillna(0) * 3.50
-    df["revenue_proj_monthly"] = 10_000 * 0.02 * df["basket_value_est"] * 0.04
-
-    # --- review_velocity (all rows) ---
-    df["review_velocity"] = df["review_count"] / 73.0
+    df["review_velocity"] = df["review_count"] / 240.0  # 240 months, Jan 1999–Dec 2018
+    df["monthly_views_est"] = df["review_velocity"] * 50  # ~50 views per review submitted
+    df["revenue_proj_monthly"] = df["monthly_views_est"] * 0.01 * df["basket_value_est"] * 0.02
 
     # --- affiliate_score (all rows) ---
     # Weights: 40% popularity, 30% quickness (shorter = better), 30% ingredient sweet spot
@@ -678,8 +677,9 @@ def _render_detail_view(row: dict) -> None:
             rev_num    = f"{rev:.2f}" if rev is not None and not pd.isna(rev) else "unknown"
             st.info(
                 f"This recipe scores {aff_score:.2f} for affiliate potential. "
-                f"With a basket of \\${basket_num} and 2% conversion at "
-                f"10,000 monthly views, it could generate ~\\${rev_num}/month in commission."
+                f"Monthly views are estimated from review velocity (reviews/month × 50). "
+                f"With a basket of \\${basket_num}, 1% conversion, and 2% commission, "
+                f"it could generate ~\\${rev_num}/month."
             )
     else:
         st.caption("Affiliate data not available for this recipe.")
