@@ -149,32 +149,28 @@ def _compute_affiliate_columns(df: pd.DataFrame) -> pd.DataFrame:
     # --- review_velocity (all rows) ---
     df["review_velocity"] = df["review_count"] / 73.0
 
-    # --- affiliate_score (top-1000 by review_count only) ---
-    df["affiliate_score"] = float("nan")
-
-    top1k = df.nlargest(1000, "review_count").index
-
-    # Median-fill cook time for normalisation; restore NaN afterwards
-    cook = df.loc[top1k, "avg_cook_minutes"]
+    # --- affiliate_score (all rows) ---
+    # Weights: 40% popularity, 30% quickness (shorter = better), 30% ingredient sweet spot
+    cook = df["avg_cook_minutes"]
     cook_filled = cook.fillna(cook.median())
     max_cook = cook_filled.max()
     if pd.isna(max_cook) or max_cook == 0:
         max_cook = 1.0
-    prep_norm = (cook_filled / max_cook).clip(lower=0.01)
+    prep_norm = (cook_filled / max_cook).clip(lower=0.0, upper=1.0)
 
-    rc = df.loc[top1k, "review_count"].fillna(0)
+    rc = df["review_count"].fillna(0)
     max_rc = rc.max()
     if max_rc == 0:
         max_rc = 1.0
 
-    sweet = ((df.loc[top1k, "ingredient_count"].fillna(0) >= 7) &
-             (df.loc[top1k, "ingredient_count"].fillna(0) <= 11)).astype(float)
+    sweet = ((df["ingredient_count"].fillna(0) >= 7) &
+             (df["ingredient_count"].fillna(0) <= 11)).astype(float)
 
-    df.loc[top1k, "affiliate_score"] = (
+    df["affiliate_score"] = (
         (rc / max_rc) * 0.40
-        + (1.0 / prep_norm) * 0.30
+        + (1.0 - prep_norm) * 0.30
         + sweet * 0.30
-    ).clip(upper=1.0)
+    )
 
     return df
 
@@ -284,7 +280,7 @@ def load_recipes() -> pd.DataFrame:
         def _to_pipe(x) -> str:
             # numpy.ndarray, list, tuple — anything iterable but not a bare string
             if hasattr(x, "__iter__") and not isinstance(x, str):
-                return "|".join(str(i) for i in list(x)[:10])
+                return "|".join(str(i) for i in list(x))
             # Fallback: string that looks like a Python list repr
             try:
                 parsed = ast.literal_eval(str(x))
@@ -315,17 +311,27 @@ def load_recipes() -> pd.DataFrame:
         if col not in df.columns:
             df[col] = float("nan")
 
-    # Alias weighted_review_count → review_count for affiliate scoring
-    if "weighted_review_count" in df.columns:
-        df["review_count"] = df["weighted_review_count"]
-    elif "review_count" not in df.columns:
-        df["review_count"] = float("nan")
+    # Compute raw review_count from interactions
+    interactions_path = STAGING_DIR / "interactions_clean.parquet"
+    if interactions_path.exists():
+        counts = (
+            pd.read_parquet(interactions_path, columns=["recipe_id"])
+            .groupby("recipe_id")
+            .size()
+            .rename("review_count")
+        )
+        df = df.merge(counts, on="recipe_id", how="left")
+        df["review_count"] = df["review_count"].fillna(0).astype(int)
+    else:
+        df["review_count"] = 0
 
     df = _compute_affiliate_columns(df)
 
     _RECIPE_MEDIAN = df[["protein", "fat", "carbs", "sugar", "sodium"]].median().fillna(0.0)
 
     return df
+
+
 
 
 @st.cache_data(ttl=300, max_entries=100)
@@ -500,17 +506,17 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
 
         with col_shop:
             st.markdown(
-                f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
-                f'color:white;text-align:center;border-radius:6px;padding:9px 12px;'
-                f'font-weight:700;font-size:13px;text-decoration:none;margin-bottom:6px;">'
-                f'🛒 Shop on Amazon Fresh</a>',
+                f'<a href="{instacart_url}" target="_blank" style="display:block;background:white;'
+                f'color:#374151;text-align:center;border-radius:6px;padding:8px 12px;'
+                f'font-size:13px;text-decoration:none;border:1px solid #e5e7eb;margin-bottom:6px;">'
+                f'🥬 Instacart</a>',
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f'<a href="{instacart_url}" target="_blank" style="display:block;background:white;'
-                f'color:#374151;text-align:center;border-radius:6px;padding:8px 12px;'
-                f'font-size:13px;text-decoration:none;border:1px solid #e5e7eb;">'
-                f'🥬 Instacart</a>',
+                f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
+                f'color:white;text-align:center;border-radius:6px;padding:9px 12px;'
+                f'font-weight:700;font-size:13px;text-decoration:none;">'
+                f'🛒 Shop on Amazon Fresh</a>',
                 unsafe_allow_html=True,
             )
 
@@ -519,7 +525,7 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
 
             with col_radar:
                 st.plotly_chart(
-                    _nutrition_radar(row, median_row=_RECIPE_MEDIAN),
+                    _nutrition_radar(row, median_row=None),
                     use_container_width=True,
                     key=f"radar_{recipe_id}_{card_index}",
                 )
@@ -585,28 +591,25 @@ def _render_detail_view(row: dict) -> None:
     instacart_url = build_instacart_url(name)
 
     # --- Back button + shop buttons row ---
-    col_back, col_shops = st.columns([3, 2])
+    col_back, col_shops = st.columns([3, 1])
     with col_back:
         if st.button("← Back to results", key="back_to_list", type="primary"):
             _back_to_list()
     with col_shops:
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            st.markdown(
-                f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
-                f'color:white;text-align:center;border-radius:6px;padding:9px 12px;'
-                f'font-weight:700;font-size:13px;text-decoration:none;">'
-                f'🛒 Shop on Amazon Fresh</a>',
-                unsafe_allow_html=True,
-            )
-        with sc2:
-            st.markdown(
-                f'<a href="{instacart_url}" target="_blank" style="display:block;background:white;'
-                f'color:#374151;text-align:center;border-radius:6px;padding:8px 12px;'
-                f'font-size:13px;text-decoration:none;border:1px solid #e5e7eb;">'
-                f'🥬 Instacart</a>',
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            f'<a href="{instacart_url}" target="_blank" style="display:block;background:white;'
+            f'color:#374151;text-align:center;border-radius:6px;padding:8px 12px;'
+            f'font-size:13px;text-decoration:none;border:1px solid #e5e7eb;margin-bottom:6px;">'
+            f'🥬 Instacart</a>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
+            f'color:white;text-align:center;border-radius:6px;padding:9px 12px;'
+            f'font-weight:700;font-size:13px;text-decoration:none;">'
+            f'🛒 Shop on Amazon Fresh</a>',
+            unsafe_allow_html=True,
+        )
 
     # --- Recipe title + metadata ---
     st.markdown(f"# {html.escape(_restore_apostrophes(html.unescape(name)))}")
@@ -632,26 +635,6 @@ def _render_detail_view(row: dict) -> None:
 
     st.divider()
 
-    # --- Steps ---
-    st.markdown("### Steps")
-    detail = load_recipe_detail(recipe_id)
-    steps = detail.get("steps", [])
-    if steps:
-        steps_html = "".join(
-            f'<div style="display:flex;align-items:flex-start;margin-bottom:14px;">'
-            f'<span style="background:#10b981;color:white;border-radius:50%;'
-            f'min-width:26px;height:26px;display:flex;align-items:center;'
-            f'justify-content:center;font-size:12px;font-weight:700;'
-            f'flex-shrink:0;margin-right:14px;">{i}</span>'
-            f'<span style="font-size:14px;line-height:1.6;color:#111827;">'
-            f'{html.escape(str(step))}</span>'
-            f'</div>'
-            for i, step in enumerate(steps, 1)
-        )
-        st.markdown(steps_html, unsafe_allow_html=True)
-    else:
-        st.info("Recipe steps not available for this recipe.")
-
     # --- Affiliate Insights ---
     st.markdown("### 💰 Affiliate Insights")
     aff_score = row.get("affiliate_score")
@@ -666,33 +649,37 @@ def _render_detail_view(row: dict) -> None:
             )
 
         with ai2:
-            cart_rdy  = row.get("cart_ready")
-            basket    = row.get("basket_value_est")
-            rev_proj  = row.get("revenue_proj_monthly")
-            velocity  = row.get("review_velocity")
-            ic        = row.get("ingredient_count")
-            sweet     = "Yes" if (ic is not None and not pd.isna(ic) and 7 <= int(ic) <= 11) else "No"
-            cart_str  = "Yes" if cart_rdy is True else "No"
-            basket_str = f"${basket:.2f}" if basket is not None and not pd.isna(basket) else "—"
-            rev_str   = f"${rev_proj:.2f}" if rev_proj is not None and not pd.isna(rev_proj) else "—"
-            vel_str   = f"{velocity:.2f}" if velocity is not None and not pd.isna(velocity) else "—"
+            cart_rdy   = row.get("cart_ready")
+            basket_est = row.get("basket_value_est")
+            rev_proj   = row.get("revenue_proj_monthly")
+            review_cnt = row.get("review_count")
+            ic         = row.get("ingredient_count")
+
+            basket  = basket_est
+            rev     = rev_proj
+
+            sweet      = "Yes" if (ic is not None and not pd.isna(ic) and 7 <= int(ic) <= 11) else "No"
+            cart_str   = "Yes" if cart_rdy is True else "No"
+            basket_str = f"${basket:.2f} (est.)" if basket is not None and not pd.isna(basket) else "—"
+            rev_str    = f"${rev:.2f}" if rev is not None and not pd.isna(rev) else "—"
+            rc_str     = f"{int(review_cnt):,}" if review_cnt is not None and not pd.isna(review_cnt) else "—"
             st.markdown(
                 f"| Metric | Value |\n"
                 f"|---|---|\n"
-                f"| Review Velocity | {vel_str} / 73 days |\n"
+                f"| Review Count | {rc_str} |\n"
                 f"| Cart Ready | {cart_str} |\n"
-                f"| Est. Basket Value | {basket_str} |\n"
+                f"| Basket Value | {basket_str} |\n"
                 f"| Est. Monthly Revenue | {rev_str} |\n"
                 f"| Ingredient Sweet Spot (7–11) | {sweet} |"
             )
 
         with ai3:
-            basket_val = f"${basket:.2f}" if basket is not None and not pd.isna(basket) else "unknown"
-            rev_val    = f"${rev_proj:.2f}" if rev_proj is not None and not pd.isna(rev_proj) else "unknown"
+            basket_num = f"{basket:.2f}" if basket is not None and not pd.isna(basket) else "unknown"
+            rev_num    = f"{rev:.2f}" if rev is not None and not pd.isna(rev) else "unknown"
             st.info(
                 f"This recipe scores {aff_score:.2f} for affiliate potential. "
-                f"With an estimated basket of {basket_val} and 2% conversion at "
-                f"10,000 monthly views, it could generate ~{rev_val}/month in commission."
+                f"With a basket of \\${basket_num} and 2% conversion at "
+                f"10,000 monthly views, it could generate ~\\${rev_num}/month in commission."
             )
     else:
         st.caption("Affiliate data not available for this recipe.")
@@ -700,13 +687,14 @@ def _render_detail_view(row: dict) -> None:
     st.divider()
 
     # --- Nutrition & Ingredients ---
+
     st.markdown("### Nutrition & Ingredients")
     row_series = pd.Series(row)
     col_radar, col_bars, col_pills = st.columns([1.2, 1.5, 1])
 
     with col_radar:
         st.plotly_chart(
-            _nutrition_radar(row_series, median_row=_RECIPE_MEDIAN),
+            _nutrition_radar(row_series, median_row=None),
             use_container_width=True,
             key=f"detail_radar_{recipe_id}",
         )
@@ -750,6 +738,28 @@ def _render_detail_view(row: dict) -> None:
     if cal_val is not None and not pd.isna(cal_val):
         st.caption(f"Calories: {cal_val:.0f} kcal per serving")
 
+    st.divider()
+
+    # --- Steps ---
+    st.markdown("### Steps")
+    detail = load_recipe_detail(recipe_id)
+    steps = detail.get("steps", [])
+    if steps:
+        steps_html = "".join(
+            f'<div style="display:flex;align-items:flex-start;margin-bottom:14px;">'
+            f'<span style="background:#10b981;color:white;border-radius:50%;'
+            f'min-width:26px;height:26px;display:flex;align-items:center;'
+            f'justify-content:center;font-size:12px;font-weight:700;'
+            f'flex-shrink:0;margin-right:14px;">{i}</span>'
+            f'<span style="font-size:14px;line-height:1.6;color:#111827;">'
+            f'{html.escape(str(step))}</span>'
+            f'</div>'
+            for i, step in enumerate(steps, 1)
+        )
+        st.markdown(steps_html, unsafe_allow_html=True)
+    else:
+        st.info("Recipe steps not available for this recipe.")
+
 
 # ---------------------------------------------------------------------------
 # Main render
@@ -763,8 +773,8 @@ def _render_list_mode(df: pd.DataFrame) -> None:
         '<div style="background:linear-gradient(135deg,#10b981,#059669);border-radius:10px;'
         'padding:24px 28px;margin-bottom:12px;">'
         '<h1 style="color:white;margin:0;font-size:26px;">🍳 Recipe Explorer</h1>'
-        '<p style="color:#d1fae5;margin:6px 0 0;">Browse recipes — '
-        'see ratings, nutrition, and shop ingredients in one click.</p>'
+        '<p style="color:#d1fae5;margin:6px 0 0;">Discover high-potential recipes — '
+        'explore affiliate scores, nutrition, basket value, and shop ingredients in one click.</p>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -777,7 +787,12 @@ def _render_list_mode(df: pd.DataFrame) -> None:
             [["name", "affiliate_score", "basket_value_est",
               "revenue_proj_monthly", "cart_ready",
               "avg_cook_minutes", "ingredient_count"]]
+            .copy()
         )
+        if not top20.empty:
+            top20["name"] = top20["name"].apply(
+                lambda n: _restore_apostrophes(html.unescape(str(n)))
+            )
         if top20.empty:
             st.caption("No affiliate data yet — run the pipeline first.")
         else:
@@ -816,14 +831,54 @@ def _render_list_mode(df: pd.DataFrame) -> None:
 
     # --- Sidebar affiliate filters ---
     with st.sidebar:
-        st.markdown("### 🏷️ Affiliate Filters")
-        cart_only = st.toggle("Cart-Ready only (7–11 ingredients)", key="aff_cart_only")
-        min_aff   = st.slider("Minimum Affiliate Score", 0.0, 1.0, 0.0,
-                              step=0.05, key="aff_min_score")
+        st.markdown(
+            '<div style="background:linear-gradient(135deg,#10b981,#059669);'
+            'border-radius:10px;padding:16px 18px;margin-bottom:4px;">'
+            '<p style="color:white;font-weight:700;font-size:15px;margin:0;">🏷️ Affiliate Filters</p>'
+            '<p style="color:#d1fae5;font-size:12px;margin:4px 0 0;">'
+            'Narrow recipes by affiliate potential</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
+        st.markdown("**🛒 Availability**")
+        cart_only = st.toggle("Cart-Ready only", key="aff_cart_only")
+        st.caption(
+            "Recipes with 7–11 ingredients hit the sweet spot for grocery cart conversion — "
+            "enough variety to fill a basket, manageable enough not to overwhelm a shopper."
+        )
+
+        st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
+        st.markdown("**📊 Affiliate Score Range**")
+        aff_range = st.slider(
+            "Score range",
+            min_value=0.0, max_value=1.0, value=(0.0, 1.0),
+            step=0.05, key="aff_score_range",
+            label_visibility="collapsed",
+        )
+        st.markdown(
+            f"<div style='display:flex;justify-content:space-between;margin-top:-8px;'>"
+            f"<span style='font-size:12px;color:#6b7280;'>Min: <b>{aff_range[0]:.2f}</b></span>"
+            f"<span style='font-size:12px;color:#6b7280;'>Max: <b>{aff_range[1]:.2f}</b></span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.caption(
+            "Affiliate score combines review popularity (40%), "
+            "recipe simplicity (30%), and ingredient sweet spot (30%)."
+        )
+
     if cart_only:
         df = df[df["cart_ready"] == True]  # noqa: E712
-    if min_aff > 0.0:
-        df = df[df["affiliate_score"].fillna(0) >= min_aff]
+    aff_lo, aff_hi = aff_range
+    df = df[
+        (df["affiliate_score"].fillna(0) >= aff_lo) &
+        (df["affiliate_score"].fillna(0) <= aff_hi)
+    ]
+
+    df = df.sort_values("affiliate_score", ascending=False, na_position="last")
 
     total = len(df)
     page = st.session_state.get("_recipe_page", 0)

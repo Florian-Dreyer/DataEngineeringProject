@@ -206,10 +206,9 @@ class TestComputeAffiliateColumns:
                     "basket_value_est", "revenue_proj_monthly"]:
             assert col in df.columns, f"missing column: {col}"
 
-    def test_affiliate_score_only_top1000(self):
+    def test_affiliate_score_all_rows(self):
         df = _compute_affiliate_columns(_make_affiliate_df(n=1200))
-        non_nan = df["affiliate_score"].notna().sum()
-        assert non_nan == 1000
+        assert df["affiliate_score"].notna().sum() == 1200
 
     def test_affiliate_score_range(self):
         df = _compute_affiliate_columns(_make_affiliate_df())
