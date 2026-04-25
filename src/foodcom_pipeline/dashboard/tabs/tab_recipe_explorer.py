@@ -120,6 +120,61 @@ def nutrition_bar_color(pct_dv: float, nutrient: str) -> str:
     return "#10b981"      # emerald — default
 
 
+def _compute_affiliate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute affiliate scoring columns in-place and return the DataFrame.
+
+    Only the top 1 000 recipes by review_count receive an affiliate_score;
+    all others get NaN.  All other columns (cart_ready, basket_value_est,
+    review_velocity, revenue_proj_monthly) are computed for every row.
+    """
+    df = df.copy()
+
+    # --- cart_ready (all rows) ---
+    ic = df["ingredient_count"].fillna(0)
+    df["cart_ready"] = pd.array(
+        [bool(v) for v in ((ic >= 7) & (ic <= 11))], dtype=object
+    )
+
+    # --- basket_value_est and revenue_proj_monthly (all rows) ---
+    df["basket_value_est"] = df["ingredient_count"].fillna(0) * 3.50
+    df["revenue_proj_monthly"] = 10_000 * 0.02 * df["basket_value_est"] * 0.04
+
+    # --- review_velocity (all rows) ---
+    df["review_velocity"] = df["review_count"] / 73.0
+
+    # --- affiliate_score (top-1000 by review_count only) ---
+    df["affiliate_score"] = float("nan")
+
+    if "review_count" not in df.columns or df["review_count"].isna().all():
+        return df
+
+    top1k = df.nlargest(1000, "review_count").index
+
+    # Median-fill cook time for normalisation; restore NaN afterwards
+    cook = df.loc[top1k, "avg_cook_minutes"]
+    cook_filled = cook.fillna(cook.median())
+    max_cook = cook_filled.max()
+    if max_cook == 0:
+        max_cook = 1.0
+    prep_norm = (cook_filled / max_cook).clip(lower=0.01)
+
+    rc = df.loc[top1k, "review_count"].fillna(0)
+    max_rc = rc.max()
+    if max_rc == 0:
+        max_rc = 1.0
+
+    sweet = ((df.loc[top1k, "ingredient_count"].fillna(0) >= 7) &
+             (df.loc[top1k, "ingredient_count"].fillna(0) <= 11)).astype(float)
+
+    df.loc[top1k, "affiliate_score"] = (
+        (rc / max_rc) * 0.40
+        + (1.0 / prep_norm) * 0.30
+        + sweet * 0.30
+    ).clip(upper=1.0)
+
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -613,17 +668,27 @@ def _render_list_mode(df: pd.DataFrame) -> None:
         _render_compact_card(row, card_index=start + idx)
 
     # --- Pagination controls ---
-    pc1, pc2, pc3 = st.columns([1, 2, 1])
+    _, pc1, pc2, pc3, _ = st.columns([3, 1, 1, 1, 3])
     with pc1:
-        if page > 0 and st.button("← Previous", key="prev_page", type="primary"):
-            st.session_state["_recipe_page"] = page - 1
-            st.rerun()
+        if page > 0:
+            if st.button("← Previous", key="prev_page", type="primary", use_container_width=True):
+                st.session_state["_recipe_page"] = page - 1
+                st.rerun()
+        else:
+            st.empty()
     with pc2:
-        st.caption(f"Page {page + 1} of {n_pages}")
+        st.markdown(
+            f'<div style="text-align:center;padding-top:6px;color:#6b7280;font-size:13px;">'
+            f'Page {page + 1} of {n_pages}</div>',
+            unsafe_allow_html=True,
+        )
     with pc3:
-        if page < n_pages - 1 and st.button("Next →", key="next_page", type="primary"):
-            st.session_state["_recipe_page"] = page + 1
-            st.rerun()
+        if page < n_pages - 1:
+            if st.button("Next →", key="next_page", type="primary", use_container_width=True):
+                st.session_state["_recipe_page"] = page + 1
+                st.rerun()
+        else:
+            st.empty()
 
 
 def render() -> None:

@@ -154,3 +154,95 @@ class TestIsUsefulTag:
         assert _is_useful_tag("asian") is True
         assert _is_useful_tag("low-fat") is True
         assert _is_useful_tag("affordable-for-groups") is True
+
+
+import math
+from foodcom_pipeline.dashboard.tabs.tab_recipe_explorer import (
+    _compute_affiliate_columns,
+)
+
+
+def _make_affiliate_df(n=1200) -> pd.DataFrame:
+    """1200-row df: recipes with varying review_count, cook time, ingredient_count."""
+    import numpy as np
+    rng = np.random.default_rng(42)
+    return pd.DataFrame({
+        "recipe_id":       range(n),
+        "review_count":    rng.integers(1, 500, size=n).astype(float),
+        "avg_cook_minutes": rng.integers(5, 120, size=n).astype(float),
+        "ingredient_count": rng.integers(2, 20, size=n).astype(float),
+    })
+
+
+class TestComputeAffiliateColumns:
+    def test_new_columns_exist(self):
+        df = _compute_affiliate_columns(_make_affiliate_df())
+        for col in ["affiliate_score", "cart_ready", "review_velocity",
+                    "basket_value_est", "revenue_proj_monthly"]:
+            assert col in df.columns, f"missing column: {col}"
+
+    def test_affiliate_score_only_top1000(self):
+        df = _compute_affiliate_columns(_make_affiliate_df(n=1200))
+        non_nan = df["affiliate_score"].notna().sum()
+        assert non_nan == 1000
+
+    def test_affiliate_score_range(self):
+        df = _compute_affiliate_columns(_make_affiliate_df())
+        scores = df["affiliate_score"].dropna()
+        assert (scores >= 0).all()
+        assert (scores <= 1.01).all()  # small float tolerance
+
+    def test_cart_ready_sweet_spot(self):
+        df = pd.DataFrame({
+            "recipe_id": [1, 2, 3],
+            "review_count": [10.0, 10.0, 10.0],
+            "avg_cook_minutes": [30.0, 30.0, 30.0],
+            "ingredient_count": [7.0, 11.0, 12.0],
+        })
+        result = _compute_affiliate_columns(df)
+        assert result.loc[result["recipe_id"] == 1, "cart_ready"].iloc[0] is True
+        assert result.loc[result["recipe_id"] == 2, "cart_ready"].iloc[0] is True
+        assert result.loc[result["recipe_id"] == 3, "cart_ready"].iloc[0] is False
+
+    def test_basket_value_formula(self):
+        df = pd.DataFrame({
+            "recipe_id": [1],
+            "review_count": [10.0],
+            "avg_cook_minutes": [30.0],
+            "ingredient_count": [8.0],
+        })
+        result = _compute_affiliate_columns(df)
+        assert math.isclose(result.iloc[0]["basket_value_est"], 8 * 3.50)
+
+    def test_revenue_proj_formula(self):
+        df = pd.DataFrame({
+            "recipe_id": [1],
+            "review_count": [10.0],
+            "avg_cook_minutes": [30.0],
+            "ingredient_count": [8.0],
+        })
+        result = _compute_affiliate_columns(df)
+        basket = 8 * 3.50
+        expected_rev = 10_000 * 0.02 * basket * 0.04
+        assert math.isclose(result.iloc[0]["revenue_proj_monthly"], expected_rev)
+
+    def test_review_velocity_formula(self):
+        df = pd.DataFrame({
+            "recipe_id": [1],
+            "review_count": [73.0],
+            "avg_cook_minutes": [30.0],
+            "ingredient_count": [8.0],
+        })
+        result = _compute_affiliate_columns(df)
+        assert math.isclose(result.iloc[0]["review_velocity"], 1.0)
+
+    def test_nan_safe_missing_cook_time(self):
+        df = pd.DataFrame({
+            "recipe_id": [1, 2],
+            "review_count": [10.0, 20.0],
+            "avg_cook_minutes": [float("nan"), 30.0],
+            "ingredient_count": [8.0, 9.0],
+        })
+        result = _compute_affiliate_columns(df)
+        # Should not raise; affiliate_score may be NaN for row 1 but no exception
+        assert "affiliate_score" in result.columns
