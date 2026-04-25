@@ -446,6 +446,30 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
             if badge_parts:
                 st.markdown(" &nbsp; ".join(badge_parts), unsafe_allow_html=True)
 
+            # --- Affiliate badges ---
+            aff_score = row.get("affiliate_score")
+            cart_rdy  = row.get("cart_ready")
+            basket    = row.get("basket_value_est")
+            rev_proj  = row.get("revenue_proj_monthly")
+
+            aff_parts = []
+            if aff_score is not None and not pd.isna(aff_score):
+                aff_parts.append(
+                    f'<span style="background:#fef3c7;color:#92400e;border-radius:4px;'
+                    f'padding:2px 8px;font-size:12px;">🏷️ Affiliate Score: {aff_score:.2f}</span>'
+                )
+            if cart_rdy is True:
+                aff_parts.append(
+                    f'<span style="background:#d1fae5;color:#065f46;border-radius:4px;'
+                    f'padding:2px 8px;font-size:12px;">✅ Cart-Ready</span>'
+                )
+            if aff_parts:
+                st.markdown(" &nbsp; ".join(aff_parts), unsafe_allow_html=True)
+            if basket is not None and not pd.isna(basket):
+                st.caption(f"Est. basket value: ${basket:.2f}")
+            if rev_proj is not None and not pd.isna(rev_proj):
+                st.caption(f"Est. monthly revenue: ${rev_proj:.2f}")
+
         with col_shop:
             st.markdown(
                 f'<a href="{amazon_url}" target="_blank" style="display:block;background:#10b981;'
