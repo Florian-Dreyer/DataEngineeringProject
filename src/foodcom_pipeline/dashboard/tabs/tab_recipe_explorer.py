@@ -769,6 +769,33 @@ def _render_list_mode(df: pd.DataFrame) -> None:
         unsafe_allow_html=True,
     )
 
+    # --- Top 20 Affiliate Opportunities ---
+    with st.expander("📈 Top 20 Affiliate Opportunities"):
+        top20 = (
+            df.dropna(subset=["affiliate_score"])
+            .nlargest(20, "affiliate_score")
+            [["name", "affiliate_score", "basket_value_est",
+              "revenue_proj_monthly", "cart_ready",
+              "avg_cook_minutes", "ingredient_count"]]
+        )
+        if top20.empty:
+            st.caption("No affiliate data yet — run the pipeline first.")
+        else:
+            st.dataframe(
+                top20,
+                use_container_width=True,
+                column_config={
+                    "name":                 st.column_config.TextColumn("Recipe"),
+                    "affiliate_score":      st.column_config.NumberColumn("Affiliate Score", format="%.2f"),
+                    "basket_value_est":     st.column_config.NumberColumn("Est. Basket", format="$%.2f"),
+                    "revenue_proj_monthly": st.column_config.NumberColumn("Est. Monthly Rev.", format="$%.2f"),
+                    "cart_ready":           st.column_config.CheckboxColumn("Cart Ready"),
+                    "avg_cook_minutes":     st.column_config.NumberColumn("Cook (min)", format="%d"),
+                    "ingredient_count":     st.column_config.NumberColumn("Ingredients", format="%d"),
+                },
+                hide_index=True,
+            )
+
     # --- Search ---
     search = st.text_input(
         "",
@@ -786,6 +813,17 @@ def _render_list_mode(df: pd.DataFrame) -> None:
         ]
     else:
         st.session_state.pop("_recipe_search", None)
+
+    # --- Sidebar affiliate filters ---
+    with st.sidebar:
+        st.markdown("### 🏷️ Affiliate Filters")
+        cart_only = st.toggle("Cart-Ready only (7–11 ingredients)", key="aff_cart_only")
+        min_aff   = st.slider("Minimum Affiliate Score", 0.0, 1.0, 0.0,
+                              step=0.05, key="aff_min_score")
+    if cart_only:
+        df = df[df["cart_ready"] == True]  # noqa: E712
+    if min_aff > 0.0:
+        df = df[df["affiliate_score"].fillna(0) >= min_aff]
 
     total = len(df)
     page = st.session_state.get("_recipe_page", 0)
