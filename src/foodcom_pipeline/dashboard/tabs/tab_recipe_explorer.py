@@ -44,6 +44,11 @@ _DB_DSN  = f"postgresql://{_PG_USER}:{_PG_PASS}@{_PG_HOST}:{_PG_PORT}/{_PG_DB}"
 
 PAGE_SIZE = 10
 
+# Populated by load_recipes(); always a valid Series even before first load.
+_RECIPE_MEDIAN: pd.Series = pd.Series(
+    {n: 0.0 for n in ["protein", "fat", "carbs", "sugar", "sodium"]}
+)
+
 # Nutrition axes shown on the radar (all Food.com %DV columns)
 _RADAR_NUTRIENTS = ["protein", "fat", "carbs", "sugar", "sodium"]
 _RADAR_LABELS    = ["Protein %DV", "Fat %DV", "Carbs %DV", "Sugar %DV", "Sodium %DV"]
@@ -184,6 +189,7 @@ def load_recipes() -> pd.DataFrame:
     Load recipe data. Tries PostgreSQL dim_recipe first; falls back to parquet.
     Returns a DataFrame with a normalised schema. Returns empty DataFrame on failure.
     """
+    global _RECIPE_MEDIAN
     # Primary: PostgreSQL dim_recipe
     try:
         import psycopg2
@@ -205,6 +211,12 @@ def load_recipes() -> pd.DataFrame:
             conn.close()
         if not df.empty:
             df["display_rating"] = df["sentiment_rating"].fillna(df["avg_rating"])
+            if "weighted_review_count" in df.columns:
+                df["review_count"] = df["weighted_review_count"]
+            elif "review_count" not in df.columns:
+                df["review_count"] = float("nan")
+            df = _compute_affiliate_columns(df)
+            _RECIPE_MEDIAN = df[["protein", "fat", "carbs", "sugar", "sodium"]].median()
             return df
     except Exception:
         pass
@@ -274,6 +286,16 @@ def load_recipes() -> pd.DataFrame:
     for col in ["calories", "protein", "fat", "sugar", "sodium", "carbs", "saturated_fat"]:
         if col not in df.columns:
             df[col] = float("nan")
+
+    # Alias weighted_review_count → review_count for affiliate scoring
+    if "weighted_review_count" in df.columns:
+        df["review_count"] = df["weighted_review_count"]
+    elif "review_count" not in df.columns:
+        df["review_count"] = float("nan")
+
+    df = _compute_affiliate_columns(df)
+
+    _RECIPE_MEDIAN = df[["protein", "fat", "carbs", "sugar", "sodium"]].median()
 
     return df
 
