@@ -12,7 +12,7 @@ import re
 from datetime import date
 
 import pandas as pd
-from serpapi import GoogleSearch
+import serpapi
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,8 @@ _SEED_PATTERN = re.compile(r"\brecipes?\b", re.IGNORECASE)
 def _search(**params) -> dict:
     """Execute a SerpAPI Google Trends search."""
     params["api_key"] = os.environ["SERPAPI_KEY"]
-    return GoogleSearch(params).get_dict()
+    client = serpapi.Client(**params)
+    return client.get_dict()
 
 
 def _validate_related_query(query: str) -> bool:

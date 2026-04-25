@@ -80,6 +80,7 @@ def _ensure_parquet_pool():
                 pool=PARQUET_POOL,
                 slots=1,
                 description='Serializes access to staging parquet files to prevent file lock deadlocks',
+                include_deferred=False,
             )
             session.add(pool)
             session.commit()

@@ -42,26 +42,20 @@ services:
     # Use the image's airflow user so the `airflow` CLI is available on PATH.
     user: "50000:0"
     volumes:
-      # Long-form bind mounts avoid mis-parsing of colons in host paths (e.g. "AY25:26")
-      - type: bind
-        source: .
-        target: /opt/airflow/app
+      # DAGs must be mounted for live reload during development
       - type: bind
         source: ./src/foodcom_pipeline/batch/dags
         target: /opt/airflow/dags
-      - type: bind
-        source: ./data
-        target: /opt/airflow/data
-      - type: bind
-        source: ./staging
-        target: /opt/airflow/staging
+        consistency: delegated
+      # Staging dir as volume (not bind mount) — avoids errno 35 deadlock
+      - staging_volume:/opt/airflow/staging
+      # Kaggle credentials as read-only bind mount
       - type: bind
         source: ${HOME}/.kaggle
         target: /home/airflow/.kaggle
         read_only: true
-      - type: bind
-        source: ./usda_data
-        target: /opt/airflow/usda_data
+      # USDA data as volume (built into image, but allow override)
+      - usda_volume:/opt/airflow/usda_data
     ports:
       - "8080:8080"
     command: >
@@ -72,4 +66,5 @@ services:
 
 volumes:
   postgres_data:
-
+  staging_volume:
+  usda_volume:

@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 import zipfile
 from datetime import date, datetime
 from pathlib import Path
@@ -329,8 +330,7 @@ def extract_recipes(**context) -> None:
     """
     logger.info(f'Reading recipes from {RECIPES_CSV}')
 
-    df = pd.read_csv(
-        RECIPES_CSV,
+    df = _retry_on_deadlock(pd.read_csv, RECIPES_CSV,
         usecols=['id', 'name', 'minutes', 'tags', 'nutrition', 'steps', 'ingredients'],
         dtype={'id': 'int64'},
     )
@@ -388,8 +388,7 @@ def extract_interactions(**context) -> None:
 
     logger.info(f'Reading interactions from {INTERACTIONS_CSV}')
 
-    df = pd.read_csv(
-        INTERACTIONS_CSV,
+    df = _retry_on_deadlock(pd.read_csv, INTERACTIONS_CSV,
         usecols=['user_id', 'recipe_id', 'date', 'rating', 'review'],
         dtype={'user_id': 'int64', 'recipe_id': 'int64', 'rating': 'int8'},
         parse_dates=['date'],
@@ -985,3 +984,23 @@ def _log_extraction_stats(name: str, df: pd.DataFrame) -> None:
     logger.info(f'  Columns    : {list(df.columns)}')
     logger.info(f'  Null counts:\n{df.isnull().sum().to_string()}')
     logger.info(f'  Memory     : {df.memory_usage(deep=True).sum() / 1e6:.1f} MB')
+
+
+def _retry_on_deadlock(func, *args, max_retries=5, **kwargs):
+    """Retry a function if it raises OSError with errno 35 (resource deadlock).
+    
+    Exponential backoff: 1s, 2s, 4s.
+    """
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except OSError as e:
+            if e.errno == 35 and attempt < max_retries - 1:
+                wait_time = (2 ** (attempt + 1))
+                logger.warning(
+                    f'OSError 35 (resource deadlock) on attempt {attempt + 1}/{max_retries}. '
+                    f'Retrying in {wait_time}s...'
+                )
+                time.sleep(wait_time)
+            else:
+                raise
