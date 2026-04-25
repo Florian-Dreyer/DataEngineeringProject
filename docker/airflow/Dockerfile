@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir \
     scipy \
     scikit-learn \
     serpapi \
-    google-generativeai \
+    google-genai \
     requests \
     sqlalchemy \
     psycopg2-binary \
@@ -20,5 +20,5 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     tqdm \
     transformers \
-    torch
-
+    torch \
+    fpdf2

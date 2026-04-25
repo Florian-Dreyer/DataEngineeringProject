@@ -12,7 +12,7 @@ import re
 from datetime import date
 
 import pandas as pd
-import serpapi
+from serpapi import GoogleSearch
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +21,10 @@ SEEDS: list[str] = ["recipe", "recipes"]
 _SEED_PATTERN = re.compile(r"\brecipes?\b", re.IGNORECASE)
 
 
-def _get_client() -> serpapi.Client:
-    return serpapi.Client(api_key=os.environ["SERPAPI_KEY"])
+def _search(**params) -> dict:
+    """Execute a SerpAPI Google Trends search."""
+    params["api_key"] = os.environ["SERPAPI_KEY"]
+    return GoogleSearch(params).get_dict()
 
 
 def _validate_related_query(query: str) -> bool:
@@ -37,17 +39,16 @@ def extract_google_trends(timeframe: str = "today 5-y", geo: str = "") -> pd.Dat
     Returns:
         DataFrame with columns: keyword, date, interest_score, geo, related_queries
     """
-    client = _get_client()
     q = ", ".join(SEEDS)
 
-    results = client.search({
-        "engine": "google_trends",
-        "q": q,
-        "date": timeframe,
-        "tz": "360",
-        "geo": geo,
-        "data_type": "TIMESERIES",
-    })
+    results = _search(
+        engine="google_trends",
+        q=q,
+        date=timeframe,
+        tz="360",
+        geo=geo,
+        data_type="TIMESERIES",
+    )
 
     timeline = _parse_timeline(results, SEEDS)
 
@@ -67,14 +68,14 @@ def extract_google_trends(timeframe: str = "today 5-y", geo: str = "") -> pd.Dat
     # RELATED_QUERIES only accepts a single keyword — fetch each seed separately.
     related_queries: dict = {}
     for kw in SEEDS:
-        rq_result = client.search({
-            "engine": "google_trends",
-            "q": kw,
-            "date": timeframe,
-            "tz": "360",
-            "geo": geo,
-            "data_type": "RELATED_QUERIES",
-        })
+        rq_result = _search(
+            engine="google_trends",
+            q=kw,
+            date=timeframe,
+            tz="360",
+            geo=geo,
+            data_type="RELATED_QUERIES",
+        )
         kw_rq = rq_result.get("related_queries", {})
         related_queries[kw] = kw_rq.get(kw) or kw_rq
 
@@ -106,21 +107,20 @@ def fetch_related_queries(seeds: list[str], timeframe: str = "today 5-y", geo: s
 
     Columns: seed_query, related_query, query_type (rising|top), raw_value, fetched_date.
     """
-    client = _get_client()
     fetched_date = date.today()
     rows: list[dict] = []
 
     # RELATED_QUERIES only accepts a single keyword — fetch each seed separately.
     combined_related: dict = {}
     for seed in seeds:
-        result = client.search({
-            "engine": "google_trends",
-            "q": seed,
-            "date": timeframe,
-            "tz": "360",
-            "geo": geo,
-            "data_type": "RELATED_QUERIES",
-        })
+        result = _search(
+            engine="google_trends",
+            q=seed,
+            date=timeframe,
+            tz="360",
+            geo=geo,
+            data_type="RELATED_QUERIES",
+        )
         seed_rq = result.get("related_queries", {})
         combined_related[seed] = seed_rq.get(seed) or seed_rq
 
