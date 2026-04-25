@@ -747,12 +747,27 @@ def _log_row_counts(engine) -> None:
 # ---------------------------------------------------------------------------
 # Trends metadata — tracks when each seed query was last fetched so the
 # extract_google_trends task can skip fetches that are still fresh.
-# Stored as a small Parquet file alongside other staging artefacts.
+# Metadata is stored in PostgreSQL to avoid file-locking issues (EDEADLK / errno 35)
+# on Docker bind-mount volumes.  is_trends_stale() already queries google_trends_raw
+# directly, so save_trends_metadata only needs to touch the DB.
 # ---------------------------------------------------------------------------
 
-_TRENDS_METADATA_PATH = STAGING_DIR / 'trends_metadata.parquet'
-_AI_MODE_METADATA_PATH = STAGING_DIR / 'ai_mode_metadata.parquet'
 _STALENESS_DAYS = 7
+
+_ENSURE_METADATA_DDL = """
+CREATE TABLE IF NOT EXISTS pipeline_metadata (
+    key          TEXT PRIMARY KEY,
+    fetched_date DATE NOT NULL
+)
+"""
+
+
+def _metadata_engine():
+    return create_engine(POSTGRES_CONN)
+
+
+def _ensure_metadata_table(conn) -> None:
+    conn.execute(text(_ENSURE_METADATA_DDL))
 
 
 def _days_since(last_fetched) -> int:
@@ -766,7 +781,7 @@ def _days_since(last_fetched) -> int:
 def is_trends_stale(seed_query: str) -> bool:
     """Returns True if google_trends_raw has no rows for *seed_query* or data is older than 7 days."""
     try:
-        engine = create_engine(POSTGRES_CONN)
+        engine = _metadata_engine()
         with engine.connect() as conn:
             result = conn.execute(
                 text(
@@ -784,48 +799,59 @@ def is_trends_stale(seed_query: str) -> bool:
 
 def is_ai_mode_stale() -> bool:
     """Returns True if AI Mode data is missing, older than 7 days, or absent from the DB."""
-    # Check metadata file first
-    if not _AI_MODE_METADATA_PATH.is_file():
-        return True
-    meta = pd.read_parquet(_AI_MODE_METADATA_PATH)
-    if meta.empty or _days_since(meta.iloc[0]['last_fetched_date']) > _STALENESS_DAYS:
-        return True
-    # Confirm data actually landed in the DB
     try:
-        engine = create_engine(POSTGRES_CONN)
+        engine = _metadata_engine()
+        with engine.connect() as conn:
+            _ensure_metadata_table(conn)
+            row = conn.execute(
+                text("SELECT fetched_date FROM pipeline_metadata WHERE key = 'ai_mode'")
+            ).fetchone()
+        if row is None or _days_since(row[0]) > _STALENESS_DAYS:
+            return True
+        # Confirm data actually landed
         with engine.connect() as conn:
             count = conn.execute(text("SELECT COUNT(*) FROM ai_mode_raw")).scalar()
-        if not count:
-            return True
+        return not count
     except Exception:
         return True
-    return False
 
 
 def save_trends_metadata(seed_query: str, fetched_date: date) -> None:
-    """Upserts a *trends_metadata* row for *seed_query* with *fetched_date*."""
-    if _TRENDS_METADATA_PATH.is_file():
-        df = pd.read_parquet(_TRENDS_METADATA_PATH)
-        df = df[df['seed_query'] != seed_query]
-    else:
-        df = pd.DataFrame(columns=['seed_query', 'last_fetched_date'])
-
-    new_row = pd.DataFrame(
-        [{'seed_query': seed_query, 'last_fetched_date': fetched_date}]
-    )
-    df = pd.concat([df, new_row], ignore_index=True)
-
-    _TRENDS_METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(_TRENDS_METADATA_PATH, index=False)
-    logger.info('trends_metadata updated: %s → %s', seed_query, fetched_date)
+    """Records the date of the last successful Trends fetch for *seed_query*."""
+    try:
+        engine = _metadata_engine()
+        with engine.begin() as conn:
+            _ensure_metadata_table(conn)
+            conn.execute(
+                text("""
+                    INSERT INTO pipeline_metadata (key, fetched_date)
+                    VALUES (:key, :fetched_date)
+                    ON CONFLICT (key) DO UPDATE SET fetched_date = EXCLUDED.fetched_date
+                """),
+                {"key": f"trends:{seed_query}", "fetched_date": fetched_date},
+            )
+        logger.info('trends_metadata updated: %s → %s', seed_query, fetched_date)
+    except Exception as exc:
+        logger.warning('Could not save trends metadata: %s', exc)
 
 
 def save_ai_mode_metadata(fetched_date: date) -> None:
     """Records the date of the last successful AI Mode fetch."""
-    df = pd.DataFrame([{'last_fetched_date': fetched_date}])
-    _AI_MODE_METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(_AI_MODE_METADATA_PATH, index=False)
-    logger.info('ai_mode_metadata updated: %s', fetched_date)
+    try:
+        engine = _metadata_engine()
+        with engine.begin() as conn:
+            _ensure_metadata_table(conn)
+            conn.execute(
+                text("""
+                    INSERT INTO pipeline_metadata (key, fetched_date)
+                    VALUES ('ai_mode', :fetched_date)
+                    ON CONFLICT (key) DO UPDATE SET fetched_date = EXCLUDED.fetched_date
+                """),
+                {"fetched_date": fetched_date},
+            )
+        logger.info('ai_mode_metadata updated: %s', fetched_date)
+    except Exception as exc:
+        logger.warning('Could not save ai_mode metadata: %s', exc)
 
 
 # ---------------------------------------------------------------------------

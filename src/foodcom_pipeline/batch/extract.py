@@ -600,8 +600,17 @@ def _load_local_usda_foods(usda_dir: Path) -> list[dict[str, Any]]:
         if not path.is_file():
             logger.warning('USDA JSON file not found, skipping: %s', path)
             continue
-        with path.open(encoding='utf-8') as f:
-            payload = json.load(f)
+        try:
+            # Read fully into memory before parsing to avoid EDEADLK (errno 35)
+            # on Docker volume mounts where streaming large files can deadlock.
+            raw = path.read_bytes()
+            payload = json.loads(raw)
+        except OSError as exc:
+            logger.warning('Could not read %s (%s); skipping.', path, exc)
+            continue
+        except json.JSONDecodeError as exc:
+            logger.warning('Could not parse %s (%s); skipping.', path, exc)
+            continue
         batch = payload.get(top_key) or []
         if not isinstance(batch, list):
             logger.warning(
@@ -609,6 +618,7 @@ def _load_local_usda_foods(usda_dir: Path) -> list[dict[str, Any]]:
             )
             continue
         foods.extend(batch)
+        logger.info('Loaded %d foods from %s', len(batch), filename)
     return foods
 
 

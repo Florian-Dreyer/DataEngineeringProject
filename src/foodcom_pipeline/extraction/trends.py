@@ -64,15 +64,19 @@ def extract_google_trends(timeframe: str = "today 5-y", geo: str = "") -> pd.Dat
         .reset_index()
     )
 
-    rq_results = client.search({
-        "engine": "google_trends",
-        "q": q,
-        "date": timeframe,
-        "tz": "360",
-        "geo": geo,
-        "data_type": "RELATED_QUERIES",
-    })
-    related_queries = rq_results.get("related_queries", {})
+    # RELATED_QUERIES only accepts a single keyword — fetch each seed separately.
+    related_queries: dict = {}
+    for kw in SEEDS:
+        rq_result = client.search({
+            "engine": "google_trends",
+            "q": kw,
+            "date": timeframe,
+            "tz": "360",
+            "geo": geo,
+            "data_type": "RELATED_QUERIES",
+        })
+        kw_rq = rq_result.get("related_queries", {})
+        related_queries[kw] = kw_rq.get(kw) or kw_rq
 
     rows = []
     for kw in SEEDS:
@@ -106,19 +110,22 @@ def fetch_related_queries(seeds: list[str], timeframe: str = "today 5-y", geo: s
     fetched_date = date.today()
     rows: list[dict] = []
 
-    results = client.search({
-        "engine": "google_trends",
-        "q": ", ".join(seeds),
-        "date": timeframe,
-        "tz": "360",
-        "geo": geo,
-        "data_type": "RELATED_QUERIES",
-    })
-
-    related = results.get("related_queries", {})
+    # RELATED_QUERIES only accepts a single keyword — fetch each seed separately.
+    combined_related: dict = {}
+    for seed in seeds:
+        result = client.search({
+            "engine": "google_trends",
+            "q": seed,
+            "date": timeframe,
+            "tz": "360",
+            "geo": geo,
+            "data_type": "RELATED_QUERIES",
+        })
+        seed_rq = result.get("related_queries", {})
+        combined_related[seed] = seed_rq.get(seed) or seed_rq
 
     for seed in seeds:
-        seed_rq = related.get(seed) or {}
+        seed_rq = combined_related.get(seed) or {}
         for query_type in ("rising", "top"):
             for item in seed_rq.get(query_type) or []:
                 query = item.get("query", "")

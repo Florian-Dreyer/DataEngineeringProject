@@ -38,6 +38,7 @@ CLEANED_STAGING = STAGING_DIR / "recipes_clean.parquet"
 TAGS_STAGING = STAGING_DIR / "recipe_tags.parquet"
 SIGNAL_TAGS_STAGING = STAGING_DIR / "signal_tags.parquet"
 RECIPE_TERM_INDEX_STAGING = STAGING_DIR / "recipe_term_index.parquet"
+EXTERNAL_TERMS_STAGING = STAGING_DIR / "external_recipe_terms.parquet"
 
 MAX_LLM_RECIPES = 20
 GEMINI_MODEL = "gemini-3-flash"
@@ -832,3 +833,417 @@ def build_recipe_term_index(**context) -> None:
     if context.get("ti"):
         context["ti"].xcom_push(key="recipe_term_index_count", value=len(index_df))
         context["ti"].xcom_push(key="recipes_without_tags", value=no_tags_count)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# External recipe terms: normalize Google AI Mode outputs
+# ─────────────────────────────────────────────────────────────────────────
+
+_EXT_COLS = [
+    "source",
+    "raw_term",
+    "canonical_term",
+    "source_score",
+    "raw_frequency",
+    "fetched_date",
+    "tags",
+    "tag_dimensions",
+]
+
+# Term-level patterns that indicate conversational AI residue, not dish names.
+# Block-level filtering already runs in ai_mode.fetch_ai_mode_blocks, but
+# individual terms can still carry these fragments after splitting.
+_AI_RESIDUE = re.compile(
+    r"would you like"
+    r"|here are some"
+    r"|let me know"
+    r"|i hope"
+    r"|feel free"
+    r"|^for example\b"
+    r"|^to (make|cook|prepare)\b"
+    r"|^if you\b"
+    r"|^you (can|might|could|should)\b"
+    r"|^i (can|will|would|think)\b"
+    r"|\?"
+    r"|\bclick\b"
+    r"|\bsee more\b"
+    r"|\bread more\b"
+    r"|\bsign up\b"
+    r"|\bsubscribe\b",
+    flags=re.IGNORECASE,
+)
+
+_MAX_TERM_CHARS = 60   # anything longer is almost certainly a sentence fragment
+_MIN_ALPHA_RATIO = 0.6  # fraction of characters that must be alphabetic
+
+# Non-food domain keywords — Trends queries matching these are always dropped.
+_TRENDS_BLOCKLIST = re.compile(
+    r"\bpython\b"
+    r"|\binsurance\b"
+    r"|\blaptops?\b"
+    r"|\breal estate\b"
+    r"|\bflights?\b"
+    r"|\bweather\b"
+    r"|\bstock market\b"
+    r"|\bused cars?\b"
+    r"|\bpc games?\b"
+    r"|\bcoupons?\b"
+    r"|\bnovels?\b"
+    r"|\bgame reviews?\b"
+    r"|\bcartoons?\b",
+    flags=re.IGNORECASE,
+)
+
+# Recipe intent signal — a Trends query must pass this OR match a food taxonomy keyword.
+_RECIPE_KEYWORDS = re.compile(r"\brecipes?\b", re.IGNORECASE)
+
+
+def _has_food_intent(term: str) -> bool:
+    """
+    Return True if *term* is recipe/food-adjacent.
+    Passes if the term contains "recipe"/"recipes" OR matches a food
+    taxonomy keyword from TAG_DICT.
+    """
+    if _RECIPE_KEYWORDS.search(term):
+        return True
+    term_lower = term.lower()
+    # Use compiled TAG_PATTERNS (already have word-boundary anchors)
+    for patterns in TAG_PATTERNS.values():
+        for pat in patterns:
+            if pat.search(term_lower):
+                return True
+    return False
+
+
+def _is_valid_external_term(term: str) -> bool:
+    """
+    Return True if *term* looks like a dish / recipe search phrase.
+    Rejects conversational residue, prose fragments, and non-food junk.
+    """
+    if not term or len(term) < 3:
+        return False
+    if len(term) > _MAX_TERM_CHARS:
+        return False
+    if _AI_RESIDUE.search(term):
+        return False
+    alpha_chars = sum(c.isalpha() for c in term)
+    if alpha_chars / len(term) < _MIN_ALPHA_RATIO:
+        return False
+    return True
+
+
+def _aggregate_signal_tags(signal_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Group signal_tags rows by term, producing pipe-joined tags and
+    tag_dimensions (derived from TAG_DIMENSION_MAP, not stored in signal_tags).
+    Returns a DataFrame with columns: term, tags, tag_dimensions.
+    """
+    if signal_df.empty:
+        return pd.DataFrame(columns=["term", "tags", "tag_dimensions"])
+
+    def _dims(tag_series) -> str:
+        dims = sorted({
+            TAG_DIMENSION_MAP.get(t, "unknown")
+            for t in tag_series.dropna().unique()
+        })
+        return "|".join(dims)
+
+    return (
+        signal_df
+        .groupby("term", sort=False)
+        .agg(
+            tags=("tag", lambda s: "|".join(sorted(s.dropna().unique()))),
+            tag_dimensions=("tag", _dims),
+        )
+        .reset_index()
+    )
+
+
+def _enrich_with_tags(df: pd.DataFrame, tag_agg: pd.DataFrame) -> pd.DataFrame:
+    """Left-join tag_agg onto df on raw_term, filling tags/tag_dimensions columns."""
+    if tag_agg.empty or df.empty:
+        return df
+    merged = df.merge(tag_agg, left_on="raw_term", right_on="term", how="left", suffixes=("", "_sig"))
+    for col in ("tags", "tag_dimensions"):
+        sig_col = f"{col}_sig"
+        if sig_col in merged.columns:
+            merged[col] = merged[sig_col].where(merged[sig_col].notna(), merged[col])
+            merged = merged.drop(columns=[sig_col])
+    return merged.drop(columns=["term"], errors="ignore")
+
+
+def _build_ai_mode_rows(scores_df: pd.DataFrame) -> tuple[list[dict], int, int]:
+    """
+    Convert ai_mode_term_scores rows into external term dicts.
+    Returns (rows, dropped_residue, dropped_canonical).
+    """
+    rows: list[dict] = []
+    dropped_residue = 0
+    dropped_canonical = 0
+
+    for _, row in scores_df.iterrows():
+        raw_term = str(row["term"]).strip()
+        if not _is_valid_external_term(raw_term):
+            dropped_residue += 1
+            logger.debug("AI Mode: dropping residue/junk %r", raw_term)
+            continue
+        canonical_term = canonicalize_recipe_term(raw_term)
+        if not canonical_term:
+            dropped_canonical += 1
+            logger.debug("AI Mode: empty canonical for %r", raw_term)
+            continue
+        rows.append({
+            "source": "google_ai",
+            "raw_term": raw_term,
+            "canonical_term": canonical_term,
+            "source_score": row.get("normalised_score"),
+            "raw_frequency": row.get("raw_frequency"),
+            "fetched_date": row.get("fetched_date"),
+            "tags": None,
+            "tag_dimensions": None,
+        })
+
+    logger.info(
+        "AI Mode: kept %d  |  dropped residue/junk %d  |  dropped empty canonical %d",
+        len(rows), dropped_residue, dropped_canonical,
+    )
+    return rows, dropped_residue, dropped_canonical
+
+
+def _build_trends_rows(trends_df: pd.DataFrame) -> tuple[list[dict], int, int, int]:
+    """
+    Convert google_trends_normalised rows into external term dicts.
+
+    Filters:
+      - Drop if matches _TRENDS_BLOCKLIST (non-food domain keywords)
+      - Keep if contains recipe keyword OR matches food taxonomy keyword
+      - Drop if canonical_term is empty after canonicalization
+
+    Returns (rows, dropped_blocklist, dropped_intent, dropped_canonical).
+    """
+    rows: list[dict] = []
+    dropped_blocklist = 0
+    dropped_intent = 0
+    dropped_canonical = 0
+
+    # Deduplicate across seed/query_type: one row per related_query,
+    # keeping the highest normalised_score.
+    deduped = (
+        trends_df
+        .sort_values("normalised_score", ascending=False, na_position="last")
+        .drop_duplicates(subset=["related_query"])
+    )
+
+    for _, row in deduped.iterrows():
+        raw_term = str(row["related_query"]).strip()
+
+        if _TRENDS_BLOCKLIST.search(raw_term):
+            dropped_blocklist += 1
+            logger.debug("Trends: blocklist drop %r", raw_term)
+            continue
+
+        if not _has_food_intent(raw_term):
+            dropped_intent += 1
+            logger.debug("Trends: no food intent %r", raw_term)
+            continue
+
+        canonical_term = canonicalize_recipe_term(raw_term)
+        if not canonical_term:
+            dropped_canonical += 1
+            logger.debug("Trends: empty canonical for %r", raw_term)
+            continue
+
+        rows.append({
+            "source": "google_trends",
+            "raw_term": raw_term,
+            "canonical_term": canonical_term,
+            "source_score": row.get("normalised_score"),
+            "raw_frequency": row.get("raw_value"),
+            "fetched_date": row.get("fetched_date"),
+            "tags": None,
+            "tag_dimensions": None,
+        })
+
+    logger.info(
+        "Trends: kept %d  |  dropped blocklist %d  |  dropped no-intent %d  |  dropped empty canonical %d",
+        len(rows), dropped_blocklist, dropped_intent, dropped_canonical,
+    )
+    return rows, dropped_blocklist, dropped_intent, dropped_canonical
+
+
+def build_external_recipe_terms(**context) -> None:
+    """
+    Normalize Google AI Mode and Google Trends outputs into
+    external_recipe_terms.parquet.
+
+    Columns: source, raw_term, canonical_term, source_score, raw_frequency,
+             fetched_date, tags, tag_dimensions
+
+    source is 'google_ai' or 'google_trends'.  raw_term is kept for
+    explainability.  Tags are enriched from signal_tags.parquet when
+    available; tag_dimensions are derived from TAG_DIMENSION_MAP.
+    """
+    logger.info("Building external recipe terms (AI Mode + Google Trends)...")
+
+    all_rows: list[dict] = []
+    total_dropped = 0
+
+    # ── 1. AI Mode ────────────────────────────────────────────────────────
+    if AI_MODE_TERM_SCORES_STAGING.is_file():
+        scores_df = pd.read_parquet(AI_MODE_TERM_SCORES_STAGING)
+        logger.info("Loaded %d AI Mode term scores", len(scores_df))
+        ai_rows, dr, dc = _build_ai_mode_rows(scores_df)
+        all_rows.extend(ai_rows)
+        total_dropped += dr + dc
+    else:
+        logger.warning("AI Mode term scores not found: %s", AI_MODE_TERM_SCORES_STAGING)
+
+    # ── 2. Google Trends ──────────────────────────────────────────────────
+    if TRENDS_NORMALISED_STAGING.is_file():
+        trends_df = pd.read_parquet(TRENDS_NORMALISED_STAGING)
+        logger.info("Loaded %d Google Trends normalised rows", len(trends_df))
+        tr_rows, db, di, dc = _build_trends_rows(trends_df)
+        all_rows.extend(tr_rows)
+        total_dropped += db + di + dc
+    else:
+        logger.warning("Trends normalised staging not found: %s", TRENDS_NORMALISED_STAGING)
+
+    if not all_rows:
+        logger.warning("No valid external recipe terms produced from any source")
+        ext_df = pd.DataFrame(columns=_EXT_COLS)
+    else:
+        ext_df = pd.DataFrame(all_rows)
+
+    # ── 3. Load signal_tags and enrich per source ─────────────────────────
+    if SIGNAL_TAGS_STAGING.exists() and not ext_df.empty:
+        signal_full = pd.read_parquet(SIGNAL_TAGS_STAGING)
+
+        for source_val, data_source_val in (
+            ("google_ai", "ai_mode"),
+            ("google_trends", "trends"),
+        ):
+            sig_subset = signal_full[signal_full["data_source"] == data_source_val].copy()
+            tag_agg = _aggregate_signal_tags(sig_subset)
+            mask = ext_df["source"] == source_val
+            if mask.any() and not tag_agg.empty:
+                enriched = _enrich_with_tags(ext_df[mask].copy(), tag_agg)
+                ext_df = pd.concat(
+                    [enriched, ext_df[~mask]], ignore_index=True
+                )
+    else:
+        if not SIGNAL_TAGS_STAGING.exists():
+            logger.info("signal_tags.parquet not found — tags will be empty")
+
+    # ── 4. Deduplicate within each source on canonical_term ───────────────
+    ext_df = (
+        ext_df
+        .sort_values("source_score", ascending=False, na_position="last")
+        .drop_duplicates(subset=["source", "canonical_term"])
+        .reset_index(drop=True)
+    )
+
+    # ── 5. Enforce schema ─────────────────────────────────────────────────
+    for col in _EXT_COLS:
+        if col not in ext_df.columns:
+            ext_df[col] = None
+    ext_df = ext_df[_EXT_COLS]
+
+    # ── 6. Write parquet ──────────────────────────────────────────────────
+    EXTERNAL_TERMS_STAGING.parent.mkdir(parents=True, exist_ok=True)
+    atomic_parquet(ext_df, EXTERNAL_TERMS_STAGING)
+    logger.info(
+        "External recipe terms written to %s (%d rows, %d dropped total)",
+        EXTERNAL_TERMS_STAGING, len(ext_df), total_dropped,
+    )
+
+    # ── 7. Validation ─────────────────────────────────────────────────────
+    _validate_external_terms(ext_df)
+
+    if context.get("ti"):
+        context["ti"].xcom_push(key="external_terms_count", value=len(ext_df))
+        context["ti"].xcom_push(key="external_terms_dropped", value=total_dropped)
+
+
+def _validate_external_terms(df: pd.DataFrame) -> None:
+    """
+    Log validation checks for external_recipe_terms.
+    Also runs the Trends filter against a fixed set of known-good and
+    known-bad examples so the logic can be verified even when those
+    exact strings are absent from the live data.
+    """
+    logger.info("=== external_recipe_terms validation ===")
+    logger.info("Row count: %d", len(df))
+
+    by_source = df.groupby("source").size().to_dict()
+    for src, n in sorted(by_source.items()):
+        logger.info("  source=%-15s  rows=%d", src, n)
+
+    # Check: no "would you like" anywhere
+    wyl = int(df["raw_term"].str.contains("would you like", case=False, na=False).sum())
+    logger.info("Rows containing 'would you like': %d  [%s]", wyl, "OK" if wyl == 0 else "FAIL")
+
+    # Check: all canonical_terms non-empty
+    empty_ct = int((df["canonical_term"].isna() | (df["canonical_term"] == "")).sum())
+    logger.info("Rows with empty canonical_term: %d  [%s]", empty_ct, "OK" if empty_ct == 0 else "FAIL")
+
+    # Top 20 by source_score
+    logger.info("--- top 20 rows by source_score ---")
+    top = df.nlargest(20, "source_score")
+    for _, row in top.iterrows():
+        logger.info(
+            "  [%-13s]  raw=%-35s  canonical=%-28s  score=%+.3f",
+            row["source"],
+            str(row["raw_term"])[:35],
+            str(row["canonical_term"])[:28],
+            float(row["source_score"]) if pd.notna(row["source_score"]) else 0.0,
+        )
+
+    # ── Trends filter unit checks ─────────────────────────────────────────
+    _validate_trends_filter()
+
+    logger.info("=== end validation ===")
+
+
+def _validate_trends_filter() -> None:
+    """
+    Run the Trends blocklist + food-intent filter against a fixed set of
+    known-drop and known-keep examples and log PASS/FAIL for each.
+    """
+    should_drop = [
+        "how to learn python",
+        "car insurance quotes",
+        "cheap flights",
+        "stock market news",
+    ]
+    should_keep = [
+        "banana bread recipe",
+        "ramen recipes",
+        "chicken recipes",
+        "gluten free pizza crust recipe",
+    ]
+
+    logger.info("--- trends filter unit checks ---")
+    all_pass = True
+
+    for term in should_drop:
+        blocked = bool(_TRENDS_BLOCKLIST.search(term))
+        food = _has_food_intent(term)
+        # A term is dropped if blocklisted OR has no food intent
+        dropped = blocked or not food
+        ok = dropped
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            all_pass = False
+        logger.info("  SHOULD DROP  [%s]  %r  (blocklist=%s, food_intent=%s)", status, term, blocked, food)
+
+    for term in should_keep:
+        blocked = bool(_TRENDS_BLOCKLIST.search(term))
+        food = _has_food_intent(term)
+        kept = not blocked and food
+        ok = kept
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            all_pass = False
+        logger.info("  SHOULD KEEP  [%s]  %r  (blocklist=%s, food_intent=%s)", status, term, blocked, food)
+
+    logger.info("Trends filter unit checks: %s", "ALL PASS" if all_pass else "SOME FAILED")

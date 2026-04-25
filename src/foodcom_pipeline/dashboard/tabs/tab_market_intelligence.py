@@ -32,13 +32,17 @@ def _resolve_staging_dir() -> Path:
 
 STAGING_DIR = _resolve_staging_dir()
 
-CLUSTER_PROFILE_PATH         = STAGING_DIR / "cluster_profiles.json"
-AI_MODE_TERM_SCORES_PATH     = STAGING_DIR / "ai_mode_term_scores.parquet"
-GAP_ANALYSIS_PATH            = STAGING_DIR / "gap_analysis.parquet"
-TRENDS_NORMALISED_PATH       = STAGING_DIR / "google_trends_normalised.parquet"
+CLUSTER_PROFILE_PATH        = STAGING_DIR / "cluster_profiles.json"
+AI_MODE_TERM_SCORES_PATH    = STAGING_DIR / "ai_mode_term_scores.parquet"
+TRENDS_NORMALISED_PATH      = STAGING_DIR / "google_trends_normalised.parquet"
+RECIPE_GAP_ANALYSIS_PATH    = STAGING_DIR / "recipe_gap_analysis.parquet"
+EXTERNAL_RECIPE_TERMS_PATH  = STAGING_DIR / "external_recipe_terms.parquet"
+RECIPE_TERM_INDEX_PATH      = STAGING_DIR / "recipe_term_index.parquet"
+RECIPE_TERM_CLUSTERS_PATH   = STAGING_DIR / "recipe_term_clusters.parquet"
+RECIPE_TAGS_PATH            = STAGING_DIR / "recipe_tags.parquet"
 
 # ─────────────────────────────────────────────────────────────────────────
-# CPG segment config (unchanged)
+# CPG segment config
 # ─────────────────────────────────────────────────────────────────────────
 
 RADAR_FEATURES = ["avg_rating_dairy", "avg_rating_protein", "avg_rating_vegetable",
@@ -91,7 +95,7 @@ def _load_parquet(path: Path) -> pd.DataFrame | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# CPG helpers (unchanged)
+# CPG helpers
 # ─────────────────────────────────────────────────────────────────────────
 
 def _radar_chart(profiles: dict, selected_labels: list[str]) -> go.Figure:
@@ -184,23 +188,28 @@ def _generate_pdf(profiles: dict, selected_labels: list[str]) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Search demand helpers
+# Demand gap helpers
 # ─────────────────────────────────────────────────────────────────────────
 
-_TIER_COLORS = {"High": "#ef4444", "Medium": "#f97316", "Low": "#9ca3af"}
+_OPP_COLORS = {"High": "#ef4444", "Medium": "#f97316", "Low": "#9ca3af"}
+_OPP_ICONS  = {"High": "🔴", "Medium": "🟠", "Low": "⚪"}
 
 
 def _gap_bar_chart(gap_df: pd.DataFrame) -> go.Figure:
+    """Bar chart of gap scores coloured by opportunity_label."""
+    label_col = "opportunity_label" if "opportunity_label" in gap_df.columns else "opportunity_tier"
+    term_col  = "raw_term"          if "raw_term"          in gap_df.columns else "term"
+
     fig = go.Figure()
     for tier in ("High", "Medium", "Low"):
-        subset = gap_df[gap_df["opportunity_tier"] == tier]
+        subset = gap_df[gap_df[label_col] == tier]
         if subset.empty:
             continue
         fig.add_trace(go.Bar(
-            x=subset["term"],
+            x=subset[term_col],
             y=subset["gap_score"],
             name=tier,
-            marker_color=_TIER_COLORS[tier],
+            marker_color=_OPP_COLORS[tier],
         ))
     fig.update_layout(
         barmode="overlay",
@@ -208,7 +217,30 @@ def _gap_bar_chart(gap_df: pd.DataFrame) -> go.Figure:
         yaxis_title="Gap Score",
         xaxis_tickangle=-40,
         height=420,
-        legend_title="Opportunity Tier",
+        legend_title="Opportunity",
+        margin=dict(l=40, r=20, t=30, b=120),
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Recipe term cluster helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+def _clusters_bar_chart(clusters_df: pd.DataFrame) -> go.Figure:
+    top = clusters_df.dropna(subset=["max_gap_score"]).nlargest(20, "max_gap_score")
+    fig = go.Figure(go.Bar(
+        x=top["cluster_label"],
+        y=top["max_gap_score"],
+        marker_color="#6366f1",
+        text=top["sources_present"],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        xaxis_title="Cluster",
+        yaxis_title="Max Gap Score",
+        xaxis_tickangle=-40,
+        height=400,
         margin=dict(l=40, r=20, t=30, b=120),
     )
     return fig
@@ -221,13 +253,13 @@ def _gap_bar_chart(gap_df: pd.DataFrame) -> go.Figure:
 def render() -> None:
     st.header("📊 Market Intelligence")
 
-    # ── Section A: AI-Powered Search Inspiration ──────────────────────────
+    # ── Section A: AI-Powered Search Intelligence ─────────────────────────
     st.subheader("What consumers are searching for right now")
     st.markdown("*Sourced from Google AI Mode — the AI answers users see before any search results*")
 
     ai_df = _load_parquet(AI_MODE_TERM_SCORES_PATH)
     if ai_df is None:
-        st.warning("Data not yet available — run the pipeline first.")
+        st.warning("AI Mode data not yet available — run the pipeline first.")
     else:
         top15 = (
             ai_df.sort_values("normalised_score", ascending=False)
@@ -242,22 +274,60 @@ def render() -> None:
             "the first thing a user reads when they Google a meal idea."
         )
 
+    # External terms breakdown (AI Mode + Trends combined)
+    ext_df = _load_parquet(EXTERNAL_RECIPE_TERMS_PATH)
+    if ext_df is not None and not ext_df.empty:
+        with st.expander("View all normalised external terms (AI Mode + Trends)"):
+            by_src = ext_df.groupby("source").size().reset_index(name="terms")
+            st.dataframe(by_src, use_container_width=True, hide_index=True)
+            display_cols = [c for c in
+                ["source", "raw_term", "canonical_term", "source_score", "tags", "fetched_date"]
+                if c in ext_df.columns]
+            st.dataframe(
+                ext_df[display_cols].sort_values("source_score", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
+
     st.divider()
 
     # ── Section B: Demand vs Supply Gap ───────────────────────────────────
     st.subheader("Where consumer demand outpaces available recipes")
 
-    gap_df = _load_parquet(GAP_ANALYSIS_PATH)
+    gap_df = _load_parquet(RECIPE_GAP_ANALYSIS_PATH)
     if gap_df is None:
-        st.warning("Data not yet available — run the pipeline first.")
+        st.warning("Gap analysis data not yet available — run the pipeline first.")
     else:
-        gap_sorted = gap_df.sort_values("gap_score", ascending=False).reset_index(drop=True)
-        st.plotly_chart(_gap_bar_chart(gap_sorted), use_container_width=True)
-        st.info(
-            "These are the cuisines and ingredients where consumer demand is outpacing available "
-            "content — these are the emerging markets you should be moving into."
+        opp_df = (
+            gap_df[gap_df["match_status"].isin(["gap", "weak_match"])]
+            .sort_values("gap_score", ascending=False)
+            .reset_index(drop=True)
         )
-        st.dataframe(gap_sorted, use_container_width=True, hide_index=True)
+
+        st.plotly_chart(_gap_bar_chart(opp_df.head(30)), use_container_width=True)
+        st.info(
+            "These are the cuisines and ingredients where consumer demand is outpacing "
+            "available content — emerging markets you should move into."
+        )
+
+        # Top insight cards
+        st.markdown("#### Top content opportunities")
+        top_gaps = opp_df.head(10)
+        for _, row in top_gaps.iterrows():
+            insight = str(row.get("insight_summary") or "")
+            label   = str(row.get("opportunity_label") or "")
+            icon    = _OPP_ICONS.get(label, "•")
+            raw     = str(row.get("raw_term", ""))
+            if insight:
+                st.info(f"{icon} **{raw}** — {insight}")
+
+        # Full table
+        with st.expander("View full gap analysis table"):
+            display_cols = [c for c in [
+                "raw_term", "match_status", "gap_score", "opportunity_label",
+                "top_gap_rank", "best_foodcom_recipe_name", "best_foodcom_similarity",
+                "matching_method", "source", "insight_summary",
+            ] if c in gap_df.columns]
+            st.dataframe(gap_df[display_cols], use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -266,7 +336,7 @@ def render() -> None:
 
     trends_df = _load_parquet(TRENDS_NORMALISED_PATH)
     if trends_df is None:
-        st.warning("Data not yet available — run the pipeline first.")
+        st.warning("Trends data not yet available — run the pipeline first.")
     else:
         top20 = (
             trends_df.sort_values("normalised_score", ascending=False)
@@ -278,7 +348,84 @@ def render() -> None:
 
     st.divider()
 
-    # ── CPG Audience Segments ─────────────────────────────────────────────
+    # ── Section D: Recipe Term Clusters ───────────────────────────────────
+    st.subheader("Recipe term clusters")
+    st.markdown("*Semantic groups of external demand terms — fuzzy-merged by dish similarity*")
+
+    clusters_df = _load_parquet(RECIPE_TERM_CLUSTERS_PATH)
+    if clusters_df is None:
+        st.warning("Cluster data not yet available — run `build_recipe_term_clusters` first.")
+    else:
+        st.plotly_chart(_clusters_bar_chart(clusters_df), use_container_width=True)
+
+        display_cols = [c for c in [
+            "cluster_label", "representative_term", "sources_present",
+            "dominant_tags", "avg_gap_score", "max_gap_score",
+            "best_foodcom_match", "foodcom_coverage_count",
+        ] if c in clusters_df.columns]
+        st.dataframe(
+            clusters_df[display_cols].sort_values("max_gap_score", ascending=False, na_position="last"),
+            use_container_width=True, hide_index=True,
+        )
+
+        with st.expander("Cluster explanations"):
+            if "explanation" in clusters_df.columns:
+                for _, row in clusters_df.dropna(subset=["max_gap_score"]).nlargest(15, "max_gap_score").iterrows():
+                    label = str(row.get("cluster_label", ""))
+                    expl  = str(row.get("explanation", ""))
+                    if expl:
+                        st.markdown(f"**{label}** — {expl}")
+
+    st.divider()
+
+    # ── Section E: Pipeline Health ────────────────────────────────────────
+    st.subheader("🏥 Pipeline health")
+
+    _files_to_check = [
+        ("recipe_tags",           RECIPE_TAGS_PATH),
+        ("recipe_term_index",     RECIPE_TERM_INDEX_PATH),
+        ("external_terms",        EXTERNAL_RECIPE_TERMS_PATH),
+        ("gap_analysis",          RECIPE_GAP_ANALYSIS_PATH),
+        ("term_clusters",         RECIPE_TERM_CLUSTERS_PATH),
+    ]
+
+    health_cols = st.columns(len(_files_to_check))
+    for col, (label, path) in zip(health_cols, _files_to_check):
+        if path.is_file():
+            try:
+                n = len(pd.read_parquet(path))
+                col.metric(label, f"{n:,}", "✓ present")
+            except Exception:
+                col.metric(label, "read error", "⚠")
+        else:
+            col.metric(label, "missing", "✗")
+
+    if gap_df is not None and not gap_df.empty and "match_status" in gap_df.columns:
+        total  = len(gap_df)
+        strong = int((gap_df["match_status"] == "strong_match").sum())
+        weak   = int((gap_df["match_status"] == "weak_match").sum())
+        gaps   = int((gap_df["match_status"] == "gap").sum())
+
+        st.markdown("**Gap analysis match breakdown**")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Strong matches",      f"{strong:,}", f"{100*strong/total:.0f}% of total")
+        c2.metric("Weak matches",        f"{weak:,}",   f"{100*weak/total:.0f}% of total")
+        c3.metric("Gaps (opportunities)", f"{gaps:,}",  f"{100*gaps/total:.0f}% of total")
+
+        if "insight_summary" in gap_df.columns:
+            populated = int(gap_df["insight_summary"].notna().sum())
+            if populated == total:
+                st.success(f"All {total:,} rows have `insight_summary` populated.")
+            else:
+                st.warning(f"{populated:,} / {total:,} rows have `insight_summary`.")
+
+        if "matching_method" in gap_df.columns:
+            method = gap_df["matching_method"].mode().iloc[0] if not gap_df.empty else "unknown"
+            st.caption(f"Matching method: **{method}**")
+
+    st.divider()
+
+    # ── Section F: Audience & CPG Segments ───────────────────────────────
     st.subheader("Audience & CPG Segments")
 
     profiles_data = _load_cluster_profiles()
