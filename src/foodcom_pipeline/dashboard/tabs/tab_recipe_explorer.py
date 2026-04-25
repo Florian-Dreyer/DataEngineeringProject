@@ -179,6 +179,34 @@ def _compute_affiliate_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _affiliate_gauge(score: float, recipe_id) -> go.Figure:
+    """Plotly indicator gauge for affiliate_score (0–1).
+
+    Green ≥ 0.6, amber 0.3–0.59, red < 0.3.
+    """
+    if score >= 0.6:
+        color = "#10b981"
+    elif score >= 0.3:
+        color = "#f59e0b"
+    else:
+        color = "#ef4444"
+
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        number={"valueformat": ".2f", "font": {"size": 20}},
+        gauge={
+            "axis": {"range": [0, 1], "tickfont": {"size": 9}},
+            "bar": {"color": color},
+            "bgcolor": "#f3f4f6",
+            "borderwidth": 0,
+        },
+        title={"text": "Affiliate Score", "font": {"size": 12}},
+    ))
+    fig.update_layout(height=200, margin=dict(t=40, b=10, l=20, r=20))
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -623,6 +651,51 @@ def _render_detail_view(row: dict) -> None:
         st.markdown(steps_html, unsafe_allow_html=True)
     else:
         st.info("Recipe steps not available for this recipe.")
+
+    # --- Affiliate Insights ---
+    st.markdown("### 💰 Affiliate Insights")
+    aff_score = row.get("affiliate_score")
+    if aff_score is not None and not pd.isna(aff_score):
+        ai1, ai2, ai3 = st.columns([1.2, 1.5, 1])
+
+        with ai1:
+            st.plotly_chart(
+                _affiliate_gauge(float(aff_score), recipe_id),
+                use_container_width=True,
+                key=f"affiliate_gauge_{recipe_id}",
+            )
+
+        with ai2:
+            cart_rdy  = row.get("cart_ready")
+            basket    = row.get("basket_value_est")
+            rev_proj  = row.get("revenue_proj_monthly")
+            velocity  = row.get("review_velocity")
+            ic        = row.get("ingredient_count")
+            sweet     = "Yes" if (ic is not None and not pd.isna(ic) and 7 <= int(ic) <= 11) else "No"
+            cart_str  = "Yes" if cart_rdy is True else "No"
+            basket_str = f"${basket:.2f}" if basket is not None and not pd.isna(basket) else "—"
+            rev_str   = f"${rev_proj:.2f}" if rev_proj is not None and not pd.isna(rev_proj) else "—"
+            vel_str   = f"{velocity:.2f}" if velocity is not None and not pd.isna(velocity) else "—"
+            st.markdown(
+                f"| Metric | Value |\n"
+                f"|---|---|\n"
+                f"| Review Velocity | {vel_str} / 90 days |\n"
+                f"| Cart Ready | {cart_str} |\n"
+                f"| Est. Basket Value | {basket_str} |\n"
+                f"| Est. Monthly Revenue | {rev_str} |\n"
+                f"| Ingredient Sweet Spot (7–11) | {sweet} |"
+            )
+
+        with ai3:
+            basket_val = f"${basket:.2f}" if basket is not None and not pd.isna(basket) else "unknown"
+            rev_val    = f"${rev_proj:.2f}" if rev_proj is not None and not pd.isna(rev_proj) else "unknown"
+            st.info(
+                f"This recipe scores {aff_score:.2f} for affiliate potential. "
+                f"With an estimated basket of {basket_val} and 2% conversion at "
+                f"10,000 monthly views, it could generate ~{rev_val}/month in commission."
+            )
+    else:
+        st.caption("Affiliate data not available for this recipe.")
 
     st.divider()
 
