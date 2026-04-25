@@ -240,6 +240,15 @@ def _download_file_from_kaggle(filename: str) -> None:
     ]
 
     logger.info(f'Downloading {filename} from Kaggle...')
+
+    # Clean up any existing partial/corrupted files before downloading
+    base_path = DATA_DIR / filename
+    zip_path = base_path.with_suffix(base_path.suffix + '.zip')
+    for cleanup_path in [base_path, zip_path]:
+        if cleanup_path.exists():
+            logger.info(f'Removing existing file before re-download: {cleanup_path}')
+            cleanup_path.unlink()
+
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
