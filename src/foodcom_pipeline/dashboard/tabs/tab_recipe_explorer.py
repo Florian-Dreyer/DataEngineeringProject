@@ -121,13 +121,15 @@ def nutrition_bar_color(pct_dv: float, nutrient: str) -> str:
 
 
 def _compute_affiliate_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute affiliate scoring columns in-place and return the DataFrame.
+    """Return a copy of *df* with affiliate scoring columns added.
 
     Only the top 1 000 recipes by review_count receive an affiliate_score;
-    all others get NaN.  All other columns (cart_ready, basket_value_est,
+    all others get NaN. All other columns (cart_ready, basket_value_est,
     review_velocity, revenue_proj_monthly) are computed for every row.
     """
     df = df.copy()
+    if "review_count" not in df.columns:
+        df["review_count"] = float("nan")
 
     # --- cart_ready (all rows) ---
     ic = df["ingredient_count"].fillna(0)
@@ -144,9 +146,6 @@ def _compute_affiliate_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- affiliate_score (top-1000 by review_count only) ---
     df["affiliate_score"] = float("nan")
-
-    if "review_count" not in df.columns or df["review_count"].isna().all():
-        return df
 
     top1k = df.nlargest(1000, "review_count").index
 
