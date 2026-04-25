@@ -349,10 +349,14 @@ def _back_to_list() -> None:
 # UI helpers
 # ---------------------------------------------------------------------------
 
-def _nutrition_radar(row: pd.Series) -> go.Figure:
-    """Plotly polar chart for 5 nutrition axes (%DV values)."""
+def _nutrition_radar(row: pd.Series, median_row: pd.Series | None = None) -> go.Figure:
+    """Plotly polar chart for 5 nutrition axes (%DV values).
+
+    If median_row is supplied, overlays a grey dashed trace for the category median.
+    """
     def _safe_float(v) -> float:
         return 0.0 if v is None or pd.isna(v) else float(v)
+
     values = [_safe_float(row.get(n)) for n in _RADAR_NUTRIENTS]
     fig = go.Figure(go.Scatterpolar(
         r=values + [values[0]],
@@ -362,6 +366,18 @@ def _nutrition_radar(row: pd.Series) -> go.Figure:
         line=dict(color="#10b981", width=2),
         name="%DV",
     ))
+
+    if median_row is not None:
+        med_values = [_safe_float(median_row.get(n)) for n in _RADAR_NUTRIENTS]
+        fig.add_trace(go.Scatterpolar(
+            r=med_values + [med_values[0]],
+            theta=_RADAR_LABELS + [_RADAR_LABELS[0]],
+            fill="toself",
+            fillcolor="rgba(156,163,175,0.10)",
+            line=dict(color="#9ca3af", width=1, dash="dash"),
+            name="Category median",
+        ))
+
     fig.update_layout(
         polar=dict(
             radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=9)),
@@ -451,7 +467,7 @@ def _render_compact_card(row: pd.Series, card_index: int = 0) -> None:
 
             with col_radar:
                 st.plotly_chart(
-                    _nutrition_radar(row),
+                    _nutrition_radar(row, median_row=_RECIPE_MEDIAN),
                     use_container_width=True,
                     key=f"radar_{recipe_id}_{card_index}",
                 )
@@ -593,7 +609,7 @@ def _render_detail_view(row: dict) -> None:
 
     with col_radar:
         st.plotly_chart(
-            _nutrition_radar(row_series),
+            _nutrition_radar(row_series, median_row=_RECIPE_MEDIAN),
             use_container_width=True,
             key=f"detail_radar_{recipe_id}",
         )

@@ -159,7 +159,32 @@ class TestIsUsefulTag:
 import math
 from foodcom_pipeline.dashboard.tabs.tab_recipe_explorer import (
     _compute_affiliate_columns,
+    _nutrition_radar,
 )
+
+
+class TestNutritionRadar:
+    def _make_row(self):
+        return pd.Series({"protein": 20.0, "fat": 30.0, "carbs": 50.0,
+                          "sugar": 10.0, "sodium": 40.0})
+
+    def test_no_median_has_one_trace(self):
+        fig = _nutrition_radar(self._make_row())
+        assert len(fig.data) == 1
+
+    def test_with_median_has_two_traces(self):
+        median = pd.Series({"protein": 15.0, "fat": 25.0, "carbs": 40.0,
+                            "sugar": 8.0, "sodium": 30.0})
+        fig = _nutrition_radar(self._make_row(), median_row=median)
+        assert len(fig.data) == 2
+
+    def test_median_trace_is_dashed_grey(self):
+        median = pd.Series({"protein": 15.0, "fat": 25.0, "carbs": 40.0,
+                            "sugar": 8.0, "sodium": 30.0})
+        fig = _nutrition_radar(self._make_row(), median_row=median)
+        median_trace = fig.data[1]
+        assert median_trace.line.dash == "dash"
+        assert "9ca3af" in median_trace.line.color
 
 
 def _make_affiliate_df(n=1200) -> pd.DataFrame:
