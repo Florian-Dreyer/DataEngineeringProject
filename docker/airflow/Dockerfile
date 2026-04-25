@@ -23,9 +23,16 @@ RUN pip install --no-cache-dir \
     torch \
     fpdf2
 
-# Create data and staging directories inside container (no bind mounts = no errno 35)
-RUN mkdir -p /opt/airflow/data /opt/airflow/staging /opt/airflow/usda_data && \
-    chown -R 50000:0 /opt/airflow/data /opt/airflow/staging /opt/airflow/usda_data
+# Copy source code with correct ownership (airflow user is 50000)
+COPY --chown=50000:0 src /opt/airflow/app/src
+
+# Create all necessary runtime directories
+RUN mkdir -p /opt/airflow/data \
+             /opt/airflow/staging \
+             /opt/airflow/usda_data && \
+    chown -R 50000:0 /opt/airflow/data \
+                     /opt/airflow/staging \
+                     /opt/airflow/usda_data
 
 # Add /opt/airflow/app/src to Python path so Airflow can import foodcom_pipeline
 ENV PYTHONPATH=/opt/airflow/app/src:${PYTHONPATH}

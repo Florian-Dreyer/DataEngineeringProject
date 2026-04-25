@@ -36,26 +36,25 @@ services:
       FOODCOM_KAGGLE_DATASET: ${FOODCOM_KAGGLE_DATASET:-shuyangli94/food-com-recipes-and-user-interactions}
       KAGGLE_CONFIG_DIR: /home/airflow/.kaggle
 
-      # Make package importable from the mounted repo
+      # Make package importable
       PYTHONPATH: /opt/airflow/app/src
       
     # Use the image's airflow user so the `airflow` CLI is available on PATH.
     user: "50000:0"
     volumes:
-      # DAGs must be mounted for live reload during development
+      # Only mount DAGs for live reload during development
       - type: bind
         source: ./src/foodcom_pipeline/batch/dags
         target: /opt/airflow/dags
-        consistency: delegated
-      # Staging dir as volume (not bind mount) — avoids errno 35 deadlock
+      # Data, staging, USDA as Docker volumes (not bind mounts) — avoids errno 35 deadlock
+      - data_volume:/opt/airflow/data
       - staging_volume:/opt/airflow/staging
+      - usda_volume:/opt/airflow/usda_data
       # Kaggle credentials as read-only bind mount
       - type: bind
         source: ${HOME}/.kaggle
         target: /home/airflow/.kaggle
         read_only: true
-      # USDA data as volume (built into image, but allow override)
-      - usda_volume:/opt/airflow/usda_data
     ports:
       - "8080:8080"
     command: >
@@ -66,5 +65,6 @@ services:
 
 volumes:
   postgres_data:
+  data_volume:
   staging_volume:
   usda_volume:
