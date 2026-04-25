@@ -179,7 +179,7 @@ def _compute_affiliate_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _affiliate_gauge(score: float, recipe_id) -> go.Figure:
+def _affiliate_gauge(score: float) -> go.Figure:
     """Plotly indicator gauge for affiliate_score (0–1).
 
     Green ≥ 0.6, amber 0.3–0.59, red < 0.3.
@@ -323,7 +323,7 @@ def load_recipes() -> pd.DataFrame:
 
     df = _compute_affiliate_columns(df)
 
-    _RECIPE_MEDIAN = df[["protein", "fat", "carbs", "sugar", "sodium"]].median()
+    _RECIPE_MEDIAN = df[["protein", "fat", "carbs", "sugar", "sodium"]].median().fillna(0.0)
 
     return df
 
@@ -660,7 +660,7 @@ def _render_detail_view(row: dict) -> None:
 
         with ai1:
             st.plotly_chart(
-                _affiliate_gauge(float(aff_score), recipe_id),
+                _affiliate_gauge(float(aff_score)),
                 use_container_width=True,
                 key=f"affiliate_gauge_{recipe_id}",
             )
@@ -679,7 +679,7 @@ def _render_detail_view(row: dict) -> None:
             st.markdown(
                 f"| Metric | Value |\n"
                 f"|---|---|\n"
-                f"| Review Velocity | {vel_str} / 90 days |\n"
+                f"| Review Velocity | {vel_str} / 73 days |\n"
                 f"| Cart Ready | {cart_str} |\n"
                 f"| Est. Basket Value | {basket_str} |\n"
                 f"| Est. Monthly Revenue | {rev_str} |\n"
