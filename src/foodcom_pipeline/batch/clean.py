@@ -84,30 +84,18 @@ def run_clean(**context) -> None:
     """
     Main cleaning entry point. Cleans both DataFrames independently,
     then writes cleaned parquet files for downstream tasks.
-    Uses chunked processing for interactions to manage memory on large datasets.
     """
     logger.info('Starting clean step.')
 
     recipes_df = pd.read_parquet(RECIPES_STAGING)
-    
-    # Check if interactions need cleaning or can be reused
-    interactions_staging_exists = INTERACTIONS_STAGING.exists()
-    interactions_clean_exists = INTERACTIONS_CLEAN.exists()
-    
-    should_clean_interactions = interactions_staging_exists
-    if interactions_staging_exists:
-        interactions_staging_size = INTERACTIONS_STAGING.stat().st_size
-        logger.info(f'Interactions staging size: {interactions_staging_size / 1e6:.1f} MB')
-    
-    if not should_clean_interactions and interactions_clean_exists:
+    interactions_df = pd.read_parquet(INTERACTIONS_STAGING)
+
+    if interactions_df.empty and INTERACTIONS_CLEAN.exists():
         logger.info(
-            'Interactions staging missing (no new data since last run) and '
-            'clean file already exists — skipping interactions clean.'
+            'Interactions staging is empty (no new data since last run) and '
+            'clean file already exists — skipping interactions clean to preserve existing output.'
         )
         interactions_df = None
-    else:
-        # For large interaction datasets, process in chunks to avoid OOM
-        interactions_df = pd.read_parquet(INTERACTIONS_STAGING)
 
     ingr_map: dict[str, str] | None = None
     if INGR_MAP_PKL.exists():

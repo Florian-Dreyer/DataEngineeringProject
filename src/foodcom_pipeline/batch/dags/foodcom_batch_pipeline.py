@@ -24,6 +24,7 @@ from foodcom_pipeline.batch.extract import (
 )
 from foodcom_pipeline.batch.clean import run_clean
 from foodcom_pipeline.batch.sentiment import run_sentiment
+from foodcom_pipeline.batch.features import run_features
 from foodcom_pipeline.batch.aggregate_user_stats import run_aggregate_user_stats
 from foodcom_pipeline.batch.cluster import run_clustering
 from foodcom_pipeline.batch.load import run_load, load_trends
@@ -116,6 +117,12 @@ dag=dag,
 task_sentiment = PythonOperator(
     task_id='sentiment',
     python_callable=run_sentiment,
+dag=dag,
+)
+
+task_features = PythonOperator(
+    task_id='features',
+    python_callable=run_features,
 dag=dag,
 )
 
@@ -236,11 +243,14 @@ task_tag_recipes >> task_build_recipe_term_index
 # Clustering runs after gap analysis so it can enrich from gap scores
 task_build_recipe_gap_analysis >> task_build_recipe_term_clusters
 
+# Feature engineering reads sentiment output, so it must run after sentiment
+task_sentiment >> task_features
+
 # Aggregation reads sentiment output, so it must run after sentiment
 task_sentiment >> task_aggregate_user_stats
 
-# Clustering depends on aggregation
-task_aggregate_user_stats >> task_cluster
+# Clustering depends on both features and aggregation
+[task_features, task_aggregate_user_stats] >> task_cluster
 
 # Load phase: depends on sentiment and cluster
 [task_sentiment, task_cluster] >> task_load

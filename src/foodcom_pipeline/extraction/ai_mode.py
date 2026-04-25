@@ -55,10 +55,7 @@ _STOPWORDS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 def build_ai_query(seed: str) -> str:
-    # Instructional prompts suppress Google AI Mode entirely — it returns an
-    # empty response. A short natural query reliably produces a dish list in
-    # reconstructed_markdown which fetch_ai_mode_blocks reads as its fallback.
-    return f"Output a list of 20 dish names only. Each item must be a core dish name representing a real recipe or search term.  Do not include explanations, descriptions, questions, suggestions, or conversational text. Output format must be a single comma-separated list of dish names only. No numbering, no bullet points, no extra sentences. Do not ask follow-up questions. "
+    return f"20 {seed} comma-separated dish names"
 
 
 def fetch_ai_mode_blocks(seeds, api_key) -> pd.DataFrame:

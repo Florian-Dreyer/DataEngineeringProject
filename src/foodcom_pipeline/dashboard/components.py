@@ -1,5 +1,6 @@
 """Dashboard UI components — reusable widgets for the decision-focused dashboard."""
 
+import re
 import streamlit as st
 import plotly.graph_objects as go
 from typing import Optional
@@ -80,21 +81,28 @@ TOOLTIPS = {
 # COMPONENT FUNCTIONS
 # =============================================================================
 
-def render_tooltip(key: str) -> str:
-    """Get tooltip HTML for a given metric key."""
-    tooltip_text = TOOLTIPS.get(key, "")
-    if not tooltip_text:
-        return ""
-    
-    # Convert markdown to HTML-friendly text
-    tooltip_text = tooltip_text.strip()
-    
-    return f"""
-    <div class="tooltip-container">
-        <span class="tooltip-icon">?</span>
-        <span class="tooltip-text">{tooltip_text}</span>
-    </div>
+def tooltip_icon(text: str) -> str:
+    """Return a (?) hover icon for arbitrary tooltip text.
+
+    Uses the CSS classes from theme.py (.tooltip-container / .tooltip-icon /
+    .tooltip-text) and adds a native `title` attribute as a reliable fallback.
+    Markdown bold markers (**) are stripped so the raw text reads cleanly.
     """
+    if not text:
+        return ""
+    clean = re.sub(r"\*+", "", text).strip()
+    safe_title = clean.replace('"', "&quot;").replace("\n", " ")
+    return (
+        '<span class="tooltip-container" style="display:inline-flex;vertical-align:middle;">'
+        f'<span class="tooltip-icon" title="{safe_title}">?</span>'
+        f'<span class="tooltip-text">{clean}</span>'
+        "</span>"
+    )
+
+
+def render_tooltip(key: str) -> str:
+    """Get tooltip HTML for a given metric key from the TOOLTIPS dictionary."""
+    return tooltip_icon(TOOLTIPS.get(key, ""))
 
 
 def metric_with_tooltip(

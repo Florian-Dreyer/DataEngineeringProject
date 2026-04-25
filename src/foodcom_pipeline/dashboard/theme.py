@@ -224,18 +224,24 @@ p, .stMarkdown {
   visibility: hidden;
   opacity: 0;
   position: absolute;
-  bottom: 100%;
+  bottom: calc(100% + 6px);
   left: 50%;
   transform: translateX(-50%);
   background: #1e293b;
   color: white;
-  padding: 8px 12px;
+  padding: 10px 14px;
   border-radius: 6px;
   font-size: 12px;
-  white-space: nowrap;
-  z-index: 1000;
-  margin-bottom: 8px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  /* size to content, bounded — prevents collapsing to icon width */
+  width: max-content;
+  min-width: 180px;
+  max-width: 320px;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  line-height: 1.6;
+  z-index: 9999;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.2);
 }
 
 .tooltip-container:hover .tooltip-text {
