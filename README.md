@@ -9,23 +9,19 @@ An **ETL pipeline** for the [Food.com](https://www.kaggle.com/datasets/shuyangli
 ## Architecture
 
 ```text
-┌─────────────────────────────────────────────────────────┐
-│                    ETL PIPELINE (Airflow)                │
-│                                                          │
-│  ensure_source_data                                      │
-│       │                                                  │
-│       ├── extract_recipes ──────────────────────┐        │
-│       ├── extract_interactions ─► check_new ─► clean    │
-│       └── extract_usda_nutrients ───────────────┘        │
-│                    │                                     │
-│             run_vader_sentiment                          │
-│                    │                                     │
-│                features                                  │
-│                    │                                     │
-│          run_kmeans_clustering                           │
-│                    │                                     │
-│           load_to_star_schema                            │
-└─────────────────────────────────────────────────────────┘
+ensure_source_data
+      │
+      ├── extract_recipes ──────────┐
+      ├── extract_interactions ──────► check_has_new_data ─┐
+      └── extract_usda_nutrients ───────────────────────────► clean ──► run_vader_sentiment ──┐
+                  │                                                                            │
+                  └─────────────────────────────────► embed_canonical_ingredients ────────────┘
+                                                                                               │
+                                                                                           features
+                                                                                               │
+                                                                                   run_kmeans_clustering
+                                                                                               │
+                                                                                   load_to_star_schema
 
 ┌─────────────────────────────────────────────────────────┐
 │              DATA WAREHOUSE (PostgreSQL)                 │
@@ -41,13 +37,14 @@ An **ETL pipeline** for the [Food.com](https://www.kaggle.com/datasets/shuyangli
 | --- | --- | --- |
 | 1 | `ensure_source_data` | Downloads `RAW_recipes.csv`, `RAW_interactions.csv`, `ingr_map.pkl` from Kaggle if missing |
 | 2 | `extract_recipes` | Full extract of recipes → parquet |
-| 2 | `extract_interactions` | Incremental extract of interactions (watermark-based) → parquet |
-| 2 | `extract_usda_nutrients` | Matches canonical ingredients to USDA FoodData Central nutrient values |
-| 3 | `check_has_new_data` | Short-circuits if no new interactions found |
+| 2 | `extract_interactions` | Full extract of interactions → parquet; pushes `has_new_data` flag to XCom |
+| 2 | `extract_usda_nutrients` | Matches canonical ingredients to USDA FoodData Central nutrient values → parquet |
+| 3 | `check_has_new_data` | Short-circuits all downstream tasks if no new interactions found |
 | 4 | `clean` | Deduplication, invalid rating removal, date parsing, cook-time caps, nutrition outlier flagging (95th percentile), bot detection |
 | 5 | `run_vader_sentiment` | VADER compound polarity scoring + `rating_sentiment_gap` |
-| 6 | `features` | Per-user aggregate stats, ingredient category ratings, Bayesian recipe sentiment ratings, substitution candidate flagging |
-| 7 | `run_kmeans_clustering` | K-Means user segmentation (k selected by silhouette score over [4,5,6]) |
+| 5 | `embed_canonical_ingredients` | Builds hybrid text + USDA nutrition embeddings for canonical ingredients (runs in parallel with `run_vader_sentiment`) |
+| 6 | `features` | Per-user aggregate stats, ingredient category ratings, Bayesian recipe sentiment ratings, substitution pairs via nearest-neighbour on embeddings |
+| 7 | `run_kmeans_clustering` | K-Means user segmentation (k selected by silhouette score over [4, 5, 6]) |
 | 8 | `load_to_star_schema` | Upsert to PostgreSQL star schema |
 
 ### User Segments
@@ -193,12 +190,12 @@ SELECT COUNT(*) FROM dim_date;
 
 ## Dashboard
 
-| Tab | Status | Content |
-| --- | --- | --- |
-| Overview | stub | Pipeline run summary |
-| Recipe Analytics | stub | Top recipes, sentiment ratings |
-| Audience & Market Intelligence | implemented | Radar chart, segment profiles, CPG brand adjacency, PDF export |
-| Pipeline Status | implemented | Row counts per stage, data loss rate, USDA coverage, Airflow task runtimes |
+| Tab | Content |
+| --- | --- |
+| Recipe Explorer | Recipe search, nutrition radar, star vs Bayesian sentiment ratings, affiliate shopping links |
+| Smart Substitutions | Ingredient swap recommendations ranked by similarity, quality delta, and nutrition impact; affiliate links |
+| Market Intelligence | User segment radar chart, CPG brand adjacency table, cuisine trend gap chart, PDF export |
+| Pipeline Status | Row counts per stage, data loss rate, USDA nutrient coverage, clustering health, Airflow task runtimes |
 
 ---
 
