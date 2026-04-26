@@ -26,7 +26,7 @@ from foodcom_pipeline.batch.sentiment import run_sentiment
 from foodcom_pipeline.batch.features import run_features
 from foodcom_pipeline.batch.aggregate_user_stats import run_aggregate_user_stats
 from foodcom_pipeline.batch.cluster import run_clustering
-from foodcom_pipeline.batch.load import run_load, load_trends, load_app_data
+from foodcom_pipeline.batch.load import run_load, normalize_trends, load_app_data
 from foodcom_pipeline.batch.tag_recipes import (
     run_tag_recipes,
     tag_signals,
@@ -253,9 +253,9 @@ task_load = PythonOperator(
     dag=dag,
 )
 
-task_load_trends = PythonOperator(
-    task_id='load_trends',
-    python_callable=load_trends,
+task_normalize_trends = PythonOperator(
+    task_id='normalize_trends',
+    python_callable=normalize_trends,
     dag=dag,
 )
 
@@ -322,11 +322,11 @@ task_ensure_source_data >> [
 # Trends + AI Mode branch: runs fully async alongside the main pipeline
 [task_extract_recipes, task_extract_google_trends] >> task_extract_ai_mode
 
-# load_trends runs after both extracts so all 5 tables are populated together
-[task_extract_google_trends, task_extract_ai_mode] >> task_load_trends
+# normalize_trends runs after both extracts so all 5 tables are populated together
+[task_extract_google_trends, task_extract_ai_mode] >> task_normalize_trends
 
-# tag_signals runs after load_trends so both staging files are guaranteed to exist
-task_load_trends >> task_tag_signals
+# tag_signals runs after normalize_trends so both staging files are guaranteed to exist
+task_normalize_trends >> task_tag_signals
 
 # External terms normalization depends on tag_signals (which guarantees both
 # ai_mode_term_scores.parquet and signal_tags.parquet are ready)

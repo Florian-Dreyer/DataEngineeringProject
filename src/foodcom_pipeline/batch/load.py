@@ -1150,7 +1150,7 @@ def load_app_data(**context) -> None:
         logger.info('load_app_data complete: %d gap rows, %d clusters.', n_gap, n_clusters)
 
 
-def load_trends(**context) -> None:
+def normalize_trends(**context) -> None:
     """
     Loads all Google Trends and AI Mode staging parquet files into Postgres.
     Creates tables on first run; subsequent runs upsert.
