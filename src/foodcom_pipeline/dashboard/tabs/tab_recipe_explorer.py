@@ -829,46 +829,41 @@ def _render_list_mode(df: pd.DataFrame) -> None:
     else:
         st.session_state.pop("_recipe_search", None)
 
-    # --- Sidebar affiliate filters ---
-    with st.sidebar:
-        st.markdown(
-            '<div style="background:linear-gradient(135deg,#10b981,#059669);'
-            'border-radius:10px;padding:16px 18px;margin-bottom:4px;">'
-            '<p style="color:white;font-weight:700;font-size:15px;margin:0;">🏷️ Affiliate Filters</p>'
-            '<p style="color:#d1fae5;font-size:12px;margin:4px 0 0;">'
-            'Narrow recipes by affiliate potential</p>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+    # --- Inline affiliate filters ---
+    with st.expander("🏷️ Affiliate Filters", expanded=False):
+        # Row 1: filter controls
+        _pad, fc1, _gap, fc2, _pad2 = st.columns([1, 1.2, 1, 1.5, 1])
+        with fc1:
+            st.markdown("**🛒 Availability**")
+            cart_only = st.toggle("Cart-Ready only", key="aff_cart_only")
+        with fc2:
+            st.markdown("**📊 Affiliate Score Range**")
+            aff_range = st.slider(
+                "Score range",
+                min_value=0.0, max_value=1.0, value=(0.0, 1.0),
+                step=0.05, key="aff_score_range",
+                label_visibility="collapsed",
+            )
+            st.markdown(
+                f"<div style='display:flex;justify-content:space-between;margin-top:-8px;'>"
+                f"<span style='font-size:12px;color:#6b7280;'>Min: <b>{aff_range[0]:.2f}</b></span>"
+                f"<span style='font-size:12px;color:#6b7280;'>Max: <b>{aff_range[1]:.2f}</b></span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-        st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
-        st.markdown("**🛒 Availability**")
-        cart_only = st.toggle("Cart-Ready only", key="aff_cart_only")
-        st.caption(
-            "Recipes with 7–11 ingredients hit the sweet spot for grocery cart conversion — "
-            "enough variety to fill a basket, manageable enough not to overwhelm a shopper."
-        )
-
-        st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
-        st.markdown("**📊 Affiliate Score Range**")
-        aff_range = st.slider(
-            "Score range",
-            min_value=0.0, max_value=1.0, value=(0.0, 1.0),
-            step=0.05, key="aff_score_range",
-            label_visibility="collapsed",
-        )
-        st.markdown(
-            f"<div style='display:flex;justify-content:space-between;margin-top:-8px;'>"
-            f"<span style='font-size:12px;color:#6b7280;'>Min: <b>{aff_range[0]:.2f}</b></span>"
-            f"<span style='font-size:12px;color:#6b7280;'>Max: <b>{aff_range[1]:.2f}</b></span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-        st.caption(
-            "Affiliate score combines review popularity (40%), "
-            "recipe simplicity (30%), and ingredient sweet spot (30%)."
-        )
+        # Row 2: descriptions aligned below their respective controls
+        _pad, dc1, _gap, dc2, _pad2 = st.columns([1, 1.2, 1, 1.5, 1])
+        with dc1:
+            st.caption(
+                "Recipes with 7–11 ingredients hit the sweet spot for grocery cart conversion — "
+                "enough variety to fill a basket, manageable enough not to overwhelm a shopper."
+            )
+        with dc2:
+            st.caption(
+                "Affiliate score combines review popularity (40%), "
+                "recipe simplicity (30%), and ingredient sweet spot (30%)."
+            )
 
     if cart_only:
         df = df[df["cart_ready"] == True]  # noqa: E712
