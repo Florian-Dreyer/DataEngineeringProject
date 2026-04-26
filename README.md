@@ -21,7 +21,7 @@ ensure_source_data
                                                                                                │
                                                                                    run_kmeans_clustering
                                                                                                │
-                                                                                   load_to_star_schema
+                                                                                   load_star
 
 ┌─────────────────────────────────────────────────────────┐
 │              DATA WAREHOUSE (PostgreSQL)                 │
@@ -45,7 +45,7 @@ ensure_source_data
 | 5 | `embed_canonical_ingredients` | Builds hybrid text + USDA nutrition embeddings for canonical ingredients (runs in parallel with `run_vader_sentiment`) |
 | 6 | `features` | Per-user aggregate stats, ingredient category ratings, Bayesian recipe sentiment ratings, substitution pairs via nearest-neighbour on embeddings |
 | 7 | `run_kmeans_clustering` | K-Means user segmentation (k selected by silhouette score over [4, 5, 6]) |
-| 8 | `load_to_star_schema` | Upsert to PostgreSQL star schema |
+| 8 | `load_star` | Upsert to PostgreSQL star schema |
 
 ### User Segments
 

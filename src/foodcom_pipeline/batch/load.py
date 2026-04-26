@@ -1051,6 +1051,105 @@ def save_ai_mode_metadata(fetched_date: date) -> None:
 # ---------------------------------------------------------------------------
 
 
+def load_app_data(**context) -> None:
+    """
+    Loads app-layer staging parquets into PostgreSQL.
+
+    Tables populated:
+      recipe_gap_analysis    — one row per external term matched against recipe index
+      recipe_term_clusters   — one row per semantic cluster of external terms
+    """
+    from foodcom_pipeline.batch.match import RECIPE_GAP_ANALYSIS_STAGING
+    from foodcom_pipeline.batch.cluster_terms import RECIPE_TERM_CLUSTERS_STAGING
+
+    engine = create_engine(POSTGRES_CONN)
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS recipe_gap_analysis (
+                source                    TEXT,
+                raw_term                  TEXT             NOT NULL,
+                canonical_term            TEXT             NOT NULL,
+                source_score              DOUBLE PRECISION,
+                best_foodcom_recipe_id    BIGINT,
+                best_foodcom_recipe_name  TEXT,
+                best_foodcom_canonical_term TEXT,
+                best_foodcom_similarity   DOUBLE PRECISION,
+                match_status              TEXT,
+                gap_score                 DOUBLE PRECISION,
+                top_gap_rank              INTEGER,
+                opportunity_label         TEXT,
+                insight_summary           TEXT,
+                gap_reason                TEXT,
+                matching_method           TEXT,
+                fetched_date              DATE,
+                PRIMARY KEY (source, canonical_term)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS recipe_term_clusters (
+                cluster_id              INTEGER          NOT NULL,
+                cluster_label           TEXT,
+                representative_term     TEXT             NOT NULL PRIMARY KEY,
+                source_terms            TEXT,
+                sources_present         TEXT,
+                dominant_tags           TEXT,
+                avg_gap_score           DOUBLE PRECISION,
+                max_gap_score           DOUBLE PRECISION,
+                best_foodcom_match      TEXT,
+                foodcom_coverage_count  INTEGER,
+                explanation             TEXT
+            )
+        """))
+
+    _load_staging_table(
+        engine, RECIPE_GAP_ANALYSIS_STAGING, 'recipe_gap_analysis',
+        cols=(
+            'source, raw_term, canonical_term, source_score, '
+            'best_foodcom_recipe_id, best_foodcom_recipe_name, best_foodcom_canonical_term, '
+            'best_foodcom_similarity, match_status, gap_score, top_gap_rank, '
+            'opportunity_label, insight_summary, gap_reason, matching_method, fetched_date'
+        ),
+        conflict='(source, canonical_term)',
+        update=(
+            'raw_term = EXCLUDED.raw_term, source_score = EXCLUDED.source_score, '
+            'best_foodcom_recipe_id = EXCLUDED.best_foodcom_recipe_id, '
+            'best_foodcom_recipe_name = EXCLUDED.best_foodcom_recipe_name, '
+            'best_foodcom_canonical_term = EXCLUDED.best_foodcom_canonical_term, '
+            'best_foodcom_similarity = EXCLUDED.best_foodcom_similarity, '
+            'match_status = EXCLUDED.match_status, gap_score = EXCLUDED.gap_score, '
+            'top_gap_rank = EXCLUDED.top_gap_rank, opportunity_label = EXCLUDED.opportunity_label, '
+            'insight_summary = EXCLUDED.insight_summary, gap_reason = EXCLUDED.gap_reason, '
+            'matching_method = EXCLUDED.matching_method, fetched_date = EXCLUDED.fetched_date'
+        ),
+    )
+    _load_staging_table(
+        engine, RECIPE_TERM_CLUSTERS_STAGING, 'recipe_term_clusters',
+        cols=(
+            'cluster_id, cluster_label, representative_term, source_terms, sources_present, '
+            'dominant_tags, avg_gap_score, max_gap_score, best_foodcom_match, '
+            'foodcom_coverage_count, explanation'
+        ),
+        conflict='(representative_term)',
+        update=(
+            'cluster_id = EXCLUDED.cluster_id, cluster_label = EXCLUDED.cluster_label, '
+            'source_terms = EXCLUDED.source_terms, sources_present = EXCLUDED.sources_present, '
+            'dominant_tags = EXCLUDED.dominant_tags, avg_gap_score = EXCLUDED.avg_gap_score, '
+            'max_gap_score = EXCLUDED.max_gap_score, best_foodcom_match = EXCLUDED.best_foodcom_match, '
+            'foodcom_coverage_count = EXCLUDED.foodcom_coverage_count, '
+            'explanation = EXCLUDED.explanation'
+        ),
+    )
+
+    if context.get('ti'):
+        with engine.connect() as conn:
+            n_gap = conn.execute(text('SELECT COUNT(*) FROM recipe_gap_analysis')).scalar()
+            n_clusters = conn.execute(text('SELECT COUNT(*) FROM recipe_term_clusters')).scalar()
+        context['ti'].xcom_push(key='recipe_gap_analysis_total', value=int(n_gap))
+        context['ti'].xcom_push(key='recipe_term_clusters_total', value=int(n_clusters))
+        logger.info('load_app_data complete: %d gap rows, %d clusters.', n_gap, n_clusters)
+
+
 def load_trends(**context) -> None:
     """
     Loads all Google Trends and AI Mode staging parquet files into Postgres.

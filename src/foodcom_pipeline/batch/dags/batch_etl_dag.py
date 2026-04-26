@@ -12,7 +12,7 @@ Lambda architecture:
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from foodcom_pipeline.batch.extract import (
     ensure_source_data,
     extract_recipes,
@@ -26,7 +26,7 @@ from foodcom_pipeline.batch.sentiment import run_sentiment
 from foodcom_pipeline.batch.features import run_features
 from foodcom_pipeline.batch.aggregate_user_stats import run_aggregate_user_stats
 from foodcom_pipeline.batch.cluster import run_clustering
-from foodcom_pipeline.batch.load import run_load, load_trends
+from foodcom_pipeline.batch.load import run_load, load_trends, load_app_data
 from foodcom_pipeline.batch.tag_recipes import (
     run_tag_recipes,
     tag_signals,
@@ -177,6 +177,18 @@ task_extract_ai_mode = PythonOperator(
 )
 
 # ─────────────────────────────────────────────────────────────────────────
+# Guard
+# ─────────────────────────────────────────────────────────────────────────
+
+task_check_new_data = ShortCircuitOperator(
+    task_id='check_has_new_data',
+    python_callable=check_has_new_data,
+    ignore_downstream_trigger_rules=False,
+    dag=dag,
+    doc_md='Short-circuits all downstream tasks if no new interactions were found.',
+)
+
+# ─────────────────────────────────────────────────────────────────────────
 # Clean Phase
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -236,7 +248,7 @@ task_cluster = PythonOperator(
 # ─────────────────────────────────────────────────────────────────────────
 
 task_load = PythonOperator(
-    task_id='load',
+    task_id='load_star',
     python_callable=run_load,
     dag=dag,
 )
@@ -265,10 +277,6 @@ task_compute_gap = PythonOperator(
     dag=dag,
 )
 
-    # task_clean >> task_sentiment
-    # task_extract_usda_nutrients >> task_embed_canonical_ingredients
-    # [task_sentiment, task_embed_canonical_ingredients] >> task_features
-    # task_features >> task_cluster >> task_load
 task_build_recipe_term_index = PythonOperator(
     task_id='build_recipe_term_index',
     python_callable=build_recipe_term_index,
@@ -290,6 +298,12 @@ task_build_recipe_gap_analysis = PythonOperator(
 task_build_recipe_term_clusters = PythonOperator(
     task_id='build_recipe_term_clusters',
     python_callable=build_recipe_term_clusters,
+    dag=dag,
+)
+
+task_load_app_data = PythonOperator(
+    task_id='load_app_data',
+    python_callable=load_app_data,
     dag=dag,
 )
 
@@ -318,12 +332,11 @@ task_load_trends >> task_tag_signals
 # ai_mode_term_scores.parquet and signal_tags.parquet are ready)
 task_tag_signals >> task_build_external_recipe_terms
 
-# Clean phase: depends only on the core extracts; unblocked by trends/AI mode
-[
-    task_extract_recipes,
-    task_extract_interactions,
-    task_extract_usda_nutrients,
-] >> task_clean
+# Guard: recipes + interactions must both be extracted before checking for new data
+[task_extract_recipes, task_extract_interactions] >> task_check_new_data
+
+# Clean phase: guard must pass AND USDA extract must be done
+[task_check_new_data, task_extract_usda_nutrients] >> task_clean
 
 # Tagging runs in parallel with sentiment after clean
 task_clean >> [task_sentiment, task_tag_recipes]
@@ -339,6 +352,9 @@ task_tag_recipes >> task_build_recipe_term_index
 
 # Clustering runs after gap analysis so it can enrich from gap scores
 task_build_recipe_gap_analysis >> task_build_recipe_term_clusters
+
+# Load app-layer tables once both gap analysis and term clusters are ready
+[task_build_recipe_gap_analysis, task_build_recipe_term_clusters] >> task_load_app_data
 
 # Feature engineering reads sentiment output, so it must run after sentiment
 task_sentiment >> task_features
