@@ -1,7 +1,7 @@
 """
-foodcom_batch_pipeline.py
-=========================
-Airflow DAG orchestrating the Food.com batch data pipeline.
+batch_etl_dag.py
+================
+Airflow DAG orchestrating the Food.com batch ETL pipeline.
 
 Lambda architecture:
   - Batch layer: daily full/incremental extract → clean → sentiment analysis → clustering → load
@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.bash import BashOperator
 from foodcom_pipeline.batch.extract import (
     ensure_source_data,
     extract_recipes,
@@ -52,9 +51,9 @@ default_args = {
 }
 
 dag = DAG(
-    'foodcom_batch_pipeline',
+    'foodcom_batch_etl',
     default_args=default_args,
-    description='Food.com batch pipeline: extract → clean → sentiment → cluster → load (trends/AI mode run async)',
+    description='Food.com batch ETL: extract → clean → sentiment → cluster → load (trends/AI mode run async)',
     schedule_interval='@daily',
     catchup=False,
     tags=['foodcom', 'batch', 'production'],
@@ -73,31 +72,31 @@ task_ensure_source_data = PythonOperator(
 task_extract_recipes = PythonOperator(
     task_id='extract_recipes',
     python_callable=extract_recipes,
-dag=dag,
+    dag=dag,
 )
 
 task_extract_interactions = PythonOperator(
     task_id='extract_interactions',
     python_callable=extract_interactions,
-dag=dag,
+    dag=dag,
 )
 
 task_extract_usda_nutrients = PythonOperator(
     task_id='extract_usda_nutrients',
     python_callable=extract_usda_nutrients,
-dag=dag,
+    dag=dag,
 )
 
 task_extract_google_trends = PythonOperator(
     task_id='extract_google_trends',
     python_callable=extract_google_trends,
-dag=dag,
+    dag=dag,
 )
 
 task_extract_ai_mode = PythonOperator(
     task_id='extract_ai_mode',
     python_callable=extract_ai_mode,
-dag=dag,
+    dag=dag,
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -107,7 +106,7 @@ dag=dag,
 task_clean = PythonOperator(
     task_id='clean',
     python_callable=run_clean,
-dag=dag,
+    dag=dag,
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -117,25 +116,25 @@ dag=dag,
 task_sentiment = PythonOperator(
     task_id='sentiment',
     python_callable=run_sentiment,
-dag=dag,
+    dag=dag,
 )
 
 task_features = PythonOperator(
     task_id='features',
     python_callable=run_features,
-dag=dag,
+    dag=dag,
 )
 
 task_aggregate_user_stats = PythonOperator(
     task_id='aggregate_user_stats',
     python_callable=run_aggregate_user_stats,
-dag=dag,
+    dag=dag,
 )
 
 task_cluster = PythonOperator(
     task_id='cluster',
     python_callable=run_clustering,
-dag=dag,
+    dag=dag,
 )
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -145,55 +144,55 @@ dag=dag,
 task_load = PythonOperator(
     task_id='load',
     python_callable=run_load,
-dag=dag,
+    dag=dag,
 )
 
 task_load_trends = PythonOperator(
     task_id='load_trends',
     python_callable=load_trends,
-dag=dag,
+    dag=dag,
 )
 
 task_tag_recipes = PythonOperator(
     task_id='tag_recipes',
     python_callable=run_tag_recipes,
-dag=dag,
+    dag=dag,
 )
 
 task_tag_signals = PythonOperator(
     task_id='tag_signals',
     python_callable=tag_signals,
-dag=dag,
+    dag=dag,
 )
 
 task_compute_gap = PythonOperator(
     task_id='compute_gap_analysis',
     python_callable=compute_gap_analysis,
-dag=dag,
+    dag=dag,
 )
 
 task_build_recipe_term_index = PythonOperator(
     task_id='build_recipe_term_index',
     python_callable=build_recipe_term_index,
-dag=dag,
+    dag=dag,
 )
 
 task_build_external_recipe_terms = PythonOperator(
     task_id='build_external_recipe_terms',
     python_callable=build_external_recipe_terms,
-dag=dag,
+    dag=dag,
 )
 
 task_build_recipe_gap_analysis = PythonOperator(
     task_id='build_recipe_gap_analysis',
     python_callable=build_recipe_gap_analysis,
-dag=dag,
+    dag=dag,
 )
 
 task_build_recipe_term_clusters = PythonOperator(
     task_id='build_recipe_term_clusters',
     python_callable=build_recipe_term_clusters,
-dag=dag,
+    dag=dag,
 )
 
 # ─────────────────────────────────────────────────────────────────────────
