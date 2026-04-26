@@ -11,6 +11,7 @@ Output columns: term, combined_score, recipe_count, gap_score, opportunity_tier,
 """
 
 import logging
+import os
 import re
 from datetime import date
 
@@ -19,7 +20,6 @@ from sqlalchemy import create_engine, text
 
 from foodcom_pipeline.batch.extract import (
     STAGING_DIR,
-    POSTGRES_CONN,
     atomic_parquet,
 )
 
@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 GAP_ANALYSIS_STAGING = STAGING_DIR / "gap_analysis.parquet"
 RECIPE_TAGS_STAGING  = STAGING_DIR / "recipe_tags.parquet"
 AI_MODE_TERM_SCORES_STAGING = STAGING_DIR / "ai_mode_term_scores.parquet"
+POSTGRES_CONN = os.getenv(
+    "FOODCOM_POSTGRES_CONN", "postgresql://user:password@postgres:5432/foodcom"
+)
 
 _RECIPE_SUFFIX = re.compile(r"\brecipes?\s*$", re.IGNORECASE)
 
@@ -157,8 +160,36 @@ def _write_to_db(gap_df: pd.DataFrame) -> None:
                     PRIMARY KEY (term, computed_date)
                 )
             """))
+            # Backward-compatible type hardening for pre-existing tables.
+            # Older schemas may use narrower integer types (e.g., SMALLINT)
+            # that overflow on large recipe counts.
+            conn.execute(text("""
+                ALTER TABLE gap_analysis
+                ALTER COLUMN combined_score TYPE DOUBLE PRECISION
+                USING combined_score::DOUBLE PRECISION
+            """))
+            conn.execute(text("""
+                ALTER TABLE gap_analysis
+                ALTER COLUMN recipe_count TYPE BIGINT
+                USING recipe_count::BIGINT
+            """))
+            conn.execute(text("""
+                ALTER TABLE gap_analysis
+                ALTER COLUMN gap_score TYPE DOUBLE PRECISION
+                USING gap_score::DOUBLE PRECISION
+            """))
 
-        records = gap_df.where(pd.notna(gap_df), None).to_dict(orient="records")
+        safe_df = gap_df.copy()
+        safe_df["combined_score"] = pd.to_numeric(
+            safe_df["combined_score"], errors="coerce"
+        )
+        safe_df["recipe_count"] = pd.to_numeric(
+            safe_df["recipe_count"], errors="coerce"
+        ).round()
+        safe_df["gap_score"] = pd.to_numeric(safe_df["gap_score"], errors="coerce")
+        safe_df["recipe_count"] = safe_df["recipe_count"].astype("Int64")
+
+        records = safe_df.where(pd.notna(safe_df), None).to_dict(orient="records")
         upsert_sql = """
             INSERT INTO gap_analysis
                 (term, combined_score, recipe_count, gap_score, opportunity_tier, computed_date)

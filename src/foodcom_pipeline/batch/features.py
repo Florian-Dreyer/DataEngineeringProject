@@ -175,13 +175,13 @@ def run_features(**context) -> None:
     substitution_engine = _compute_substitution_engine(ingredient_features, recipes)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    user_stats.to_parquet(USER_STATS_STAGING, index=False)
-    recipe_ratings.to_parquet(RECIPE_SENTIMENT_STAGING, index=False)
-    ingredient_features.to_parquet(INGREDIENT_FEATURES_STAGING, index=False)
+    #user_stats.to_parquet(USER_STATS_STAGING, index=False)
+    #recipe_ratings.to_parquet(RECIPE_SENTIMENT_STAGING, index=False)
+    #ingredient_features.to_parquet(INGREDIENT_FEATURES_STAGING, index=False)
     substitution_engine.to_parquet(SUBSTITUTION_ENGINE_STAGING, index=False)
-    #atomic_parquet(user_stats, USER_STATS_STAGING)
-    #atomic_parquet(recipe_ratings, RECIPE_SENTIMENT_STAGING)
-    #atomic_parquet(ingredient_features, INGREDIENT_FEATURES_STAGING)
+    atomic_parquet(user_stats, USER_STATS_STAGING)
+    atomic_parquet(recipe_ratings, RECIPE_SENTIMENT_STAGING)
+    atomic_parquet(ingredient_features, INGREDIENT_FEATURES_STAGING)
 
     n_candidates = int(len(ingredient_features))
     logger.info(

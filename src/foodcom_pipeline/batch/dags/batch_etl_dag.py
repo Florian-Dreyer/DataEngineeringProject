@@ -124,12 +124,8 @@ def load(**context):
 # DAG definition
 # ---------------------------------------------------------------------------
 
-with DAG(
+dag = DAG(
     dag_id='foodcom_batch_pipeline',
-    description=(
-        'Lambda batch layer: parallel extract → clean → VADER sentiment '
-        '→ feature engineering → K-Means clustering → star schema load'
-    ),
     default_args=default_args,
     description='Food.com batch ETL: extract → clean → sentiment → cluster → load (trends/AI mode run async)',
     schedule_interval='@daily',

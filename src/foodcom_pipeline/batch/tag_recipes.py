@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 from foodcom_pipeline.batch.extract import (
     STAGING_DIR,
-    POSTGRES_CONN,
     atomic_parquet,
     AI_MODE_TERM_SCORES_STAGING,
     TRENDS_NORMALISED_STAGING,
@@ -39,6 +38,9 @@ TAGS_STAGING = STAGING_DIR / "recipe_tags.parquet"
 SIGNAL_TAGS_STAGING = STAGING_DIR / "signal_tags.parquet"
 RECIPE_TERM_INDEX_STAGING = STAGING_DIR / "recipe_term_index.parquet"
 EXTERNAL_TERMS_STAGING = STAGING_DIR / "external_recipe_terms.parquet"
+POSTGRES_CONN = os.getenv(
+    "FOODCOM_POSTGRES_CONN", "postgresql://user:password@postgres:5432/foodcom"
+)
 
 MAX_LLM_RECIPES = 10
 GEMINI_MODEL = "gemini-2.5-flash"

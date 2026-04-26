@@ -45,6 +45,9 @@ def atomic_parquet(df: pd.DataFrame, dest: Union[Path, str]) -> None:
 
 DATA_DIR = Path(os.getenv('FOODCOM_DATA_DIR', '/opt/airflow/data'))
 STAGING_DIR = Path(os.getenv('FOODCOM_STAGING_DIR', '/opt/airflow/staging'))
+POSTGRES_CONN = os.getenv(
+    'FOODCOM_POSTGRES_CONN', 'postgresql://user:password@postgres:5432/foodcom'
+)
 
 RECIPES_CSV = DATA_DIR / 'RAW_recipes.csv'
 INTERACTIONS_CSV = DATA_DIR / 'RAW_interactions.csv'
