@@ -130,6 +130,11 @@ mv kaggle.json ~/.kaggle/
 
 # Secure your Kaggle API credentials by restricting file access
 chmod 600 ~/.kaggle/kaggle.json
+
+# Add API Keys to .env
+# USDA API Key – generate at https://fdc.nal.usda.gov/api-key-signup
+# SerpApi API Key - generate at https://serpapi.com/manage-api-key
+# Gemini API Key - generate at https://aistudio.google.com/app/api-keys
 ```
 
 ### 2. Start services

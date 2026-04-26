@@ -27,7 +27,7 @@ _JUNK_PATTERNS = re.compile(
     r'|shopping list',
     flags=re.IGNORECASE,
 )
-_MIN_BODY_LENGTH = 10
+_MIN_BODY_LENGTH = 5
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ _STOPWORDS: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 def build_ai_query(seed: str) -> str:
-    return f"20 {seed} comma-separated dish names"
+    return f"{seed}: 20 dish names, comma-separated"
 
 
 def fetch_ai_mode_blocks(seeds, api_key) -> pd.DataFrame:
@@ -257,8 +257,20 @@ def score_terms(raw_df: pd.DataFrame) -> pd.DataFrame:
 
         # reject phrases that are almost entirely stopwords
         words = term.split()
-        content_words = [w for w in words if w not in _STOPWORDS]
-        if len(content_words) == 0:
+        meaningful_words = [w for w in words if len(w) > 2 and w not in _STOPWORDS]
+
+        # require at least 2 meaningful words (to filter out generic phrases like "chicken recipes")
+        if len(meaningful_words) < 2:
+            return False
+
+        # reject common generic descriptors that aren't dish names
+        generic_descriptors = {
+            "recipes", "recipe", "dish", "dishes", "food", "foods",
+            "meal", "meals", "ideas", "idea", "easy", "quick", "simple",
+            "best", "top", "popular", "favorite", "favourite", "classic",
+        }
+        # if all words are generic descriptors, reject
+        if all(w.lower() in generic_descriptors for w in words):
             return False
 
         return True
