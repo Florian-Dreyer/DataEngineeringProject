@@ -1,0 +1,3 @@
+# Keywords for Google Trends extraction
+recipe
+recipes

@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-foodcom}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  airflow:
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    image: foodcom-airflow:2.9.3-local
+    hostname: airflow
+    depends_on:
+      - postgres
+    environment:
+      USDA_API_KEY: ${USDA_API_KEY}
+      SERPAPI_KEY: ${SERPAPI_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      FOODCOM_USDA_FORCE_REFRESH: ${FOODCOM_USDA_FORCE_REFRESH:-false}
+      # Airflow metadata DB (kept in Postgres for simplicity)
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-foodcom}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+      # Batch pipeline config (used by src/foodcom_pipeline/batch/*.py)
+      FOODCOM_POSTGRES_CONN: postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-foodcom}
+      FOODCOM_DATA_DIR: /opt/airflow/data
+      FOODCOM_STAGING_DIR: /opt/airflow/staging
+      FOODCOM_USDA_JSON_DIR: /opt/airflow/usda_data
+      FOODCOM_ENABLE_KAGGLE_DOWNLOAD: ${FOODCOM_ENABLE_KAGGLE_DOWNLOAD:-true}
+      FOODCOM_KAGGLE_DATASET: ${FOODCOM_KAGGLE_DATASET:-shuyangli94/food-com-recipes-and-user-interactions}
+      KAGGLE_CONFIG_DIR: /home/airflow/.kaggle
+
+      # Make package importable
+      PYTHONPATH: /opt/airflow/app/src
+      
+    # Use the image's airflow user so the `airflow` CLI is available on PATH.
+    user: "50000:0"
+    volumes:
+      # Only mount DAGs for live reload during development
+      - type: bind
+        source: ./src/foodcom_pipeline/batch/dags
+        target: /opt/airflow/dags
+      # Data and USDA as Docker volumes; staging as bind mount for host Streamlit visibility
+      - data_volume:/opt/airflow/data
+      - type: bind
+        source: ./staging
+        target: /opt/airflow/staging
+      - usda_volume:/opt/airflow/usda_data
+      # Kaggle credentials as read-only bind mount
+      - type: bind
+        source: ${HOME}/.kaggle
+        target: /home/airflow/.kaggle
+        read_only: true
+    ports:
+      - "8080:8080"
+    command: >
+      bash -lc "set -euo pipefail;
+      airflow db migrate;
+      airflow users create --username \"${AIRFLOW_USERNAME:-airflow}\" --password \"${AIRFLOW_PASSWORD:-airflow}\" --firstname \"${AIRFLOW_FIRSTNAME:-Air}\" --lastname \"${AIRFLOW_LASTNAME:-Flow}\" --role Admin --email \"${AIRFLOW_EMAIL:-airflow@example.com}\" || true;
+      airflow scheduler & exec airflow webserver"
+
+volumes:
+  postgres_data:
+  data_volume:
+  usda_volume:

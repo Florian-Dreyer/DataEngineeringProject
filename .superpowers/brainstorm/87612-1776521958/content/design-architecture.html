@@ -1,0 +1,49 @@
+<h2>Design: File Architecture</h2>
+<p class="subtitle">Option B — tab modules with a thin orchestrator</p>
+
+<div class="section">
+  <h3>New file structure</h3>
+  <div style="background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; font-family: monospace; font-size: 13px; line-height: 2;">
+    <div style="color: #6b7280;">src/foodcom_pipeline/dashboard/</div>
+    <div style="color: #111827; padding-left: 20px;">├── <strong>app.py</strong> <span style="color: #10b981; font-family: sans-serif; font-size: 11px;">← thin orchestrator: loads tabs, injects theme</span></div>
+    <div style="color: #111827; padding-left: 20px;">├── <strong>theme.py</strong> <span style="color: #10b981; font-family: sans-serif; font-size: 11px;">← shared CSS constants + color palette</span></div>
+    <div style="color: #111827; padding-left: 20px;">└── tabs/</div>
+    <div style="color: #111827; padding-left: 40px;">├── <strong>tab_recipe_explorer.py</strong> <span style="color: #10b981; font-family: sans-serif; font-size: 11px;">← NEW — Recipe Explorer + Affiliate Commerce</span></div>
+    <div style="color: #111827; padding-left: 40px;">├── <strong>tab_substitutions.py</strong> <span style="color: #f59e0b; font-family: sans-serif; font-size: 11px;">← styled "Coming Soon" stub</span></div>
+    <div style="color: #111827; padding-left: 40px;">├── <strong>tab_market_intelligence.py</strong> <span style="color: #6b7280; font-family: sans-serif; font-size: 11px;">← extracted + restyled from app.py</span></div>
+    <div style="color: #111827; padding-left: 40px;">└── <strong>tab_pipeline_status.py</strong> <span style="color: #6b7280; font-family: sans-serif; font-size: 11px;">← extracted + restyled from app.py</span></div>
+    <div style="color: #6b7280; margin-top: 8px;">Also: <strong>.streamlit/config.toml</strong> <span style="font-family: sans-serif; font-size: 11px;">← sets primaryColor, font, background</span></div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>What moves where</h3>
+  <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+    <thead>
+      <tr style="background: #f3f4f6;">
+        <th style="padding: 8px 12px; text-align: left; border-bottom: 1px solid #e5e7eb;">Current location (app.py)</th>
+        <th style="padding: 8px 12px; text-align: left; border-bottom: 1px solid #e5e7eb;">Moves to</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #f3f4f6; color: #6b7280;">Tab 1 stub (Overview)</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #f3f4f6;">→ <strong>tab_recipe_explorer.py</strong> (fully built)</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #f3f4f6; color: #6b7280;">Tab 2 stub (Recipe Analytics)</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #f3f4f6;">→ <strong>tab_substitutions.py</strong> (polished stub)</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #f3f4f6;">Tab 3: Audience & Market Intelligence</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #f3f4f6;">→ <strong>tab_market_intelligence.py</strong> (restyled)</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 12px;">Tab 4: Pipeline Status</td>
+        <td style="padding: 8px 12px;">→ <strong>tab_pipeline_status.py</strong> (restyled)</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<p style="font-size: 13px; color: #6b7280; margin-top: 16px;">Does this structure look right? Reply in the terminal.</p>

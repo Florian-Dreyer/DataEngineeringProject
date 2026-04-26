@@ -1,0 +1,150 @@
+<style>
+  .mock-tag { display: inline-block; background: #d1fae5; color: #065f46; border-radius: 12px; padding: 2px 8px; font-size: 10px; margin: 2px; }
+  .mock-badge { display: inline-block; background: #10b981; color: white; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 700; }
+  .mock-badge-gray { display: inline-block; background: #e5e7eb; color: #374151; border-radius: 4px; padding: 2px 7px; font-size: 10px; }
+  .mock-shop-btn { background: #10b981; color: white; border: none; border-radius: 6px; padding: 5px 12px; font-size: 11px; font-weight: 700; cursor: pointer; }
+  .mock-bar { height: 8px; border-radius: 4px; background: #10b981; }
+  .mock-bar-bg { height: 8px; border-radius: 4px; background: #e5e7eb; margin-bottom: 4px; }
+  .mini-label { font-size: 9px; color: #6b7280; margin-bottom: 1px; }
+  .spider { width: 70px; height: 70px; background: #d1fae5; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #065f46; font-size: 9px; font-weight: 700; }
+</style>
+
+<h2>How should the Recipe Explorer be laid out?</h2>
+<p class="subtitle">All three include: search, nutritional radar, Bayesian vs raw rating, ingredient trends, and Shop button</p>
+
+<div class="cards">
+
+  <div class="card" data-choice="sidebar" onclick="toggleSelect(this)">
+    <div class="card-image" style="background: #f8fafc; padding: 10px; height: 200px; overflow: hidden;">
+      <div style="display: flex; gap: 8px; height: 100%;">
+        <!-- Sidebar -->
+        <div style="width: 90px; background: white; border-radius: 6px; padding: 8px; border: 1px solid #e5e7eb; flex-shrink: 0;">
+          <div style="font-size: 9px; font-weight: 700; color: #374151; margin-bottom: 6px;">FILTERS</div>
+          <div style="background: #f3f4f6; border-radius: 4px; padding: 4px 6px; font-size: 9px; color: #6b7280; margin-bottom: 4px;">🔍 Search...</div>
+          <div style="font-size: 8px; color: #6b7280; margin: 6px 0 3px;">Cuisine</div>
+          <div class="mock-tag" style="font-size: 8px;">Italian</div>
+          <div class="mock-tag" style="font-size: 8px;">Asian</div>
+          <div style="font-size: 8px; color: #6b7280; margin: 6px 0 3px;">Cook Time</div>
+          <div style="background: #e5e7eb; border-radius: 4px; height: 4px;"><div style="background: #10b981; width: 60%; height: 4px; border-radius: 4px;"></div></div>
+          <div style="font-size: 8px; color: #6b7280; margin: 6px 0 3px;">Min Rating</div>
+          <div style="font-size: 8px; color: #374151;">⭐⭐⭐⭐</div>
+        </div>
+        <!-- Main content -->
+        <div style="flex: 1; display: flex; flex-direction: column; gap: 6px;">
+          <div style="background: white; border-radius: 6px; padding: 8px; border: 1px solid #e5e7eb;">
+            <div style="font-weight: 700; font-size: 10px; color: #111;">Chicken Tikka Masala</div>
+            <div style="font-size: 9px; color: #6b7280; margin: 2px 0;">45 min · <span class="mock-badge">4.8 Bayesian</span> <span class="mock-badge-gray">4.2 raw</span></div>
+            <div style="font-size: 9px; color: #6b7280; margin: 2px 0;">Trend: 🔥 High demand</div>
+            <button class="mock-shop-btn" style="margin-top: 4px; font-size: 9px; padding: 3px 8px;">🛒 Shop Ingredients</button>
+          </div>
+          <div style="background: white; border-radius: 6px; padding: 8px; border: 1px solid #e5e7eb; display: flex; gap: 8px;">
+            <div class="spider">Radar</div>
+            <div style="flex: 1;">
+              <div class="mini-label">Calories</div>
+              <div class="mock-bar-bg"><div class="mock-bar" style="width: 70%;"></div></div>
+              <div class="mini-label">Protein</div>
+              <div class="mock-bar-bg"><div class="mock-bar" style="width: 55%;"></div></div>
+              <div class="mini-label">Fat</div>
+              <div class="mock-bar-bg"><div class="mock-bar" style="width: 40%;"></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A — Sidebar Filters + Detail Panel</h3>
+      <p>Persistent filter panel on the left. Click a recipe → detail expands right. Feels like a product catalogue or Airbnb search. Best for power users who filter by multiple criteria.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="topbar" onclick="toggleSelect(this)">
+    <div class="card-image" style="background: #f8fafc; padding: 10px; height: 200px; overflow: hidden;">
+      <div style="display: flex; flex-direction: column; gap: 6px; height: 100%;">
+        <!-- Search bar at top -->
+        <div style="background: white; border-radius: 6px; padding: 6px 10px; border: 1px solid #e5e7eb; display: flex; gap: 6px; align-items: center;">
+          <span style="font-size: 11px;">🔍</span>
+          <span style="font-size: 10px; color: #9ca3af; flex: 1;">Search recipes, ingredients...</span>
+          <div class="mock-tag" style="font-size: 8px;">≤ 30 min</div>
+          <div class="mock-tag" style="font-size: 8px;">⭐4+</div>
+        </div>
+        <!-- 2-col result + detail -->
+        <div style="display: flex; gap: 6px; flex: 1;">
+          <!-- Results list -->
+          <div style="width: 50%; display: flex; flex-direction: column; gap: 4px;">
+            <div style="background: #10b981; border-radius: 5px; padding: 6px 8px; border: 2px solid #10b981;">
+              <div style="font-size: 9px; font-weight: 700; color: white;">Chicken Tikka Masala</div>
+              <div style="font-size: 8px; color: #d1fae5;">4.8 · 45 min · 🔥 Trending</div>
+            </div>
+            <div style="background: white; border-radius: 5px; padding: 6px 8px; border: 1px solid #e5e7eb;">
+              <div style="font-size: 9px; font-weight: 700; color: #374151;">Spaghetti Carbonara</div>
+              <div style="font-size: 8px; color: #9ca3af;">4.6 · 20 min</div>
+            </div>
+            <div style="background: white; border-radius: 5px; padding: 6px 8px; border: 1px solid #e5e7eb;">
+              <div style="font-size: 9px; font-weight: 700; color: #374151;">Beef Stir Fry</div>
+              <div style="font-size: 8px; color: #9ca3af;">4.4 · 15 min</div>
+            </div>
+          </div>
+          <!-- Detail panel -->
+          <div style="flex: 1; background: white; border-radius: 5px; padding: 8px; border: 1px solid #e5e7eb;">
+            <div style="font-size: 10px; font-weight: 700; color: #111;">Chicken Tikka Masala</div>
+            <div style="display: flex; gap: 4px; margin: 4px 0;">
+              <span class="mock-badge" style="font-size: 8px;">4.8 Bayesian</span>
+              <span class="mock-badge-gray" style="font-size: 8px;">4.2 raw</span>
+            </div>
+            <div class="mini-label" style="margin-top: 4px;">Protein</div>
+            <div class="mock-bar-bg"><div class="mock-bar" style="width: 55%;"></div></div>
+            <div class="mini-label">Fat</div>
+            <div class="mock-bar-bg"><div class="mock-bar" style="width: 40%;"></div></div>
+            <button class="mock-shop-btn" style="margin-top: 4px; font-size: 9px; padding: 3px 8px; width: 100%;">🛒 Shop Ingredients</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B — Top Search + Split View</h3>
+      <p>Search bar at the top, results list on left, recipe detail on right. Classic master-detail pattern (like Gmail or Spotify). Efficient — you see results and detail simultaneously.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="full" onclick="toggleSelect(this)">
+    <div class="card-image" style="background: #f8fafc; padding: 10px; height: 200px; overflow: hidden;">
+      <div style="display: flex; flex-direction: column; gap: 6px; height: 100%;">
+        <!-- Hero search -->
+        <div style="background: linear-gradient(135deg, #10b981, #059669); border-radius: 6px; padding: 10px; text-align: center;">
+          <div style="font-size: 10px; font-weight: 700; color: white; margin-bottom: 4px;">Recipe Explorer</div>
+          <div style="background: white; border-radius: 4px; padding: 4px 10px; font-size: 9px; color: #9ca3af;">🔍 "chicken tikka masala"</div>
+        </div>
+        <!-- Full-width recipe card -->
+        <div style="background: white; border-radius: 6px; padding: 8px; border: 1px solid #e5e7eb; flex: 1;">
+          <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+            <div>
+              <div style="font-size: 10px; font-weight: 700; color: #111;">Chicken Tikka Masala</div>
+              <div style="display: flex; gap: 3px; margin: 2px 0;">
+                <span class="mock-badge" style="font-size: 8px;">4.8 Bayesian</span>
+                <span class="mock-badge-gray" style="font-size: 8px;">4.2 raw</span>
+                <span style="font-size: 8px; color: #f59e0b;">🔥 Trending</span>
+              </div>
+            </div>
+            <button class="mock-shop-btn" style="font-size: 9px; padding: 3px 8px;">🛒 Shop</button>
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 6px;">
+            <div class="spider" style="width: 55px; height: 55px; font-size: 8px;">Radar</div>
+            <div style="flex: 1;">
+              <div class="mini-label">Calories 480kcal</div>
+              <div class="mock-bar-bg"><div class="mock-bar" style="width: 70%;"></div></div>
+              <div class="mini-label">Protein 32g</div>
+              <div class="mock-bar-bg"><div class="mock-bar" style="width: 55%;"></div></div>
+              <div class="mini-label">Fat 18g</div>
+              <div class="mock-bar-bg"><div class="mock-bar" style="width: 40%;"></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C — Hero Search + Full-Width Cards</h3>
+      <p>Prominent search header, results stack as full-width cards below. Each card shows everything inline — ratings, nutrition bars, trend badge, Shop button — no clicking to expand. Clean and mobile-friendly.</p>
+    </div>
+  </div>
+
+</div>

@@ -1,0 +1,112 @@
+<style>
+  .metric-card { background: white; border-radius: 8px; padding: 14px 16px; border: 1px solid #e5e7eb; border-top: 3px solid #10b981; box-shadow: 0 1px 3px rgba(0,0,0,0.05); flex: 1; }
+  .metric-val { font-size: 22px; font-weight: 800; color: #111827; }
+  .metric-label { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
+  .metric-delta { font-size: 10px; color: #10b981; font-weight: 600; margin-top: 2px; }
+  .section-card { background: white; border-radius: 8px; border: 1px solid #e5e7eb; padding: 16px; margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+  .coming-soon { background: linear-gradient(135deg, #f0fdf4, #dcfce7); border-radius: 10px; border: 2px dashed #10b981; padding: 32px; text-align: center; }
+  .tab-label { display: inline-block; background: #f3f4f6; border-radius: 6px 6px 0 0; padding: 6px 14px; font-size: 11px; font-weight: 600; color: #6b7280; border: 1px solid #e5e7eb; border-bottom: none; }
+  .tab-label-active { background: white; color: #10b981; border-top: 2px solid #10b981; }
+  .status-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid #f3f4f6; font-size: 11px; }
+  .badge-ok { background: #d1fae5; color: #065f46; border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 600; }
+  .badge-warn { background: #fef3c7; color: #92400e; border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 600; }
+</style>
+
+<h2>Design: Restyled Tabs 2, 3 & 4</h2>
+<p class="subtitle">Same data, new visual treatment — Clean & Modern theme applied consistently</p>
+
+<!-- Tab nav preview -->
+<div style="display: flex; gap: 0; margin-bottom: 0; margin-top: 8px;">
+  <span class="tab-label">🍳 Recipe Explorer</span>
+  <span class="tab-label">🔄 Substitutions</span>
+  <span class="tab-label tab-label-active">📊 Market Intelligence</span>
+  <span class="tab-label">⚙️ Pipeline Status</span>
+</div>
+
+<div class="section-card" style="border-radius: 0 8px 8px 8px; margin-bottom: 20px;">
+
+  <div style="font-size: 13px; font-weight: 700; color: #374151; margin-bottom: 12px;">Tab 2 — Smart Substitutions (polished stub)</div>
+  <div class="coming-soon">
+    <div style="font-size: 28px; margin-bottom: 8px;">🔄</div>
+    <div style="font-size: 16px; font-weight: 700; color: #065f46; margin-bottom: 6px;">Smart Substitutions</div>
+    <div style="font-size: 12px; color: #374151; max-width: 380px; margin: 0 auto; line-height: 1.7;">
+      Ingredient swap cards with rating and nutritional deltas, real-time Bayesian recalculation, and native ad placement hooks. Detects underperforming ingredients and recommends trending alternatives.
+    </div>
+    <div style="margin-top: 16px; display: inline-block; background: #10b981; color: white; border-radius: 6px; padding: 7px 18px; font-size: 12px; font-weight: 700;">Coming Soon</div>
+  </div>
+
+  <div style="margin-top: 20px; font-size: 13px; font-weight: 700; color: #374151; margin-bottom: 12px;">Tab 3 — Audience & Market Intelligence (restyled)</div>
+
+  <!-- KPI row -->
+  <div style="display: flex; gap: 10px; margin-bottom: 12px;">
+    <div class="metric-card">
+      <div class="metric-val">47,281</div>
+      <div class="metric-label">Segmented Users</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-val">5</div>
+      <div class="metric-label">Segments</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-val">$35–50</div>
+      <div class="metric-label">CPM Uplift</div>
+      <div class="metric-delta">↑ from $5 base</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-val">0.87</div>
+      <div class="metric-label">Silhouette Score</div>
+    </div>
+  </div>
+
+  <!-- Radar + table -->
+  <div style="display: flex; gap: 10px;">
+    <div style="flex: 1; background: #f8fafc; border-radius: 8px; border: 1px solid #e5e7eb; padding: 12px; text-align: center;">
+      <div style="font-size: 11px; font-weight: 600; color: #374151; margin-bottom: 8px;">Segment Taste Profiles</div>
+      <div style="width: 100%; height: 100px; background: #d1fae5; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #065f46; font-weight: 700; border: 2px dashed #10b981;">Plotly Radar Chart<br>(emerald palette)</div>
+    </div>
+    <div style="flex: 1.2; background: #f8fafc; border-radius: 8px; border: 1px solid #e5e7eb; padding: 12px;">
+      <div style="font-size: 11px; font-weight: 600; color: #374151; margin-bottom: 8px;">CPG Brand Adjacency</div>
+      <div class="status-row"><span style="color: #111;">Indulgent Baker</span><span style="color: #6b7280;">King Arthur, Ghirardelli</span><span style="color: #10b981; font-weight: 700;">$4–8 CPM</span></div>
+      <div class="status-row"><span style="color: #111;">Intl Explorer</span><span style="color: #6b7280;">Kikkoman, Goya</span><span style="color: #10b981; font-weight: 700;">$5–9 CPM</span></div>
+      <div class="status-row"><span style="color: #111;">Protein Cook</span><span style="color: #6b7280;">Tyson, Applegate</span><span style="color: #10b981; font-weight: 700;">$6–10 CPM</span></div>
+    </div>
+  </div>
+
+  <div style="margin-top: 20px; font-size: 13px; font-weight: 700; color: #374151; margin-bottom: 12px;">Tab 4 — Pipeline Status (restyled)</div>
+
+  <!-- Status KPIs -->
+  <div style="display: flex; gap: 10px; margin-bottom: 12px;">
+    <div class="metric-card">
+      <div class="metric-val" style="color: #10b981;">✓ Fresh</div>
+      <div class="metric-label">Data Freshness</div>
+      <div class="metric-delta">Last run 2h ago</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-val">0.31%</div>
+      <div class="metric-label">Data Loss Rate</div>
+      <div class="metric-delta" style="color: #10b981;">↓ below 0.5% threshold</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-val">88%</div>
+      <div class="metric-label">USDA Coverage</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-val">k = 5</div>
+      <div class="metric-label">Optimal Clusters</div>
+    </div>
+  </div>
+
+  <!-- Stage row counts -->
+  <div style="background: #f8fafc; border-radius: 8px; border: 1px solid #e5e7eb; padding: 12px;">
+    <div style="font-size: 11px; font-weight: 600; color: #374151; margin-bottom: 8px;">Pipeline Stages</div>
+    <div class="status-row"><span>extract_recipes</span><span style="color: #6b7280;">231,637 rows</span><span class="badge-ok">✓ success</span></div>
+    <div class="status-row"><span>extract_interactions</span><span style="color: #6b7280;">1,132,367 rows</span><span class="badge-ok">✓ success</span></div>
+    <div class="status-row"><span>clean</span><span style="color: #6b7280;">229,804 rows</span><span class="badge-ok">✓ success</span></div>
+    <div class="status-row"><span>sentiment</span><span style="color: #6b7280;">1,129,148 rows</span><span class="badge-ok">✓ success</span></div>
+    <div class="status-row"><span>features</span><span style="color: #6b7280;">47,918 users</span><span class="badge-ok">✓ success</span></div>
+    <div class="status-row"><span>cluster</span><span style="color: #6b7280;">k=5 selected</span><span class="badge-ok">✓ success</span></div>
+    <div class="status-row" style="border: none;"><span>load</span><span style="color: #6b7280;">47,281 upserted</span><span class="badge-ok">✓ success</span></div>
+  </div>
+</div>
+
+<p style="font-size: 13px; color: #6b7280;">Does this look right? Reply in terminal.</p>

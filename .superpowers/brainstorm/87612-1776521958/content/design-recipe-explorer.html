@@ -1,0 +1,131 @@
+<style>
+  .re-hero { background: linear-gradient(135deg, #10b981 0%, #059669 100%); border-radius: 10px; padding: 20px 24px; margin-bottom: 12px; }
+  .re-search { background: white; border-radius: 6px; padding: 8px 14px; font-size: 13px; color: #9ca3af; display: flex; align-items: center; gap: 8px; }
+  .re-filter-strip { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+  .re-chip { background: white; border: 1px solid #e5e7eb; border-radius: 20px; padding: 4px 12px; font-size: 11px; color: #374151; }
+  .re-chip-active { background: #d1fae5; border-color: #10b981; color: #065f46; }
+  .re-card { background: white; border-radius: 10px; border: 1px solid #e5e7eb; padding: 16px; margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+  .badge-green { background: #10b981; color: white; border-radius: 4px; padding: 2px 8px; font-size: 11px; font-weight: 700; }
+  .badge-gray { background: #f3f4f6; color: #374151; border-radius: 4px; padding: 2px 8px; font-size: 11px; }
+  .badge-trend { background: #fef3c7; color: #92400e; border-radius: 4px; padding: 2px 8px; font-size: 11px; }
+  .shop-btn { background: #10b981; color: white; border: none; border-radius: 6px; padding: 7px 16px; font-size: 12px; font-weight: 700; cursor: pointer; }
+  .instacart-btn { background: white; color: #374151; border: 1px solid #e5e7eb; border-radius: 6px; padding: 7px 14px; font-size: 12px; cursor: pointer; }
+  .nut-bar-bg { height: 6px; border-radius: 3px; background: #f3f4f6; margin-bottom: 6px; }
+  .nut-bar-fill { height: 6px; border-radius: 3px; background: #10b981; }
+  .nut-label { font-size: 10px; color: #6b7280; display: flex; justify-content: space-between; margin-bottom: 2px; }
+  .radar-placeholder { width: 90px; height: 90px; border-radius: 50%; background: #d1fae5; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #065f46; font-weight: 700; flex-shrink: 0; border: 2px dashed #10b981; }
+  .ingr-pill { display: inline-block; background: #f3f4f6; border-radius: 12px; padding: 2px 8px; font-size: 10px; color: #6b7280; margin: 2px; }
+</style>
+
+<h2>Design: Recipe Explorer Tab</h2>
+<p class="subtitle">Full-width card layout with hero search — mockup below</p>
+
+<div class="mockup">
+  <div class="mockup-header">Tab 1 — Recipe Explorer</div>
+  <div class="mockup-body" style="background: #f8fafc; padding: 16px;">
+
+    <!-- Hero search -->
+    <div class="re-hero">
+      <div style="font-size: 18px; font-weight: 800; color: white; margin-bottom: 8px;">Recipe Explorer</div>
+      <div class="re-search">
+        <span>🔍</span>
+        <span>Search recipes, ingredients, cuisine...</span>
+      </div>
+    </div>
+
+    <!-- Filter strip -->
+    <div class="re-filter-strip">
+      <span style="font-size: 11px; color: #6b7280; font-weight: 600;">FILTERS:</span>
+      <span class="re-chip re-chip-active">⏱ ≤ 45 min</span>
+      <span class="re-chip">⭐ 4+ rating</span>
+      <span class="re-chip">🌍 All cuisines</span>
+      <span class="re-chip">🥗 Any nutrition</span>
+      <span style="margin-left: auto; font-size: 11px; color: #6b7280;">231,637 recipes · showing 1–10</span>
+    </div>
+
+    <!-- Recipe card 1 -->
+    <div class="re-card">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+        <div>
+          <div style="font-size: 15px; font-weight: 700; color: #111827;">Chicken Tikka Masala</div>
+          <div style="font-size: 11px; color: #6b7280; margin-top: 2px;">45 min · 8 ingredients</div>
+          <div style="margin-top: 6px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center;">
+            <span class="badge-green">⭐ 4.8 Bayesian</span>
+            <span class="badge-gray">4.2 raw</span>
+            <span style="font-size: 11px; color: #059669; font-weight: 600;">↑ +0.6 sentiment boost</span>
+            <span class="badge-trend">🔥 High trend demand</span>
+          </div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 6px; align-items: flex-end;">
+          <button class="shop-btn">🛒 Shop on Amazon Fresh</button>
+          <button class="instacart-btn">🥬 Instacart</button>
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 16px; margin-top: 10px;">
+        <!-- Radar placeholder -->
+        <div style="display: flex; flex-direction: column; align-items: center; gap: 4px;">
+          <div class="radar-placeholder">Nutrition<br>Radar</div>
+          <div style="font-size: 9px; color: #6b7280;">Plotly polar chart</div>
+        </div>
+
+        <!-- Nutrition bars -->
+        <div style="flex: 1;">
+          <div style="font-size: 11px; font-weight: 600; color: #374151; margin-bottom: 8px;">Nutrition per serving</div>
+          <div class="nut-label"><span>Protein</span><span>32g</span></div>
+          <div class="nut-bar-bg"><div class="nut-bar-fill" style="width: 64%;"></div></div>
+          <div class="nut-label"><span>Carbs</span><span>28g</span></div>
+          <div class="nut-bar-bg"><div class="nut-bar-fill" style="width: 45%;"></div></div>
+          <div class="nut-label"><span>Fat</span><span>18g</span></div>
+          <div class="nut-bar-bg"><div class="nut-bar-fill" style="width: 30%;"></div></div>
+          <div class="nut-label"><span>Sugar</span><span>6g</span></div>
+          <div class="nut-bar-bg"><div class="nut-bar-fill" style="width: 12%; background: #f59e0b;"></div></div>
+          <div class="nut-label"><span>Sodium</span><span>540mg</span></div>
+          <div class="nut-bar-bg"><div class="nut-bar-fill" style="width: 55%; background: #ef4444;"></div></div>
+        </div>
+
+        <!-- Ingredients -->
+        <div style="width: 160px;">
+          <div style="font-size: 11px; font-weight: 600; color: #374151; margin-bottom: 8px;">Top Ingredients</div>
+          <span class="ingr-pill">chicken</span>
+          <span class="ingr-pill">tomato</span>
+          <span class="ingr-pill">cream</span>
+          <span class="ingr-pill">garlic</span>
+          <span class="ingr-pill">garam masala</span>
+          <span class="ingr-pill">ginger</span>
+          <span class="ingr-pill">onion</span>
+          <span class="ingr-pill">+1 more</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recipe card 2 (collapsed preview) -->
+    <div class="re-card" style="opacity: 0.7;">
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div>
+          <div style="font-size: 14px; font-weight: 700; color: #111827;">Spaghetti Carbonara</div>
+          <div style="font-size: 11px; color: #6b7280; margin-top: 2px;">20 min · 6 ingredients · <span class="badge-green" style="font-size: 10px;">⭐ 4.6 Bayesian</span> <span class="badge-gray" style="font-size: 10px;">4.5 raw</span></div>
+        </div>
+        <button class="shop-btn" style="font-size: 11px; padding: 5px 12px;">🛒 Shop</button>
+      </div>
+    </div>
+
+    <div style="text-align: center; font-size: 12px; color: #9ca3af; margin-top: 8px;">← Prev · Page 1 of 23,164 · Next →</div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 20px;">
+  <h3>Key behaviours</h3>
+  <ul style="font-size: 13px; color: #374151; line-height: 2;">
+    <li><strong>Search</strong> filters on recipe name + ingredients (case-insensitive, reads from PostgreSQL dim_recipe or parquet fallback)</li>
+    <li><strong>Filters</strong>: cook time slider, min Bayesian rating, cuisine tag (parsed from tags column)</li>
+    <li><strong>Radar chart</strong>: Plotly polar chart with 5 axes — Protein, Fat, Carbs, Sugar, Sodium — values normalised to % of typical daily intake for visual comparison</li>
+    <li><strong>Nutrition bars</strong>: colour-coded (green = good, amber = moderate sugar, red = high sodium)</li>
+    <li><strong>Trend badge</strong>: shows "🔥 High / Medium / Low demand" if trend_index available, else hidden</li>
+    <li><strong>Shop on Amazon Fresh</strong>: builds <code>amazon.com/s?k=ingredient1+ingredient2...</code> from top_ingredients</li>
+    <li><strong>Instacart</strong>: builds <code>instacart.com/store/s?k=recipe+name+ingredients</code></li>
+    <li><strong>Pagination</strong>: 10 results per page, Streamlit session state</li>
+  </ul>
+</div>
+
+<p style="font-size: 13px; color: #6b7280;">Does this look right? Reply in terminal.</p>
