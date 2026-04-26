@@ -15,10 +15,13 @@ services:
       context: .
       dockerfile: docker/airflow/Dockerfile
     image: foodcom-airflow:2.9.3-local
+    hostname: airflow
     depends_on:
       - postgres
     environment:
       USDA_API_KEY: ${USDA_API_KEY}
+      SERPAPI_KEY: ${SERPAPI_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
       FOODCOM_USDA_FORCE_REFRESH: ${FOODCOM_USDA_FORCE_REFRESH:-false}
       # Airflow metadata DB (kept in Postgres for simplicity)
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -33,41 +36,35 @@ services:
       FOODCOM_KAGGLE_DATASET: ${FOODCOM_KAGGLE_DATASET:-shuyangli94/food-com-recipes-and-user-interactions}
       KAGGLE_CONFIG_DIR: /home/airflow/.kaggle
 
-      # Make package importable from the mounted repo
+      # Make package importable
       PYTHONPATH: /opt/airflow/app/src
       
     # Use the image's airflow user so the `airflow` CLI is available on PATH.
     user: "50000:0"
     volumes:
-      # Long-form bind mounts avoid mis-parsing of colons in host paths (e.g. "AY25:26")
-      - type: bind
-        source: .
-        target: /opt/airflow/app
+      # Only mount DAGs for live reload during development
       - type: bind
         source: ./src/foodcom_pipeline/batch/dags
         target: /opt/airflow/dags
-      - type: bind
-        source: ./data
-        target: /opt/airflow/data
-      - type: bind
-        source: ./staging
-        target: /opt/airflow/staging
+      # Data, staging, USDA as Docker volumes (not bind mounts) — avoids errno 35 deadlock
+      - data_volume:/opt/airflow/data
+      - staging_volume:/opt/airflow/staging
+      - usda_volume:/opt/airflow/usda_data
+      # Kaggle credentials as read-only bind mount
       - type: bind
         source: ${HOME}/.kaggle
         target: /home/airflow/.kaggle
         read_only: true
-      - type: bind
-        source: ./usda_data
-        target: /opt/airflow/usda_data
     ports:
       - "8080:8080"
     command: >
       bash -lc "set -euo pipefail;
-      pip install -e /opt/airflow/app --no-deps;
       airflow db migrate;
       airflow users create --username \"${AIRFLOW_USERNAME:-airflow}\" --password \"${AIRFLOW_PASSWORD:-airflow}\" --firstname \"${AIRFLOW_FIRSTNAME:-Air}\" --lastname \"${AIRFLOW_LASTNAME:-Flow}\" --role Admin --email \"${AIRFLOW_EMAIL:-airflow@example.com}\" || true;
       airflow scheduler & exec airflow webserver"
 
 volumes:
   postgres_data:
-
+  data_volume:
+  staging_volume:
+  usda_volume:

@@ -124,8 +124,11 @@ mkdir -p data staging
 
 # Kaggle credentials — generate at kaggle.com → Account → API → Create New Token
 mkdir -p ~/.kaggle
-# Copy your kaggle.json here:
+# Copy your kaggle.json here: 
 #   ~/.kaggle/kaggle.json
+mv kaggle.json ~/.kaggle/
+
+# Secure your Kaggle API credentials by restricting file access
 chmod 600 ~/.kaggle/kaggle.json
 ```
 

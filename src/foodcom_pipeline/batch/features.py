@@ -49,17 +49,19 @@ Output columns — ingredient_features.parquet (one row per canonical_ingredient
   trend_index               : reserved nullable column for compatibility
 """
 
+import ast
 import logging
 import ast
 import json
 import os
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import requests
 from foodcom_pipeline.batch.clean import load_cleaned_recipes
-from foodcom_pipeline.batch.extract import STAGING_DIR, USDA_NUTRIENTS_STAGING
+from foodcom_pipeline.batch.extract import STAGING_DIR, USDA_NUTRIENTS_STAGING, atomic_parquet
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 from sklearn.impute import SimpleImputer
 from sklearn.neighbors import NearestNeighbors
@@ -177,6 +179,9 @@ def run_features(**context) -> None:
     recipe_ratings.to_parquet(RECIPE_SENTIMENT_STAGING, index=False)
     ingredient_features.to_parquet(INGREDIENT_FEATURES_STAGING, index=False)
     substitution_engine.to_parquet(SUBSTITUTION_ENGINE_STAGING, index=False)
+    #atomic_parquet(user_stats, USER_STATS_STAGING)
+    #atomic_parquet(recipe_ratings, RECIPE_SENTIMENT_STAGING)
+    #atomic_parquet(ingredient_features, INGREDIENT_FEATURES_STAGING)
 
     n_candidates = int(len(ingredient_features))
     logger.info(
@@ -1066,3 +1071,60 @@ def load_ingredient_features() -> pd.DataFrame:
 
 def load_substitution_engine() -> pd.DataFrame:
     return pd.read_parquet(SUBSTITUTION_ENGINE_STAGING)
+# ---------------------------------------------------------------------------
+# Google Trends keyword generation from recipe tags
+# ---------------------------------------------------------------------------
+
+
+def generate_recipe_tag_keywords() -> pd.DataFrame:
+    """
+    Extracts unique recipe tags from cleaned recipes and saves them as keywords
+    for Google Trends extraction.
+
+    Tags are parsed from the string representation stored in the recipes table,
+    deduplicated, sorted alphabetically, and written to config/trends_keywords.txt.
+
+    Returns:
+        DataFrame with columns: ['keyword'] containing unique recipe tags.
+    """
+    recipes = load_cleaned_recipes()
+
+    if 'tags' not in recipes.columns:
+        logger.warning('Tags column not found in recipes — skipping keyword generation.')
+        return pd.DataFrame(columns=['keyword'])
+
+    all_tags: set[str] = set()
+
+    for tags_value in recipes['tags'].dropna():
+        try:
+            # Tags stored as string representation of list
+            if isinstance(tags_value, str):
+                tags_list = ast.literal_eval(tags_value)
+                if isinstance(tags_list, list):
+                    all_tags.update([str(tag).strip().lower() for tag in tags_list if tag])
+        except (ValueError, SyntaxError):
+            # Skip malformed tag entries
+            pass
+
+    if not all_tags:
+        logger.warning('No valid tags found in recipes.')
+        return pd.DataFrame(columns=['keyword'])
+
+    # Sort alphabetically and remove empty strings
+    sorted_tags = sorted([tag for tag in all_tags if tag])
+
+    # Write to config/trends_keywords.txt
+    config_dir = Path(__file__).resolve().parents[3] / 'config'
+    config_dir.mkdir(parents=True, exist_ok=True)
+    keywords_file = config_dir / 'trends_keywords.txt'
+
+    with open(keywords_file, 'w', encoding='utf-8') as f:
+        for tag in sorted_tags:
+            f.write(f"{tag}\n")
+
+    logger.info(
+        f'Generated {len(sorted_tags):,} unique recipe tags from {len(recipes):,} recipes. '
+        f'Keywords written to {keywords_file}'
+    )
+
+    return pd.DataFrame({'keyword': sorted_tags})

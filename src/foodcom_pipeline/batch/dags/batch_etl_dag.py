@@ -1,54 +1,53 @@
 """
-foodcom_dag.py
---------------
-Airflow DAG for the Food.com batch pipeline (Lambda Architecture batch layer).
+batch_etl_dag.py
+================
+Airflow DAG orchestrating the Food.com batch ETL pipeline.
 
-Pipeline stages:
-  1. extract_recipes + extract_interactions  [PARALLEL]
-  2. check_has_new_data                      [SHORT CIRCUIT]
-  3. clean                                   [SEQUENTIAL]
-  4. run_vader_sentiment                     [SEQUENTIAL]
-  5. features                                [SEQUENTIAL]
-  6. run_kmeans_clustering                   [SEQUENTIAL]
-  7. load_to_star_schema                     [SEQUENTIAL]
-
-Dependency graph:
-
-  extract_recipes      ──┐
-                         ├──► check_has_new_data ──► clean ──► sentiment
-  extract_interactions ──┘
-
-  ──► features ──► cluster ──► load
-
-Rationale for separating features from cluster:
-  - Feature engineering is cheap and can be retried independently of K-Means fitting
-  - User stats (dim_user) are needed by the load step regardless of clustering
-  - Each step has a single, clearly scoped responsibility
+Lambda architecture:
+  - Batch layer: daily full/incremental extract → clean → sentiment analysis → clustering → load
+  - Streaming layer: Kafka events → sentiment → append to recent_interactions (handled separately)
+  - Serving layer: star schema views combining batch fact + recent stream data
 """
 
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator, ShortCircuitOperator
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.operators.python import PythonOperator
 from foodcom_pipeline.batch.extract import (
     ensure_source_data,
-    extract_interactions,
     extract_recipes,
+    extract_interactions,
     extract_usda_nutrients,
+    extract_google_trends,
+    extract_ai_mode,
 )
+from foodcom_pipeline.batch.clean import run_clean
+from foodcom_pipeline.batch.sentiment import run_sentiment
+from foodcom_pipeline.batch.features import run_features
+from foodcom_pipeline.batch.aggregate_user_stats import run_aggregate_user_stats
+from foodcom_pipeline.batch.cluster import run_clustering
+from foodcom_pipeline.batch.load import run_load, load_trends
+from foodcom_pipeline.batch.tag_recipes import (
+    run_tag_recipes,
+    tag_signals,
+    build_recipe_term_index,
+    build_external_recipe_terms,
+)
+from foodcom_pipeline.batch.match import build_recipe_gap_analysis
+from foodcom_pipeline.batch.cluster_terms import build_recipe_term_clusters
+from foodcom_pipeline.batch.dags.tasks.compute_gap import compute_gap_analysis
 
-# ---------------------------------------------------------------------------
-# Default arguments
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
+# DAG Definition
+# ─────────────────────────────────────────────────────────────────────────
 
 default_args = {
-    'owner': 'foodcom-team',
-    'depends_on_past': False,
-    'start_date': datetime(2024, 1, 1),
-    'retries': 2,
+    'owner': 'data-engineering',
+    'retries': 1,
     'retry_delay': timedelta(minutes=5),
     'email_on_failure': False,
+    'start_date': datetime(2025, 1, 1),
+    'execution_timeout': timedelta(hours=8),
 }
 
 # ---------------------------------------------------------------------------
@@ -132,163 +131,227 @@ with DAG(
         '→ feature engineering → K-Means clustering → star schema load'
     ),
     default_args=default_args,
-    schedule_interval='@hourly',
+    description='Food.com batch ETL: extract → clean → sentiment → cluster → load (trends/AI mode run async)',
+    schedule_interval='@daily',
     catchup=False,
-    max_active_runs=1,
-    tags=['foodcom', 'batch', 'lambda'],
-) as dag:
-    task_ensure_source_data = PythonOperator(
-        task_id='ensure_source_data',
-        python_callable=ensure_source_data,
-        doc_md=(
-            'Ensures RAW_recipes.csv, RAW_interactions.csv, and ingr_map.pkl exist. '
-            'If any file is missing, downloads it from Kaggle. '
-            'Handles ZIP extraction fallback for all three files.'
-        ),
-    )
+    tags=['foodcom', 'batch', 'production'],
+)
 
-    # ------------------------------------------------------------------
-    # Stage 1: Extract — PARALLEL
-    # ------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
+# Extract Phase
+# ─────────────────────────────────────────────────────────────────────────
 
-    task_extract_recipes = PythonOperator(
-        task_id='extract_recipes',
-        python_callable=extract_recipes,
-        doc_md='Full extract of RAW_recipes.csv. Stages to parquet.',
-    )
+task_ensure_source_data = PythonOperator(
+    task_id='ensure_source_data',
+    python_callable=ensure_source_data,
+    dag=dag,
+)
 
-    task_extract_interactions = PythonOperator(
-        task_id='extract_interactions',
-        python_callable=extract_interactions,
-        doc_md=(
+task_extract_interactions = PythonOperator(
+    task_id='extract_interactions',
+    python_callable=extract_interactions,
+    doc_md=(
             'Full extract of RAW_interactions.csv on every run (no warehouse watermark). '
             'Pushes `has_new_data` flag to XCom.'
-        ),
-    )
+    ),
+)
+task_extract_recipes = PythonOperator(
+    task_id='extract_recipes',
+    python_callable=extract_recipes,
+    dag=dag,
+)
 
-    task_extract_usda_nutrients = PythonOperator(
-        task_id='extract_usda_nutrients',
-        python_callable=extract_usda_nutrients,
-        doc_md=(
-            'Extracts USDA nutrient ground truth for canonical ingredients from '
-            '`ingr_map.pkl`, writes `usda_nutrients.parquet` to staging. '
-            'Skips recomputation if the parquet already exists unless '
-            '`FOODCOM_USDA_FORCE_REFRESH` is true/1/yes.'
-        ),
-    )
 
-    # ------------------------------------------------------------------
-    # Guard
-    # ------------------------------------------------------------------
+task_extract_usda_nutrients = PythonOperator(
+    task_id='extract_usda_nutrients',
+    python_callable=extract_usda_nutrients,
+    dag=dag,
+)
 
-    task_check_new_data = ShortCircuitOperator(
-        task_id='check_has_new_data',
-        python_callable=check_has_new_data, #remember to uncomment this when you are done testing!
-        ignore_downstream_trigger_rules=False,
-        doc_md='Short-circuits if no new interactions were found.',
-    )
+task_extract_google_trends = PythonOperator(
+    task_id='extract_google_trends',
+    python_callable=extract_google_trends,
+    dag=dag,
+)
 
-    # ------------------------------------------------------------------
-    # Stage 3: Clean
-    # ------------------------------------------------------------------
+task_extract_ai_mode = PythonOperator(
+    task_id='extract_ai_mode',
+    python_callable=extract_ai_mode,
+    dag=dag,
+)
 
-    task_clean = PythonOperator(
-        task_id='clean',
-        python_callable=clean,
-        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
-        doc_md=(
-            'Cleans both recipes and interactions. '
-            '[DATASET] dedup, invalid ratings, date parsing, cook time caps. '
-            '[DEFENSIVE] future dates, rating coercion, review normalization, '
-            'short reviews, bot detection.'
-        ),
-    )
+# ─────────────────────────────────────────────────────────────────────────
+# Clean Phase
+# ─────────────────────────────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Stage 4: Sentiment
-    # ------------------------------------------------------------------
+task_clean = PythonOperator(
+    task_id='clean',
+    python_callable=run_clean,
+    dag=dag,
+)
 
-    task_sentiment = PythonOperator(
-        task_id='run_vader_sentiment',
-        python_callable=run_sentiment,
-        execution_timeout=timedelta(hours=2),
-        doc_md=(
-            'Scores interactions with VADER compound polarity. '
-            'Computes rating_sentiment_gap.'
-        ),
-    )
+# ─────────────────────────────────────────────────────────────────────────
+# Sentiment & Clustering Phase
+# ─────────────────────────────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Stage 5: Aggregate user stats
-    # ------------------------------------------------------------------
+task_sentiment = PythonOperator(
+    task_id='sentiment',
+    python_callable=run_sentiment,
+    dag=dag,
+)
 
-    task_features = PythonOperator(
-        task_id='features',
-        python_callable=run_features,
-        doc_md=(
-            'Computes all derived features before clustering. '
-            'Per-user stats: avg_rating_given, review_count, recipe_diversity, '
-            'avg_sentiment_score, avg_rating_gap, std_rating_given, '
-            'pct_positive_sentiment, active_days. '
-            'Per-recipe Bayesian sentiment_rating (inverse-frequency + shrinkage). '
-            'Ingredient-level features + substitution candidate flags. '
-            'Outputs feed cluster.py and load.py.'
-        ),
-    )
-    task_embed_canonical_ingredients = PythonOperator(
-        task_id='embed_canonical_ingredients',
-        python_callable=run_embed_canonical_ingredients,
-        doc_md=(
-            'Builds hybrid text+nutrition embeddings for canonical ingredients '
-            'from `usda_nutrients.parquet` and stages '
-            '`canonical_ingredient_embeddings.parquet` for substitution scoring.'
-        ),
-    )
+task_features = PythonOperator(
+    task_id='features',
+    python_callable=run_features,
+    doc_md=(
+        'Computes all derived features before clustering. '
+        'Per-user stats: avg_rating_given, review_count, recipe_diversity, '
+        'avg_sentiment_score, avg_rating_gap, std_rating_given, '
+        'pct_positive_sentiment, active_days. '
+        'Per-recipe Bayesian sentiment_rating (inverse-frequency + shrinkage). '
+        'Ingredient-level features + substitution candidate flags. '
+        'Outputs feed cluster.py and load.py.'
+    ),
+)
+task_embed_canonical_ingredients = PythonOperator(
+    task_id='embed_canonical_ingredients',
+    python_callable=run_embed_canonical_ingredients,
+    doc_md=(
+        'Builds hybrid text+nutrition embeddings for canonical ingredients '
+        'from `usda_nutrients.parquet` and stages '
+        '`canonical_ingredient_embeddings.parquet` for substitution scoring.'
+    ),
+)
 
-    # ------------------------------------------------------------------
-    # Stage 6: Clustering
-    # ------------------------------------------------------------------
+task_aggregate_user_stats = PythonOperator(
+    task_id='aggregate_user_stats',
+    python_callable=run_aggregate_user_stats,
+    dag=dag,
+)
 
-    task_cluster = PythonOperator(
-        task_id='run_kmeans_clustering',
-        python_callable=run_clustering,
-        doc_md=(
-            'Fits K-Means on per-user ingredient category rating features. '
-            'Selects optimal k in [4,5,6] by highest silhouette score on first run. '
-            'Assigns labels (Indulgent Baker, International Explorer, '
-            'Protein-Forward Cook, Health-Conscious Cook, Quick & Simple). '
-            'Produces per-cluster profile statistics.'
-        ),
-    )
+task_cluster = PythonOperator(
+    task_id='cluster',
+    python_callable=run_clustering,
+    dag=dag,
+)
 
-    # ------------------------------------------------------------------
-    # Stage 7: Load
-    # ------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────
+# Load Phase
+# ─────────────────────────────────────────────────────────────────────────
 
-    task_load = PythonOperator(
-        task_id='load_to_star_schema',
-        python_callable=load,
-        doc_md='Upserts cleaned, scored, clustered data into the star schema.',
-    )
+task_load = PythonOperator(
+    task_id='load',
+    python_callable=run_load,
+    dag=dag,
+)
 
-    # ------------------------------------------------------------------
-    # Dependency graph
-    # ------------------------------------------------------------------
+task_load_trends = PythonOperator(
+    task_id='load_trends',
+    python_callable=load_trends,
+    dag=dag,
+)
 
-    task_ensure_source_data >> [
-        task_extract_recipes,
-        task_extract_interactions,
-        task_extract_usda_nutrients,
-    ]
+task_tag_recipes = PythonOperator(
+    task_id='tag_recipes',
+    python_callable=run_tag_recipes,
+    dag=dag,
+)
 
-    [task_extract_recipes, task_extract_interactions] >> task_check_new_data
+task_tag_signals = PythonOperator(
+    task_id='tag_signals',
+    python_callable=tag_signals,
+    dag=dag,
+)
 
-    # clean waits for: recipes extract + USDA extract + guard True (ShortCircuit success)
-    
-    task_extract_usda_nutrients >> task_clean
-    task_check_new_data >> task_clean
+task_compute_gap = PythonOperator(
+    task_id='compute_gap_analysis',
+    python_callable=compute_gap_analysis,
+    dag=dag,
+)
 
-    task_clean >> task_sentiment
-    task_extract_usda_nutrients >> task_embed_canonical_ingredients
-    [task_sentiment, task_embed_canonical_ingredients] >> task_features
-    task_features >> task_cluster >> task_load
+    # task_clean >> task_sentiment
+    # task_extract_usda_nutrients >> task_embed_canonical_ingredients
+    # [task_sentiment, task_embed_canonical_ingredients] >> task_features
+    # task_features >> task_cluster >> task_load
+task_build_recipe_term_index = PythonOperator(
+    task_id='build_recipe_term_index',
+    python_callable=build_recipe_term_index,
+    dag=dag,
+)
+
+task_build_external_recipe_terms = PythonOperator(
+    task_id='build_external_recipe_terms',
+    python_callable=build_external_recipe_terms,
+    dag=dag,
+)
+
+task_build_recipe_gap_analysis = PythonOperator(
+    task_id='build_recipe_gap_analysis',
+    python_callable=build_recipe_gap_analysis,
+    dag=dag,
+)
+
+task_build_recipe_term_clusters = PythonOperator(
+    task_id='build_recipe_term_clusters',
+    python_callable=build_recipe_term_clusters,
+    dag=dag,
+)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Task Dependencies
+# ─────────────────────────────────────────────────────────────────────────
+
+# Extract phase: ensure source data first, then independent extracts run in parallel
+task_ensure_source_data >> [
+    task_extract_recipes,
+    task_extract_interactions,
+    task_extract_usda_nutrients,
+    task_extract_google_trends,
+]
+
+# Trends + AI Mode branch: runs fully async alongside the main pipeline
+[task_extract_recipes, task_extract_google_trends] >> task_extract_ai_mode
+
+# load_trends runs after both extracts so all 5 tables are populated together
+[task_extract_google_trends, task_extract_ai_mode] >> task_load_trends
+
+# tag_signals runs after load_trends so both staging files are guaranteed to exist
+task_load_trends >> task_tag_signals
+
+# External terms normalization depends on tag_signals (which guarantees both
+# ai_mode_term_scores.parquet and signal_tags.parquet are ready)
+task_tag_signals >> task_build_external_recipe_terms
+
+# Clean phase: depends only on the core extracts; unblocked by trends/AI mode
+[
+    task_extract_recipes,
+    task_extract_interactions,
+    task_extract_usda_nutrients,
+] >> task_clean
+
+# Tagging runs in parallel with sentiment after clean
+task_clean >> [task_sentiment, task_tag_recipes]
+
+# Gap analysis needs both recipe tags and AI Mode demand signal
+task_tag_recipes >> task_compute_gap
+
+# Term index aggregates tags back to recipe level; runs after tagging
+task_tag_recipes >> task_build_recipe_term_index
+
+# Gap analysis needs both the external terms and the recipe term index
+[task_build_recipe_term_index, task_build_external_recipe_terms] >> task_build_recipe_gap_analysis
+
+# Clustering runs after gap analysis so it can enrich from gap scores
+task_build_recipe_gap_analysis >> task_build_recipe_term_clusters
+
+# Feature engineering reads sentiment output, so it must run after sentiment
+task_sentiment >> task_features
+
+# Aggregation reads sentiment output, so it must run after sentiment
+task_sentiment >> task_aggregate_user_stats
+
+# Clustering depends on both features and aggregation
+[task_features, task_aggregate_user_stats] >> task_cluster
+
+# Load phase: depends on sentiment and cluster
+[task_sentiment, task_cluster] >> task_load

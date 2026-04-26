@@ -1,273 +1,195 @@
 """
 Core Implementation of Google Trends Extraction
 
-Contains: extract_google_trends() function
-Calls: Google Trends API via pytrends library
-Reads: trends_keywords.txt for keyword list
-Purpose: Actual data extraction logic with rate limiting and error handling
+Contains: extract_google_trends(), fetch_related_queries(), batch_normalise()
+Calls: Google Trends API via SerpAPI
+Seeds: hardcoded as SEEDS = ['recipe', 'recipes']
 """
 
-import time
+import logging
 import os
+import re
+from datetime import date
 
 import pandas as pd
-from pytrends.request import TrendReq
+import serpapi
+
+logger = logging.getLogger(__name__)
+
+SEEDS: list[str] = ["recipe", "recipes"]
+
+_SEED_PATTERN = re.compile(r"\brecipes?\b", re.IGNORECASE)
 
 
-def extract_google_trends(
-    keywords_file=None,
-    batch_size=4,  # Reduced to 4 to accommodate anchor keyword
-    sleep_time=30,  # Increased default for backoff-only mode (no proxies)
-    timeframe="today 5-y",
-    geo="",
-    use_proxies=False,
-    proxies=None,
-):
+def _search(**params) -> dict:
+    """Execute a SerpAPI Google Trends search."""
+    client = serpapi.Client(api_key=os.environ["SERPAPI_KEY"])
+    return client.search(params).as_dict()
+
+
+def _validate_related_query(query: str) -> bool:
+    """Return True only if the query contains 'recipe' or 'recipes'."""
+    return bool(_SEED_PATTERN.search(query))
+
+
+def extract_google_trends(timeframe: str = "today 5-y", geo: str = "") -> pd.DataFrame:
     """
-    Extract Google Trends data for a list of keywords with cross-batch normalization.
-
-    Uses 'pasta' as anchor keyword in every batch for cross-batch comparability.
-    Interest scores are scaled so 'pasta' maintains consistent reference value.
-    
-    Includes exponential backoff for 429 rate-limit errors (default, no proxies needed).
-    Optionally supports proxy rotation for faster extraction when proxies available.
-
-    Args:
-        keywords_file: Path to file containing keywords (one per line).
-                      If None, uses config/trends_keywords.txt relative to project root.
-        batch_size: Number of keywords to query per batch (excluding anchor, Google rate limits)
-        sleep_time: Base seconds to sleep between batches (default 30s for backoff-only mode)
-                   Reduce to 5-10s if using paid proxies (use_proxies=True with proxies parameter)
-        timeframe: Trends timeframe (e.g., 'today 5-y' for 5 years)
-        geo: Geographic region (empty for global)
-        use_proxies: If True, use provided proxies for faster extraction (requires proxies parameter)
-        proxies: List of proxy URLs (e.g., ['https://proxy1.com:8080', 'https://proxy2.com:8080'])
-                Only used if use_proxies=True. If None, runs without proxies using exponential backoff.
+    Extract Google Trends interest-over-time and related queries for SEEDS via SerpAPI.
 
     Returns:
         DataFrame with columns: keyword, date, interest_score, geo, related_queries
-        
-    Note:
-        DEFAULT (use_proxies=False): Slower but reliable extraction using exponential backoff.
-        - Extraction time: ~5-8 minutes for 30 keywords
-        - No external dependencies needed
-        - Success rate: 95%+
-        
-        WITH PROXIES (use_proxies=True): Faster extraction, requires working proxy service.
-        - Extraction time: ~1-3 minutes for 30 keywords  
-        - Requires paid proxy service like ScraperAPI or Bright Data ($5-50/month)
-        - Success rate: 99%+
-        
-        If hitting rate limits with default mode, try increasing sleep_time to 45-60s.
     """
-    # Load keywords from file
-    if keywords_file is None:
-        # Find config relative to this file's parent directory (src/foodcom_pipeline/extraction)
-        config_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "..", "config", "trends_keywords.txt"
+    q = ", ".join(SEEDS)
+
+    results = _search(
+        engine="google_trends",
+        q=q,
+        date=timeframe,
+        tz="360",
+        geo=geo,
+        data_type="TIMESERIES",
+    )
+
+    timeline = _parse_timeline(results, SEEDS)
+
+    if timeline.empty:
+        raise RuntimeError("Empty TIMESERIES response from Google Trends.")
+
+    # Monthly resample
+    timeline = (
+        timeline.set_index("date")
+        .groupby("keyword")
+        .resample("ME")["interest_score"]
+        .mean()
+        .round()
+        .reset_index()
+    )
+
+    # RELATED_QUERIES only accepts a single keyword — fetch each seed separately.
+    related_queries: dict = {}
+    for kw in SEEDS:
+        rq_result = _search(
+            engine="google_trends",
+            q=kw,
+            date=timeframe,
+            tz="360",
+            geo=geo,
+            data_type="RELATED_QUERIES",
         )
-        keywords_file = config_path
+        kw_rq = rq_result.get("related_queries", {})
+        related_queries[kw] = kw_rq.get(kw) or kw_rq
 
-    keywords_path = keywords_file
-    if not os.path.exists(keywords_path):
-        raise FileNotFoundError("Keywords file not found: {}".format(keywords_file))
+    rows = []
+    for kw in SEEDS:
+        kw_data = timeline[timeline["keyword"] == kw].copy()
+        kw_data["geo"] = geo if geo else "global"
 
-    with open(keywords_path, "r", encoding="utf-8") as f:
-        keywords = [
-            line.strip()
-            for line in f
-            if line.strip() and not line.startswith("#")
+        kw_rq = related_queries.get(kw) or {}
+        rising = [
+            r["query"]
+            for r in (kw_rq.get("rising") or [])[:5]
+            if _validate_related_query(r.get("query", ""))
         ]
+        kw_data["related_queries"] = [rising] * len(kw_data)
 
-    if not keywords:
-        raise ValueError("No keywords found in file")
+        rows.append(kw_data)
 
-    # Ensure 'pasta' is in the keywords list (anchor for cross-batch normalization)
-    if "pasta" not in keywords:
-        keywords.insert(0, "pasta")
+    result_df = pd.concat(rows, ignore_index=True)
+    result_df["date"] = pd.to_datetime(result_df["date"])
 
-    # Separate anchor keyword from others
-    anchor_keyword = "pasta"
-    other_keywords = [kw for kw in keywords if kw != anchor_keyword]
+    return result_df.sort_values(["keyword", "date"]).reset_index(drop=True)
 
-    if len(other_keywords) < batch_size:
-        raise ValueError("Need at least {} non-anchor keywords for batching".format(batch_size))
 
-    # Create batches: each batch contains anchor + batch_size other keywords
-    batches = []
-    for i in range(0, len(other_keywords), batch_size):
-        batch = [anchor_keyword] + other_keywords[i : i + batch_size]
-        batches.append(batch)
+def fetch_related_queries(seeds: list[str], timeframe: str = "today 5-y", geo: str = "") -> pd.DataFrame:
+    """
+    Fetch RELATED_QUERIES for each seed via SerpAPI and return a flat DataFrame.
+    Only rows where related_query contains 'recipe' or 'recipes' are kept.
 
-    print("Created {} batches with anchor keyword '{}'".format(len(batches), anchor_keyword))
+    Columns: seed_query, related_query, query_type (rising|top), raw_value, fetched_date.
+    """
+    fetched_date = date.today()
+    rows: list[dict] = []
 
-    # Initialize pytrends
-    # Default: no proxies, use exponential backoff for rate limiting
-    # Optional: enable proxies if use_proxies=True and proxies provided
-    if use_proxies and proxies:
-        print("Using proxies for faster extraction: {}".format(proxies[:1]))  # Show first proxy
-        pytrends = TrendReq(
-            hl='en-US',
-            tz=360,
-            timeout=(10, 25),
-            proxies=proxies,
-            retries=2,
-            backoff_factor=0.1,
-            requests_args={'verify': False}
+    # RELATED_QUERIES only accepts a single keyword — fetch each seed separately.
+    combined_related: dict = {}
+    for seed in seeds:
+        result = _search(
+            engine="google_trends",
+            q=seed,
+            date=timeframe,
+            tz="360",
+            geo=geo,
+            data_type="RELATED_QUERIES",
         )
-    else:
-        print("Using exponential backoff for rate limiting (no proxies)")
-        pytrends = TrendReq(
-            hl='en-US',
-            tz=360
-        )
+        seed_rq = result.get("related_queries", {})
+        combined_related[seed] = seed_rq.get(seed) or seed_rq
 
-    all_data = []
-    anchor_scores = {}  # Store anchor scores for cross-batch normalization
-    successful_batches = []  # Track which batches succeeded
-
-    # Process batches to handle rate limiting with exponential backoff
-    current_sleep = sleep_time
-    for batch_idx, batch in enumerate(batches):
-        print("Processing batch {}: {}".format(batch_idx + 1, batch))
-
-        max_retries = 3
-        retry_count = 0
-        success = False
-
-        while retry_count < max_retries and not success:
-            try:
-                # Build payload for interest over time (monthly data)
-                pytrends.build_payload(
-                    kw_list=batch, cat=0, timeframe=timeframe, geo=geo, gprop=""
-                )
-
-                # Get interest over time data
-                interest_df = pytrends.interest_over_time()
-
-                if interest_df.empty:
-                    print("  Warning: Empty response for batch {}".format(batch))
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        wait_time = current_sleep * (2 ** retry_count)
-                        print("  Retrying after {} seconds...".format(wait_time))
-                        time.sleep(wait_time)
+    for seed in seeds:
+        seed_rq = combined_related.get(seed) or {}
+        for query_type in ("rising", "top"):
+            for item in seed_rq.get(query_type) or []:
+                query = item.get("query", "")
+                if not _validate_related_query(query):
+                    logger.debug("Dropping unrelated query %r (no recipe/recipes)", query)
                     continue
+                raw_value = item.get("extracted_value") or item.get("value") or 0
+                if isinstance(raw_value, str):
+                    raw_value = 5000 if raw_value.lower() == "breakout" else 0
+                rows.append({
+                    "seed_query": seed,
+                    "related_query": query,
+                    "query_type": query_type,
+                    "raw_value": int(raw_value),
+                    "fetched_date": fetched_date,
+                })
 
-                # Resample to monthly data if needed
-                # Google Trends returns weekly data, resample to monthly
-                interest_df = interest_df.resample('ME').mean().round().reset_index()
+    if not rows:
+        return pd.DataFrame(
+            columns=["seed_query", "related_query", "query_type", "raw_value", "fetched_date"]
+        )
 
-                # Get related queries
-                related_queries = pytrends.related_queries()
-
-                # Store anchor score for this batch
-                if anchor_keyword in interest_df.columns:
-                    anchor_score = interest_df[anchor_keyword].max()
-                    if anchor_score and anchor_score > 0:
-                        anchor_scores[batch_idx] = anchor_score
-
-                # Process each keyword in the batch
-                for kw in batch:
-                    if kw in interest_df.columns:
-                        # Extract data for this keyword (include date column)
-                        cols_to_include = ["date", kw] if "date" in interest_df.columns else [kw]
-                        kw_data = interest_df[cols_to_include].copy()
-                        
-                        # If date wasn't in columns, reset index to get it
-                        if "date" not in kw_data.columns:
-                            kw_data = kw_data.reset_index()
-                        
-                        kw_data = kw_data.rename(columns={kw: "interest_score"})
-                        kw_data["keyword"] = kw
-                        kw_data["geo"] = geo if geo else "global"
-
-                        # Add related queries (top 5 rising queries)
-                        related_list = []
-                        if (
-                            kw in related_queries
-                            and related_queries[kw] is not None
-                            and "rising" in related_queries[kw]
-                            and related_queries[kw]["rising"] is not None
-                        ):
-                            rising_df = related_queries[kw]["rising"]
-                            related_list = rising_df["query"].head(5).tolist()
-
-                        kw_data["related_queries"] = [related_list] * len(kw_data)
-
-                        all_data.append(kw_data)
-
-                successful_batches.append(batch_idx)
-                success = True
-
-            except Exception as e:
-                error_msg = str(e)
-                if "429" in error_msg:
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        wait_time = current_sleep * (2 ** retry_count)
-                        print("  Rate limited (429). Retrying after {} seconds...".format(wait_time))
-                        time.sleep(wait_time)
-                    else:
-                        print("  Error processing batch {}: {} (max retries exceeded)".format(batch, e))
-                        break
-                else:
-                    print("  Error processing batch {}: {}".format(batch, e))
-                    break
-
-        # Increase base sleep time if we're experiencing rate limits
-        if not success and "429" in str(e):
-            current_sleep = int(current_sleep * 1.5)
-
-        # Sleep between batches to avoid rate limiting
-        if batch_idx < len(batches) - 1 and success:
-            print("  Sleeping {} seconds...".format(current_sleep))
-            time.sleep(current_sleep)
-
-    if not all_data:
-        raise RuntimeError("No data retrieved from Google Trends. Consider increasing sleep_time or reducing batch_size.")
-
-    # Combine all batches
-    result_df = pd.concat(all_data, ignore_index=True)
-
-    # Ensure date column is datetime
-    if "date" in result_df.columns:
-        result_df["date"] = pd.to_datetime(result_df["date"])
-
-    # Implement cross-batch normalization using anchor keyword
-    # Only normalize if we have anchor scores from successful batches
-    if anchor_scores and len(anchor_scores) > 0:
-        # Calculate target anchor score (average of all anchor scores across batches)
-        target_anchor_score = sum(anchor_scores.values()) / len(anchor_scores)
-
-        # Scale each batch's scores so anchor keyword has consistent value
-        normalized_data = []
-        for batch_idx in successful_batches:
-            if batch_idx in anchor_scores:
-                batch_anchor_score = anchor_scores[batch_idx]
-                scale_factor = target_anchor_score / batch_anchor_score if batch_anchor_score > 0 else 1.0
-
-                # Apply scaling to all keywords in this batch
-                batch_keywords = batches[batch_idx]
-                batch_data = result_df[result_df["keyword"].isin(batch_keywords)].copy()
-                batch_data["interest_score"] = (batch_data["interest_score"] * scale_factor).round().astype(int)
-                batch_data["interest_score"] = batch_data["interest_score"].clip(0, 100)  # Ensure 0-100 range
-                normalized_data.append(batch_data)
-
-        if normalized_data:
-            result_df = pd.concat(normalized_data, ignore_index=True)
-
-    # Sort by keyword and date
-    result_df = result_df.sort_values(["keyword", "date"]).reset_index(drop=True)
-
-    return result_df
+    df = pd.DataFrame(rows)
+    logger.info(
+        "fetch_related_queries: kept %d rows (all contain 'recipe'/'recipes')", len(df)
+    )
+    return df
 
 
-def load_keywords_from_file(file_path):
-    """Load keywords from a text file."""
-    with open(file_path, "r") as f:
-        return [
-            line.strip()
-            for line in f
-            if line.strip() and not line.startswith("#")
-        ]
+def batch_normalise(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Z-score normalise raw_value within each (seed_query, query_type) group
+    and return the full DataFrame with an added normalised_score column.
+    """
+    if raw_df.empty:
+        return raw_df.assign(normalised_score=pd.Series(dtype=float))
+
+    def _zscore(series: pd.Series) -> pd.Series:
+        std = series.std()
+        if pd.isna(std) or std == 0:
+            return pd.Series(0.0, index=series.index)
+        return ((series - series.mean()) / std).round(6)
+
+    df = raw_df.copy()
+    df["normalised_score"] = (
+        df.groupby(["seed_query", "query_type"])["raw_value"]
+        .transform(_zscore)
+    )
+    return df
+
+
+def _parse_timeline(results: dict, keywords: list[str]) -> pd.DataFrame:
+    """Converts a SerpAPI TIMESERIES response into a long-form DataFrame."""
+    iot = results.get("interest_over_time", {})
+    timeline = iot.get("timeline_data", []) if isinstance(iot, dict) else iot
+    rows = []
+    for point in timeline:
+        ts = pd.to_datetime(int(point["timestamp"]), unit="s")
+        for val in point.get("values", []):
+            query = val.get("query", "")
+            if query in keywords:
+                rows.append({
+                    "date": ts,
+                    "keyword": query,
+                    "interest_score": val.get("extracted_value", 0),
+                })
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["date", "keyword", "interest_score"])

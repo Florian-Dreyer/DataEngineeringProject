@@ -17,7 +17,11 @@ Cleaning steps are divided into two categories:
 
 import ast
 import logging
+import os
+import pickle
 import re
+import sys
+import types
 from typing import Any
 
 import pandas as pd
@@ -27,6 +31,7 @@ from foodcom_pipeline.batch.extract import (
     RECIPES_STAGING,
     STAGING_DIR,
     USDA_NUTRIENTS_STAGING,
+    atomic_parquet,
     _load_ingr_map,
 )
 
@@ -59,6 +64,18 @@ MAX_RECIPE_NAME_LENGTH = 200
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _atomic_parquet(df: pd.DataFrame, dest) -> None:
+    """Write df to a .tmp file then rename, avoiding EDEADLK on macOS bind mounts."""
+    tmp = str(dest) + '.tmp'
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, dest)
+
+
+# ---------------------------------------------------------------------------
 # Entry point called by Airflow
 # ---------------------------------------------------------------------------
 
@@ -72,6 +89,13 @@ def run_clean(**context) -> None:
 
     recipes_df = pd.read_parquet(RECIPES_STAGING)
     interactions_df = pd.read_parquet(INTERACTIONS_STAGING)
+
+    if interactions_df.empty and INTERACTIONS_CLEAN.exists():
+        logger.info(
+            'Interactions staging is empty (no new data since last run) and '
+            'clean file already exists — skipping interactions clean to preserve existing output.'
+        )
+        interactions_df = None
 
     ingr_map: dict[str, str] | None = None
     if INGR_MAP_PKL.exists():
@@ -93,17 +117,20 @@ def run_clean(**context) -> None:
             logger.warning(f'Could not load {USDA_NUTRIENTS_STAGING}: {e}')
 
     recipes_clean = clean_recipes(recipes_df, ingr_map=ingr_map, usda_nutrients=usda_nutrients)
-    interactions_clean = clean_interactions(interactions_df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    recipes_clean.to_parquet(RECIPES_CLEAN, index=False)
-    interactions_clean.to_parquet(INTERACTIONS_CLEAN, index=False)
+    _atomic_parquet(recipes_clean, RECIPES_CLEAN)
+
+    if interactions_df is not None:
+        interactions_clean = clean_interactions(interactions_df)
+        _atomic_parquet(interactions_clean, INTERACTIONS_CLEAN)
+    else:
+        interactions_clean = pd.read_parquet(INTERACTIONS_CLEAN)
+        logger.info('Interactions clean preserved from previous run (%d rows).', len(interactions_clean))
 
     logger.info('Clean step complete.')
     logger.info(f'  Recipes    : {len(recipes_df):,} → {len(recipes_clean):,} rows')
-    logger.info(
-        f'  Interactions: {len(interactions_df):,} → {len(interactions_clean):,} rows'
-    )
+    logger.info(f'  Interactions: {len(interactions_clean):,} rows')
 
     context['ti'].xcom_push(key='recipes_clean_count', value=len(recipes_clean))
     context['ti'].xcom_push(
@@ -327,19 +354,26 @@ def _flag_suspected_bots(df: pd.DataFrame) -> pd.DataFrame:
 
     Adds a boolean column `suspected_bot` rather than immediately dropping,
     so the decision can be changed without modifying this function.
+    
+    Optimized for large datasets by using value_counts on date string.
     """
-    reviews_per_user_per_day = (
-        df.groupby(['user_id', df['date'].dt.date])
+    # Avoid creating large groupby intermediate for bot detection
+    # Instead, use a more memory-efficient approach
+    df['_date_str'] = df['date'].dt.strftime('%Y-%m-%d')
+    
+    user_date_counts = (
+        df.groupby(['user_id', '_date_str'])
         .size()
         .reset_index(name='daily_review_count')
     )
 
-    bot_users = reviews_per_user_per_day.loc[
-        reviews_per_user_per_day['daily_review_count'] > MAX_REVIEWS_PER_USER_PER_DAY,
+    bot_users = user_date_counts.loc[
+        user_date_counts['daily_review_count'] > MAX_REVIEWS_PER_USER_PER_DAY,
         'user_id',
     ].unique()
 
     df['suspected_bot'] = df['user_id'].isin(bot_users)
+    df = df.drop(columns=['_date_str'])
 
     if len(bot_users) > 0:
         logger.warning(
@@ -448,63 +482,6 @@ def _parse_nutrition(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _load_ingr_map(path) -> dict[str, str]:
-    def _pickle_load_with_pandas_shim(fh):
-        try:
-            return pickle.load(fh)
-        except ModuleNotFoundError as e:
-            if "pandas.core.indexes.numeric" not in str(e):
-                raise
-            import pandas as _pd
-
-            shim = types.ModuleType("pandas.core.indexes.numeric")
-            for cls_name in [
-                "Int64Index",
-                "UInt64Index",
-                "Float64Index",
-                "NumericIndex",
-            ]:
-                setattr(shim, cls_name, _pd.Index)
-            sys.modules["pandas.core.indexes.numeric"] = shim
-            fh.seek(0)
-            return pickle.load(fh)
-
-    with path.open('rb') as f:
-        obj: Any = _pickle_load_with_pandas_shim(f)
-
-    if isinstance(obj, dict):
-        out: dict[str, str] = {}
-        for k, v in obj.items():
-            if v is None:
-                continue
-            out[str(k).strip().lower()] = str(v).strip().lower()
-        return out
-
-    # Kaggle's ingr_map.pkl is often a DataFrame with raw ingredient variants
-    # mapped to a canonical replacement string (usually in "replaced").
-    if isinstance(obj, pd.DataFrame):
-        cols = {c.lower(): c for c in obj.columns}
-        raw_col = cols.get('raw_ingr') or cols.get('raw_ingredient') or cols.get('raw')
-        canon_col = (
-            cols.get('replaced') or cols.get('canonical') or cols.get('canonical_form')
-        )
-
-        if raw_col and canon_col:
-            out: dict[str, str] = {}
-            for _, row in obj.iterrows():
-                raw = row.get(raw_col)
-                canon = row.get(canon_col)
-                if pd.notnull(raw) and pd.notnull(canon):
-                    out[str(raw).strip().lower()] = str(canon).strip().lower()
-            if out:
-                return out
-
-        raise TypeError(
-            'Unsupported ingr_map.pkl DataFrame shape. '
-            f'Columns found: {list(obj.columns)}'
-        )
-
-    raise TypeError(f'Unsupported ingr_map.pkl structure: {type(obj)!r}')
 
 
 def _normalize_ingredients(

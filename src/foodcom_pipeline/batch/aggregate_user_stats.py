@@ -26,7 +26,7 @@ Output columns (one row per user_id):
 import logging
 
 import pandas as pd
-from foodcom_pipeline.batch.extract import STAGING_DIR
+from foodcom_pipeline.batch.extract import STAGING_DIR, atomic_parquet
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ def run_aggregate_user_stats(**context) -> None:
     user_stats = _compute_user_stats(interactions)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    user_stats.to_parquet(USER_STATS_STAGING, index=False)
+    atomic_parquet(user_stats, USER_STATS_STAGING)
 
     logger.info(
         f'User stats aggregation complete. '

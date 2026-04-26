@@ -38,10 +38,18 @@ from foodcom_pipeline.batch.clean import (
     load_cleaned_recipes,
 )
 from foodcom_pipeline.batch.cluster import load_user_clusters
-from foodcom_pipeline.batch.extract import USDA_NUTRIENTS_STAGING
+
 from foodcom_pipeline.batch.features import (
     load_recipe_sentiment_ratings,
     load_substitution_engine,
+)
+from foodcom_pipeline.batch.extract import (
+    STAGING_DIR,
+    TRENDS_RAW_STAGING,
+    TRENDS_NORMALISED_STAGING,
+    AI_MODE_RAW_STAGING,
+    AI_MODE_TERM_SCORES_STAGING,
+    USDA_NUTRIENTS_STAGING,
 )
 from foodcom_pipeline.batch.sentiment import load_sentiment_interactions
 from sqlalchemy import create_engine, text
@@ -926,3 +934,215 @@ def _log_row_counts(engine) -> None:
                 logger.info(f'  {table:<25}: {n:>10,}')
             except Exception as e:
                 logger.warning(f'  {table:<25}: could not query ({e})')
+
+
+# ---------------------------------------------------------------------------
+# Trends metadata — tracks when each seed query was last fetched so the
+# extract_google_trends task can skip fetches that are still fresh.
+# Metadata is stored in PostgreSQL to avoid file-locking issues (EDEADLK / errno 35)
+# on Docker bind-mount volumes.  is_trends_stale() already queries google_trends_raw
+# directly, so save_trends_metadata only needs to touch the DB.
+# ---------------------------------------------------------------------------
+
+_STALENESS_DAYS = 7
+
+_ENSURE_METADATA_DDL = """
+CREATE TABLE IF NOT EXISTS pipeline_metadata (
+    key          TEXT PRIMARY KEY,
+    fetched_date DATE NOT NULL
+)
+"""
+
+
+def _metadata_engine():
+    return create_engine(POSTGRES_CONN)
+
+
+def _ensure_metadata_table(conn) -> None:
+    conn.execute(text(_ENSURE_METADATA_DDL))
+
+
+def _days_since(last_fetched) -> int:
+    if hasattr(last_fetched, 'date'):
+        last_fetched = last_fetched.date()
+    elif isinstance(last_fetched, str):
+        last_fetched = date.fromisoformat(last_fetched)
+    return (date.today() - last_fetched).days
+
+
+def is_trends_stale(seed_query: str) -> bool:
+    """Returns True if google_trends_raw has no rows for *seed_query* or data is older than 7 days."""
+    try:
+        engine = _metadata_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    "SELECT MAX(fetched_date) FROM google_trends_raw "
+                    "WHERE seed_query = :seed"
+                ),
+                {"seed": seed_query},
+            ).scalar()
+        if result is None:
+            return True
+        return _days_since(result) > _STALENESS_DAYS
+    except Exception:
+        return True
+
+
+def is_ai_mode_stale() -> bool:
+    """Returns True if AI Mode data is missing, older than 7 days, or absent from the DB."""
+    try:
+        engine = _metadata_engine()
+        with engine.connect() as conn:
+            _ensure_metadata_table(conn)
+            row = conn.execute(
+                text("SELECT fetched_date FROM pipeline_metadata WHERE key = 'ai_mode'")
+            ).fetchone()
+        if row is None or _days_since(row[0]) > _STALENESS_DAYS:
+            return True
+        # Confirm data actually landed
+        with engine.connect() as conn:
+            count = conn.execute(text("SELECT COUNT(*) FROM ai_mode_raw")).scalar()
+        return not count
+    except Exception:
+        return True
+
+
+def save_trends_metadata(seed_query: str, fetched_date: date) -> None:
+    """Records the date of the last successful Trends fetch for *seed_query*."""
+    try:
+        engine = _metadata_engine()
+        with engine.begin() as conn:
+            _ensure_metadata_table(conn)
+            conn.execute(
+                text("""
+                    INSERT INTO pipeline_metadata (key, fetched_date)
+                    VALUES (:key, :fetched_date)
+                    ON CONFLICT (key) DO UPDATE SET fetched_date = EXCLUDED.fetched_date
+                """),
+                {"key": f"trends:{seed_query}", "fetched_date": fetched_date},
+            )
+        logger.info('trends_metadata updated: %s → %s', seed_query, fetched_date)
+    except Exception as exc:
+        logger.warning('Could not save trends metadata: %s', exc)
+
+
+def save_ai_mode_metadata(fetched_date: date) -> None:
+    """Records the date of the last successful AI Mode fetch."""
+    try:
+        engine = _metadata_engine()
+        with engine.begin() as conn:
+            _ensure_metadata_table(conn)
+            conn.execute(
+                text("""
+                    INSERT INTO pipeline_metadata (key, fetched_date)
+                    VALUES ('ai_mode', :fetched_date)
+                    ON CONFLICT (key) DO UPDATE SET fetched_date = EXCLUDED.fetched_date
+                """),
+                {"fetched_date": fetched_date},
+            )
+        logger.info('ai_mode_metadata updated: %s', fetched_date)
+    except Exception as exc:
+        logger.warning('Could not save ai_mode metadata: %s', exc)
+
+
+# ---------------------------------------------------------------------------
+# Trends + AI Mode load — pushes all signal staging files into Postgres
+# ---------------------------------------------------------------------------
+
+
+def load_trends(**context) -> None:
+    """
+    Loads all Google Trends and AI Mode staging parquet files into Postgres.
+    Creates tables on first run; subsequent runs upsert.
+
+    Tables:
+      google_trends_raw         — raw related-query scores per seed
+      google_trends_normalised  — z-score normalised related-query scores
+      ai_mode_raw               — raw text blocks from Google AI Mode
+      ai_mode_term_scores       — term frequency + normalised scores
+    """
+    engine = create_engine(POSTGRES_CONN)
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS google_trends_raw (
+                seed_query    TEXT    NOT NULL,
+                related_query TEXT    NOT NULL,
+                query_type    TEXT    NOT NULL,
+                fetched_date  DATE    NOT NULL,
+                raw_value     INTEGER NOT NULL,
+                PRIMARY KEY (seed_query, related_query, query_type, fetched_date)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS google_trends_normalised (
+                seed_query       TEXT             NOT NULL,
+                related_query    TEXT             NOT NULL,
+                query_type       TEXT             NOT NULL,
+                fetched_date     DATE             NOT NULL,
+                raw_value        INTEGER          NOT NULL,
+                normalised_score DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (seed_query, related_query, query_type, fetched_date)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ai_mode_raw (
+                seed_query   TEXT    NOT NULL,
+                block_index  INTEGER NOT NULL,
+                body         TEXT    NOT NULL,
+                fetched_date DATE    NOT NULL,
+                PRIMARY KEY (seed_query, block_index, fetched_date)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ai_mode_term_scores (
+                term             TEXT             NOT NULL,
+                raw_frequency    INTEGER          NOT NULL,
+                normalised_score DOUBLE PRECISION NOT NULL,
+                fetched_date     DATE             NOT NULL,
+                PRIMARY KEY (term, fetched_date)
+            )
+        """))
+
+    _load_staging_table(
+        engine, TRENDS_RAW_STAGING, 'google_trends_raw',
+        cols='seed_query, related_query, query_type, fetched_date, raw_value',
+        conflict='(seed_query, related_query, query_type, fetched_date)',
+        update='raw_value = EXCLUDED.raw_value',
+    )
+    _load_staging_table(
+        engine, TRENDS_NORMALISED_STAGING, 'google_trends_normalised',
+        cols='seed_query, related_query, query_type, fetched_date, raw_value, normalised_score',
+        conflict='(seed_query, related_query, query_type, fetched_date)',
+        update='raw_value = EXCLUDED.raw_value, normalised_score = EXCLUDED.normalised_score',
+    )
+    _load_staging_table(
+        engine, AI_MODE_RAW_STAGING, 'ai_mode_raw',
+        cols='seed_query, block_index, body, fetched_date',
+        conflict='(seed_query, block_index, fetched_date)',
+        update='body = EXCLUDED.body',
+    )
+    _load_staging_table(
+        engine, AI_MODE_TERM_SCORES_STAGING, 'ai_mode_term_scores',
+        cols='term, raw_frequency, normalised_score, fetched_date',
+        conflict='(term, fetched_date)',
+        update='raw_frequency = EXCLUDED.raw_frequency, normalised_score = EXCLUDED.normalised_score',
+    )
+
+
+def _load_staging_table(engine, path, table: str, cols: str, conflict: str, update: str) -> None:
+    """Reads a staging parquet file and bulk-upserts it into *table*."""
+    if not path.is_file():
+        logger.warning('Staging file missing for %s — skipping.', table)
+        return
+    df = pd.read_parquet(path)
+    named = ', '.join(f':{c.strip()}' for c in cols.split(','))
+    sql = f"""
+        INSERT INTO {table} ({cols})
+        VALUES ({named})
+        ON CONFLICT {conflict}
+        DO UPDATE SET {update}
+    """
+    _bulk_upsert(engine, df, sql)
+    logger.info('Loaded %d rows into %s', len(df), table)

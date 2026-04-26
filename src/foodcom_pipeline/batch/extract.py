@@ -14,17 +14,30 @@ import logging
 import os
 import re
 import subprocess
+import time
 import zipfile
 from datetime import date
 from pathlib import Path
 import pickle
 import sys
 import types
-from typing import Any
+from typing import Any, Union
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+def atomic_parquet(df: pd.DataFrame, dest: Union[Path, str]) -> None:
+    """Write df to a .tmp file then atomically rename to dest.
+
+    Avoids EDEADLK (errno 35) on macOS Docker bind mounts when concurrent
+    tasks read from the same staging directory during a write.
+    """
+    tmp = str(dest) + '.tmp'
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, dest)
+
 
 # ---------------------------------------------------------------------------
 # Config — in production these come from Airflow Variables or environment vars
@@ -40,6 +53,24 @@ INGR_MAP_PKL = DATA_DIR / 'ingr_map.pkl'
 RECIPES_STAGING = STAGING_DIR / 'recipes_extracted.parquet'
 INTERACTIONS_STAGING = STAGING_DIR / 'interactions_extracted.parquet'
 USDA_NUTRIENTS_STAGING = STAGING_DIR / 'usda_nutrients.parquet'
+TRENDS_RAW_STAGING = STAGING_DIR / 'google_trends_raw.parquet'
+TRENDS_NORMALISED_STAGING = STAGING_DIR / 'google_trends_normalised.parquet'
+AI_MODE_RAW_STAGING = STAGING_DIR / 'ai_mode_raw.parquet'
+AI_MODE_TERM_SCORES_STAGING = STAGING_DIR / 'ai_mode_term_scores.parquet'
+
+from foodcom_pipeline.extraction.trends import SEEDS as _TRENDS_SEEDS
+
+_AI_MODE_SEEDS: list[str] = [
+    'dinner ideas',
+    'lunch ideas',
+    'breakfast ideas',
+    'easy weeknight meals',
+    'healthy meal ideas',
+    'quick recipes',
+    'what to cook tonight',
+    'meal prep ideas',
+    'party food ideas',
+]
 
 # USDA FoodData Central bulk JSON (Foundation, SR Legacy, FNDDS survey)
 _USDA_JSON_SPECS: tuple[tuple[str, str], ...] = (
@@ -167,15 +198,41 @@ def _download_file_from_kaggle(filename: str) -> None:
     ]
 
     logger.info(f'Downloading {filename} from Kaggle...')
+
+    # Clean up any existing partial/corrupted files before downloading
+    base_path = DATA_DIR / filename
+    zip_path = base_path.with_suffix(base_path.suffix + '.zip')
+    for cleanup_path in [base_path, zip_path]:
+        if cleanup_path.exists():
+            logger.info(f'Removing existing file before re-download: {cleanup_path}')
+            cleanup_path.unlink()
+
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
-        raise RuntimeError(
-            f'Kaggle download failed for {filename}.\n'
-            f'STDOUT: {result.stdout}\nSTDERR: {result.stderr}\n'
-            'Ensure Kaggle CLI is installed and credentials are available '
-            '(~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY).'
-        )
+        # Kaggle CLI exits non-zero for size-mismatch warnings even when the
+        # file was written successfully (e.g. after a dataset update the cached
+        # metadata size differs from the actual download).  Accept the result if
+        # the target file (or its .zip counterpart) is present and non-empty.
+        size_mismatch = 'does not match expected size' in result.stdout
+        file_landed = base_path.exists() and base_path.stat().st_size > 0
+        zip_landed = zip_path.exists() and zip_path.stat().st_size > 0
+        if size_mismatch and (file_landed or zip_landed):
+            logger.warning(
+                'Kaggle CLI reported a file-size mismatch for %s but the file '
+                'was downloaded successfully (%d bytes). Treating as success.\n'
+                'STDOUT: %s',
+                filename,
+                (base_path.stat().st_size if file_landed else zip_path.stat().st_size),
+                result.stdout.strip(),
+            )
+        else:
+            raise RuntimeError(
+                f'Kaggle download failed for {filename}.\n'
+                f'STDOUT: {result.stdout}\nSTDERR: {result.stderr}\n'
+                'Ensure Kaggle CLI is installed and credentials are available '
+                '(~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY).'
+            )
 
 
 def _extract_csv_from_zip_if_needed(csv_path: Path) -> None:
@@ -210,36 +267,54 @@ def _extract_csv_from_zip_if_needed(csv_path: Path) -> None:
     )
     for zip_path in zip_paths:
         logger.info(f'Attempting extraction for {csv_path.name} from {zip_path}.')
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            members = zf.namelist()
-            logger.info(f'ZIP member count for {zip_path.name}: {len(members)}')
+        try:
+            zf_handle = zipfile.ZipFile(zip_path, 'r')
+        except zipfile.BadZipFile:
+            logger.warning(
+                'Corrupted ZIP file %s (bad magic number); deleting and skipping.',
+                zip_path,
+            )
+            zip_path.unlink(missing_ok=True)
+            continue
 
-            # Case 1: exact filename present in archive
-            if csv_path.name in members:
-                zf.extract(csv_path.name, path=DATA_DIR)
-                logger.info(f'Extracted {csv_path.name} from {zip_path}.')
-                return
+        try:
+            with zf_handle as zf:
+                members = zf.namelist()
+                logger.info(f'ZIP member count for {zip_path.name}: {len(members)}')
 
-            # Case 2: archive has nested paths; match by basename
-            basename_matches = [
-                m for m in members if Path(m).name.lower() == csv_path.name.lower()
-            ]
-            if basename_matches:
-                member = basename_matches[0]
-                logger.info(
-                    f'Found basename match for {csv_path.name} in {zip_path.name}: {member}'
-                )
-                zf.extract(member, path=DATA_DIR)
-                extracted_path = DATA_DIR / member
-                extracted_path.parent.mkdir(parents=True, exist_ok=True)
-                extracted_path.replace(csv_path)
-                logger.info(
-                    f'Extracted {member} from {zip_path} and renamed to {csv_path.name}.'
-                )
-                return
+                # Case 1: exact filename present in archive
+                if csv_path.name in members:
+                    zf.extract(csv_path.name, path=DATA_DIR)
+                    logger.info(f'Extracted {csv_path.name} from {zip_path}.')
+                    return
 
-    raise FileNotFoundError(
-        f'Could not find {csv_path.name} inside ZIP archives in {DATA_DIR}.'
+                # Case 2: archive has nested paths; match by basename
+                basename_matches = [
+                    m for m in members if Path(m).name.lower() == csv_path.name.lower()
+                ]
+                if basename_matches:
+                    member = basename_matches[0]
+                    logger.info(
+                        f'Found basename match for {csv_path.name} in {zip_path.name}: {member}'
+                    )
+                    zf.extract(member, path=DATA_DIR)
+                    extracted_path = DATA_DIR / member
+                    extracted_path.parent.mkdir(parents=True, exist_ok=True)
+                    extracted_path.replace(csv_path)
+                    logger.info(
+                        f'Extracted {member} from {zip_path} and renamed to {csv_path.name}.'
+                    )
+                    return
+        except zipfile.BadZipFile:
+            logger.warning(
+                'Corrupted ZIP file %s (bad member header); deleting and skipping.',
+                zip_path,
+            )
+            zip_path.unlink(missing_ok=True)
+
+    logger.info(
+        'No ZIP archive in %s contained %s — will proceed to Kaggle download.',
+        DATA_DIR, csv_path.name,
     )
 
 
@@ -257,8 +332,7 @@ def extract_recipes(**context) -> None:
     """
     logger.info(f'Reading recipes from {RECIPES_CSV}')
 
-    df = pd.read_csv(
-        RECIPES_CSV,
+    df = _retry_on_deadlock(pd.read_csv, RECIPES_CSV,
         usecols=['id', 'name', 'minutes', 'tags', 'nutrition', 'steps', 'ingredients'],
         dtype={'id': 'int64'},
     )
@@ -267,7 +341,7 @@ def extract_recipes(**context) -> None:
     _validate_recipes(df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(RECIPES_STAGING, index=False)
+    atomic_parquet(df, RECIPES_STAGING)
 
     logger.info(f'Recipes staged to {RECIPES_STAGING}')
 
@@ -312,8 +386,7 @@ def extract_interactions(**context) -> None:
     """
     logger.info(f'Reading interactions from {INTERACTIONS_CSV}')
 
-    df = pd.read_csv(
-        INTERACTIONS_CSV,
+    df = _retry_on_deadlock(pd.read_csv, INTERACTIONS_CSV,
         usecols=['user_id', 'recipe_id', 'date', 'rating', 'review'],
         dtype={'user_id': 'int64', 'recipe_id': 'int64', 'rating': 'int8'},
         parse_dates=['date'],
@@ -322,20 +395,13 @@ def extract_interactions(**context) -> None:
     logger.info(f'Full interactions extract: {len(df):,} rows')
 
     if df.empty:
-        logger.warning(
-            'RAW_interactions.csv produced zero rows — staging empty parquet for downstream.'
+        # Watermark filtered everything — warehouse is already up to date.
+        # Keep the existing staging file so downstream tasks (clean, sentiment)
+        # continue to work with the data from the last successful run.
+        logger.info(
+            'No new interactions after watermark filter — warehouse is current. '
+            'Preserving existing interactions staging file for downstream tasks.'
         )
-        STAGING_DIR.mkdir(parents=True, exist_ok=True)
-        empty = pd.DataFrame(
-            {
-                'user_id': pd.Series(dtype='int64'),
-                'recipe_id': pd.Series(dtype='int64'),
-                'date': pd.Series(dtype='datetime64[ns]'),
-                'rating': pd.Series(dtype='int8'),
-                'review': pd.Series(dtype='object'),
-            }
-        )
-        empty.to_parquet(INTERACTIONS_STAGING, index=False)
         context['ti'].xcom_push(key='interactions_record_count', value=0)
         context['ti'].xcom_push(key='has_new_data', value=False)
         return
@@ -344,7 +410,7 @@ def extract_interactions(**context) -> None:
     _validate_interactions(df)
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(INTERACTIONS_STAGING, index=False)
+    atomic_parquet(df, INTERACTIONS_STAGING)
 
     logger.info(f'Interactions staged to {INTERACTIONS_STAGING}')
 
@@ -522,8 +588,17 @@ def _load_local_usda_foods(usda_dir: Path) -> list[dict[str, Any]]:
         if not path.is_file():
             logger.warning('USDA JSON file not found, skipping: %s', path)
             continue
-        with path.open(encoding='utf-8') as f:
-            payload = json.load(f)
+        try:
+            # Read fully into memory before parsing to avoid EDEADLK (errno 35)
+            # on Docker volume mounts where streaming large files can deadlock.
+            raw = path.read_bytes()
+            payload = json.loads(raw)
+        except OSError as exc:
+            logger.warning('Could not read %s (%s); skipping.', path, exc)
+            continue
+        except json.JSONDecodeError as exc:
+            logger.warning('Could not parse %s (%s); skipping.', path, exc)
+            continue
         batch = payload.get(top_key) or []
         if not isinstance(batch, list):
             logger.warning(
@@ -531,6 +606,7 @@ def _load_local_usda_foods(usda_dir: Path) -> list[dict[str, Any]]:
             )
             continue
         foods.extend(batch)
+        logger.info('Loaded %d foods from %s', len(batch), filename)
     return foods
 
 
@@ -717,7 +793,7 @@ def extract_usda_nutrients(**context) -> None:
                  **_empty_usda_nutrient_row())
             for ing in canonical_ingredients
         ]
-        pd.DataFrame(empty_rows).to_parquet(USDA_NUTRIENTS_STAGING, index=False)
+        atomic_parquet(pd.DataFrame(empty_rows), USDA_NUTRIENTS_STAGING)
         context['ti'].xcom_push(key='usda_coverage_rate', value=0.0)
         context['ti'].xcom_push(key='usda_rows', value=len(canonical_ingredients))
         context['ti'].xcom_push(key='usda_extract_skipped', value=True)
@@ -746,7 +822,7 @@ def extract_usda_nutrients(**context) -> None:
             logger.info(f'USDA local lookup progress: {i}/{len(canonical_ingredients)}')
 
     usda_df = pd.DataFrame(rows)
-    usda_df.to_parquet(USDA_NUTRIENTS_STAGING, index=False)
+    atomic_parquet(usda_df, USDA_NUTRIENTS_STAGING)
 
     coverage = int(usda_df['calories_per_100g'].notna().sum())
     coverage_rate = coverage / max(1, len(usda_df))
@@ -760,8 +836,134 @@ def extract_usda_nutrients(**context) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Google Trends extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_ai_mode(**context) -> None:
+    """
+    Calls the SerpAPI Google AI Mode engine for each seed in _AI_MODE_SEEDS,
+    scores food/cuisine term frequency from the returned text blocks.
+
+    Writes two staging files:
+      ai_mode_raw.parquet          — one row per text block
+      ai_mode_term_scores.parquet  — term frequencies + normalised scores
+
+    SERPAPI_KEY must be set as an environment variable.
+    """
+    from foodcom_pipeline.batch.load import is_ai_mode_stale, save_ai_mode_metadata
+    from foodcom_pipeline.extraction.ai_mode import (
+        fetch_ai_mode_blocks,
+        score_terms,
+    )
+
+    if not is_ai_mode_stale():
+        logger.info('AI Mode data is fresh, skipping fetch.')
+        return
+
+    api_key = os.environ.get('SERPAPI_KEY')
+    if not api_key:
+        raise RuntimeError('SERPAPI_KEY environment variable not set')
+
+    raw_df = fetch_ai_mode_blocks(_AI_MODE_SEEDS, api_key)
+
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_parquet(raw_df, AI_MODE_RAW_STAGING)
+    logger.info('AI Mode raw blocks staged: %d rows → %s', len(raw_df), AI_MODE_RAW_STAGING)
+
+    if raw_df.empty:
+        logger.warning('No AI Mode blocks returned; term scoring and merge skipped.')
+        return
+
+    term_scores = score_terms(raw_df)
+    atomic_parquet(term_scores, AI_MODE_TERM_SCORES_STAGING)
+    logger.info(
+        'AI Mode term scores staged: %d terms → %s',
+        len(term_scores), AI_MODE_TERM_SCORES_STAGING,
+    )
+
+    save_ai_mode_metadata(date.today())
+
+
+def extract_google_trends(**context) -> None:
+    """
+    Extracts Google Trends related queries for _TRENDS_SEEDS and stages two
+    Parquet files: google_trends_raw.parquet and google_trends_normalised.parquet.
+
+    Skips seeds whose last fetch is within 7 days (checked via trends_metadata.parquet).
+    Imports from load.py are deferred to avoid the circular extract ↔ load import.
+    """
+    # Deferred to avoid circular import: load.py imports STAGING_DIR from extract.py
+    from foodcom_pipeline.batch.load import is_trends_stale, save_trends_metadata
+    from foodcom_pipeline.extraction.trends import fetch_related_queries, batch_normalise
+
+    stale_seeds = [s for s in _TRENDS_SEEDS if is_trends_stale(s)]
+    if not stale_seeds:
+        logger.info('Trends data is fresh, skipping fetch.')
+        return
+
+    raw_df = fetch_related_queries(stale_seeds)
+
+    if raw_df.empty:
+        logger.warning('No trend rows returned; skipping parquet write.')
+        return
+
+    raw_df = _clean_trend_queries(raw_df)
+
+    if raw_df.empty:
+        logger.warning('No food-relevant trend rows after filtering; skipping parquet write.')
+        return
+
+    normalised_df = batch_normalise(raw_df)
+
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_parquet(raw_df, TRENDS_RAW_STAGING)
+    atomic_parquet(normalised_df, TRENDS_NORMALISED_STAGING)
+    logger.info('Trends staged: %d rows → %s', len(raw_df), STAGING_DIR)
+
+    for seed in raw_df['seed_query'].unique():
+        save_trends_metadata(seed, date.today())
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _clean_trend_queries(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip seed-word noise from related_query and drop non-food rows.
+
+    Seeds are 'recipe'/'recipes', so every related query is polluted with
+    those words (e.g. 'chicken recipe', 'easy recipe').  After stripping them,
+    non-food residue like 'easy', 'box', or 'allrecipes' is removed by
+    requiring a match against at least one keyword in TAG_PATTERNS.
+    """
+    import re as _re
+    # Deferred to avoid circular import (tag_recipes → extract)
+    from foodcom_pipeline.batch.tag_recipes import TAG_PATTERNS
+
+    _noise = _re.compile(r'\brecipes?\b', flags=_re.IGNORECASE)
+
+    df = df.copy()
+    df['related_query'] = (
+        df['related_query']
+        .str.replace(_noise, '', regex=True)
+        .str.strip()
+    )
+    df = df[df['related_query'] != '']
+
+    def _is_food(query: str) -> bool:
+        q = query.lower()
+        return any(
+            any(p.search(q) for p in patterns)
+            for patterns in TAG_PATTERNS.values()
+        )
+
+    mask = df['related_query'].apply(_is_food)
+    dropped = (~mask).sum()
+    if dropped:
+        logger.info('Trend query filter: dropped %d non-food rows.', dropped)
+    return df[mask].reset_index(drop=True)
 
 
 def _log_extraction_stats(name: str, df: pd.DataFrame) -> None:
@@ -771,3 +973,23 @@ def _log_extraction_stats(name: str, df: pd.DataFrame) -> None:
     logger.info(f'  Columns    : {list(df.columns)}')
     logger.info(f'  Null counts:\n{df.isnull().sum().to_string()}')
     logger.info(f'  Memory     : {df.memory_usage(deep=True).sum() / 1e6:.1f} MB')
+
+
+def _retry_on_deadlock(func, *args, max_retries=5, **kwargs):
+    """Retry a function if it raises OSError with errno 35 (resource deadlock).
+    
+    Exponential backoff: 1s, 2s, 4s.
+    """
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except OSError as e:
+            if e.errno == 35 and attempt < max_retries - 1:
+                wait_time = (2 ** (attempt + 1))
+                logger.warning(
+                    f'OSError 35 (resource deadlock) on attempt {attempt + 1}/{max_retries}. '
+                    f'Retrying in {wait_time}s...'
+                )
+                time.sleep(wait_time)
+            else:
+                raise
