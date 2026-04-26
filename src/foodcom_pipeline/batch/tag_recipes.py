@@ -1175,7 +1175,7 @@ def _validate_external_terms(df: pd.DataFrame) -> None:
     logger.info("=== external_recipe_terms validation ===")
     logger.info("Row count: %d", len(df))
 
-    by_source = df.groupby("source").size().to_dict()
+    by_source = df.groupby("source", dropna=False).size().to_dict()
     for src, n in sorted(by_source.items()):
         logger.info("  source=%-15s  rows=%d", src, n)
 
@@ -1189,14 +1189,22 @@ def _validate_external_terms(df: pd.DataFrame) -> None:
 
     # Top 20 by source_score
     logger.info("--- top 20 rows by source_score ---")
-    top = df.nlargest(20, "source_score")
+    score_series = pd.to_numeric(df["source_score"], errors="coerce")
+    valid_scores = int(score_series.notna().sum())
+    if valid_scores == 0:
+        logger.info("  no numeric source_score values available")
+        top = df.head(0)
+    else:
+        ranked = df.assign(_source_score_num=score_series)
+        top = ranked.nlargest(20, "_source_score_num")
     for _, row in top.iterrows():
+        score_val = row.get("_source_score_num", row.get("source_score"))
         logger.info(
             "  [%-13s]  raw=%-35s  canonical=%-28s  score=%+.3f",
             row["source"],
             str(row["raw_term"])[:35],
             str(row["canonical_term"])[:28],
-            float(row["source_score"]) if pd.notna(row["source_score"]) else 0.0,
+            float(score_val) if pd.notna(score_val) else 0.0,
         )
 
     # ── Trends filter unit checks ─────────────────────────────────────────

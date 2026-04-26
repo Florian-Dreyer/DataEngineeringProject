@@ -1086,6 +1086,34 @@ def load_app_data(**context) -> None:
                 PRIMARY KEY (source, canonical_term)
             )
         """))
+        # Backward-compatible type hardening for pre-existing deployments.
+        # Older schemas may have narrower integer/numeric types that overflow
+        # during bulk upserts (e.g. recipe ids above SMALLINT range).
+        conn.execute(text("""
+            ALTER TABLE recipe_gap_analysis
+            ALTER COLUMN source_score TYPE DOUBLE PRECISION
+            USING source_score::DOUBLE PRECISION
+        """))
+        conn.execute(text("""
+            ALTER TABLE recipe_gap_analysis
+            ALTER COLUMN best_foodcom_recipe_id TYPE BIGINT
+            USING best_foodcom_recipe_id::BIGINT
+        """))
+        conn.execute(text("""
+            ALTER TABLE recipe_gap_analysis
+            ALTER COLUMN best_foodcom_similarity TYPE DOUBLE PRECISION
+            USING best_foodcom_similarity::DOUBLE PRECISION
+        """))
+        conn.execute(text("""
+            ALTER TABLE recipe_gap_analysis
+            ALTER COLUMN gap_score TYPE DOUBLE PRECISION
+            USING gap_score::DOUBLE PRECISION
+        """))
+        conn.execute(text("""
+            ALTER TABLE recipe_gap_analysis
+            ALTER COLUMN top_gap_rank TYPE INTEGER
+            USING top_gap_rank::INTEGER
+        """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS recipe_term_clusters (
                 cluster_id              INTEGER          NOT NULL,

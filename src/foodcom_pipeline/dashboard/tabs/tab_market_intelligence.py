@@ -137,6 +137,8 @@ ALL_PRESETS = sorted(set(DEFAULT_PRESET_QUERIES + [
 
 def _resolve_staging_dir() -> Path:
     project_root = Path(__file__).resolve().parents[4]
+    local_staging = (project_root / "staging").resolve()
+
     if env_val := os.getenv("FOODCOM_STAGING_DIR"):
         env_path = Path(env_val).expanduser()
         candidates = [env_path]
@@ -145,11 +147,19 @@ def _resolve_staging_dir() -> Path:
         for candidate in candidates:
             if candidate.exists():
                 return candidate
+        # Host Streamlit often runs outside Docker while Airflow writes to a
+        # bind-mounted ./staging; fall back there when env path is container-only.
+        if local_staging.exists():
+            return local_staging
         return candidates[0]
-    candidate = project_root / "staging"
-    if candidate.exists():
-        return candidate
-    return Path("/opt/airflow/staging")
+
+    if local_staging.exists():
+        return local_staging
+
+    opt_staging = Path("/opt/airflow/staging")
+    if opt_staging.exists():
+        return opt_staging
+    return local_staging
 
 
 STAGING_DIR = _resolve_staging_dir()
@@ -1675,6 +1685,39 @@ def _load_airflow_sidebar() -> pd.DataFrame | None:
         return None
 
 
+@st.cache_data(ttl=60)
+def _load_market_table_counts_sidebar() -> dict[str, int]:
+    """Best-effort DB fallback when local parquet staging files are absent."""
+    _pg_user = os.getenv("POSTGRES_USER", "user")
+    _pg_pass = os.getenv("POSTGRES_PASSWORD", "password")
+    _pg_host = os.getenv("POSTGRES_HOST", "localhost")
+    _pg_port = os.getenv("POSTGRES_PORT", "5432")
+    _pg_db = os.getenv("POSTGRES_DB", "foodcom")
+    dsn = f"postgresql://{_pg_user}:{_pg_pass}@{_pg_host}:{_pg_port}/{_pg_db}"
+
+    counts: dict[str, int] = {}
+    table_map = {
+        "recipe_tags": "recipe_tags",
+        "gap_analysis": "recipe_gap_analysis",
+        "term_clusters": "recipe_term_clusters",
+    }
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(dsn, connect_timeout=3)
+        try:
+            with conn.cursor() as cur:
+                for key, table in table_map.items():
+                    cur.execute(f"SELECT COUNT(*) FROM {table}")
+                    row = cur.fetchone()
+                    counts[key] = int(row[0]) if row else 0
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+    return counts
+
+
 def _file_age(path: Path) -> str:
     """Return a compact human-readable age string for a file's mtime."""
     try:
@@ -1725,14 +1768,15 @@ def render_sidebar_pipeline_status() -> None:
 
         # ── Per-file status cards ─────────────────────────────────────────
         _status_files = [
-            ("Recipe Tags",    RECIPE_TAGS_PATH,           "Tag assignments across Food.com recipes"),
-            ("Term Index",     RECIPE_TERM_INDEX_PATH,     "Search index for recipe matching"),
-            ("External Terms", EXTERNAL_RECIPE_TERMS_PATH, "Demand signals from Google AI + Trends"),
-            ("Gap Analysis",   RECIPE_GAP_ANALYSIS_PATH,   "Coverage gap calculations"),
-            ("Term Clusters",  RECIPE_TERM_CLUSTERS_PATH,  "Semantic groupings of demand terms"),
+            ("Recipe Tags",    RECIPE_TAGS_PATH,           "Tag assignments across Food.com recipes", "recipe_tags"),
+            ("Term Index",     RECIPE_TERM_INDEX_PATH,     "Search index for recipe matching", None),
+            ("External Terms", EXTERNAL_RECIPE_TERMS_PATH, "Demand signals from Google AI + Trends", None),
+            ("Gap Analysis",   RECIPE_GAP_ANALYSIS_PATH,   "Coverage gap calculations", "gap_analysis"),
+            ("Term Clusters",  RECIPE_TERM_CLUSTERS_PATH,  "Semantic groupings of demand terms", "term_clusters"),
         ]
+        db_counts = _load_market_table_counts_sidebar()
 
-        for label, path, description in _status_files:
+        for label, path, description, db_key in _status_files:
             if path.is_file():
                 try:
                     n    = len(pd.read_parquet(path))
@@ -1742,7 +1786,11 @@ def render_sidebar_pipeline_status() -> None:
                 except Exception:
                     icon, note = "⚠️", "read error"
             else:
-                icon, note = "🔴", "missing"
+                db_n = db_counts.get(db_key) if db_key else None
+                if db_n is not None and db_n > 0:
+                    icon, note = "🟡", f"{db_n:,} rows · DB only (no local parquet)"
+                else:
+                    icon, note = "🔴", "missing"
             st.markdown(
                 f"{icon} **{label}** — {note} {tooltip_icon(description)}",
                 unsafe_allow_html=True,

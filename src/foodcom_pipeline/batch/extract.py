@@ -861,8 +861,18 @@ def extract_ai_mode(**context) -> None:
     )
 
     if not is_ai_mode_stale():
-        logger.info('AI Mode data is fresh, skipping fetch.')
-        return
+        if AI_MODE_RAW_STAGING.is_file() and AI_MODE_TERM_SCORES_STAGING.is_file():
+            logger.info('AI Mode data is fresh, skipping fetch.')
+            return
+        logger.info(
+            'AI Mode marked fresh but staging files are missing; attempting DB backfill.'
+        )
+        if _backfill_ai_mode_staging_from_db():
+            logger.info('AI Mode staging restored from PostgreSQL; skipping fetch.')
+            return
+        logger.info(
+            'AI Mode DB backfill unavailable/empty; proceeding with fetch despite fresh metadata.'
+        )
 
     api_key = os.environ.get('SERPAPI_KEY')
     if not api_key:
@@ -902,8 +912,19 @@ def extract_google_trends(**context) -> None:
 
     stale_seeds = [s for s in _TRENDS_SEEDS if is_trends_stale(s)]
     if not stale_seeds:
-        logger.info('Trends data is fresh, skipping fetch.')
-        return
+        if TRENDS_RAW_STAGING.is_file() and TRENDS_NORMALISED_STAGING.is_file():
+            logger.info('Trends data is fresh, skipping fetch.')
+            return
+        logger.info(
+            'Trends marked fresh but staging files are missing; attempting DB backfill.'
+        )
+        if _backfill_trends_staging_from_db():
+            logger.info('Trends staging restored from PostgreSQL; skipping fetch.')
+            return
+        logger.info(
+            'Trends DB backfill unavailable/empty; proceeding with fetch despite fresh metadata.'
+        )
+        stale_seeds = list(_TRENDS_SEEDS)
 
     raw_df = fetch_related_queries(stale_seeds)
 
@@ -967,6 +988,60 @@ def _clean_trend_queries(df: pd.DataFrame) -> pd.DataFrame:
     if dropped:
         logger.info('Trend query filter: dropped %d non-food rows.', dropped)
     return df[mask].reset_index(drop=True)
+
+
+def _backfill_ai_mode_staging_from_db() -> bool:
+    """Rebuild AI Mode staging parquet files from Postgres tables when available."""
+    try:
+        from sqlalchemy import create_engine
+
+        engine = create_engine(POSTGRES_CONN)
+        with engine.connect() as conn:
+            raw_df = pd.read_sql('SELECT * FROM ai_mode_raw', conn)
+            term_df = pd.read_sql('SELECT * FROM ai_mode_term_scores', conn)
+
+        if raw_df.empty or term_df.empty:
+            return False
+
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_parquet(raw_df, AI_MODE_RAW_STAGING)
+        atomic_parquet(term_df, AI_MODE_TERM_SCORES_STAGING)
+        logger.info(
+            'Backfilled AI Mode staging from DB: raw=%d rows, term_scores=%d rows',
+            len(raw_df),
+            len(term_df),
+        )
+        return True
+    except Exception as exc:
+        logger.warning('Could not backfill AI Mode staging from DB: %s', exc)
+        return False
+
+
+def _backfill_trends_staging_from_db() -> bool:
+    """Rebuild Trends staging parquet files from Postgres tables when available."""
+    try:
+        from sqlalchemy import create_engine
+
+        engine = create_engine(POSTGRES_CONN)
+        with engine.connect() as conn:
+            raw_df = pd.read_sql('SELECT * FROM google_trends_raw', conn)
+            norm_df = pd.read_sql('SELECT * FROM google_trends_normalised', conn)
+
+        if raw_df.empty or norm_df.empty:
+            return False
+
+        STAGING_DIR.mkdir(parents=True, exist_ok=True)
+        atomic_parquet(raw_df, TRENDS_RAW_STAGING)
+        atomic_parquet(norm_df, TRENDS_NORMALISED_STAGING)
+        logger.info(
+            'Backfilled Trends staging from DB: raw=%d rows, normalised=%d rows',
+            len(raw_df),
+            len(norm_df),
+        )
+        return True
+    except Exception as exc:
+        logger.warning('Could not backfill Trends staging from DB: %s', exc)
+        return False
 
 
 def _log_extraction_stats(name: str, df: pd.DataFrame) -> None:
