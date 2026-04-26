@@ -892,7 +892,6 @@ def _brand_adjacency_table(selected_labels: list[str]) -> pd.DataFrame:
             "Segment": label,
             "Key Categories": ", ".join(data["top_categories"]),
             "Recommended CPG Brands": ", ".join(data["brands"]),
-            "Est. CPM Range": data["cpm_range"],
         })
     return pd.DataFrame(rows)
 
@@ -923,7 +922,6 @@ def _generate_pdf(profiles: dict, selected_labels: list[str]) -> bytes:
         adj = CPG_ADJACENCY.get(label, {})
         if adj:
             pdf.cell(0, 6, f"  CPG brands      : {', '.join(adj.get('brands', []))}", ln=True)
-            pdf.cell(0, 6, f"  Est. CPM        : {adj.get('cpm_range', '—')}", ln=True)
         pdf.ln(4)
     return bytes(pdf.output())
 
@@ -1548,7 +1546,7 @@ def render_audience_cpg() -> None:
 
     st.divider()
     st.markdown("### CPG Brand Adjacency")
-    st.caption("Recommended CPG brands and estimated programmatic CPM ranges per segment.")
+    st.caption("Recommended CPG brands per segment.")
     st.dataframe(
         _brand_adjacency_table(selected_labels),
         use_container_width=True,
